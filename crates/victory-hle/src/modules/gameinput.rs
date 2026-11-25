@@ -103,7 +103,27 @@ struct KeyState {
     dead_key: bool,
 }
 
-const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
+/// Battery status (`GameInputBatteryStatus` / `GameInputBatteryState`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct BatteryState {
+    charge_rate: f32,
+    max_charge_capacity: f32,
+    remaining_capacity: f32,
+    full_charge_capacity: f32,
+    status: u32,
+}
+
+const BATTERY_UNKNOWN: u32 = 0;
+const BATTERY_NOT_PRESENT: u32 = 1;
+const BATTERY_DISCHARGING: u32 = 2;
+const BATTERY_IDLE: u32 = 3;
+
+const _: () = assert!(
+    size_of::<KeyState>() == 12
+        && size_of::<PadState>() == 28
+        && size_of::<BatteryState>() == 20
+);
 
 /// Host input, or a fake in tests.
 trait Source: Send {
@@ -116,8 +136,18 @@ trait Source: Send {
     fn scripted_keys(&mut self) -> Vec<KeyState> {
         Vec::new()
     }
-    /// Motor speeds: low frequency (left), high frequency (right).
-    fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// Motor speeds: low frequency (left), high frequency (right), left trigger, right trigger.
+    fn rumble(&mut self, slot: usize, low: u16, high: u16, left_trigger: u16, right_trigger: u16);
+    /// Battery state for a gamepad slot.
+    fn battery(&mut self, _slot: usize) -> BatteryState {
+        BatteryState {
+            charge_rate: 0.0,
+            max_charge_capacity: 1.0,
+            remaining_capacity: 1.0,
+            full_charge_capacity: 1.0,
+            status: BATTERY_NOT_PRESENT,
+        }
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -233,8 +263,8 @@ impl Device {
             id,
             root_id: id,
             supported_input: kind(index),
-            // Low and high frequency.
-            rumble_motors: if index < PADS { 0x3 } else { 0 },
+            // Low frequency, high frequency, left trigger, right trigger.
+            rumble_motors: if index < PADS { 0xF } else { 0 },
             ..Default::default()
         };
         Device {
@@ -564,7 +594,7 @@ fn host() -> Box<dyn Source> {
         fn keys(&mut self) -> Vec<KeyState> {
             Vec::new()
         }
-        fn rumble(&mut self, _: usize, _: u16, _: u16) {}
+        fn rumble(&mut self, _: usize, _: u16, _: u16, _: u16, _: u16) {}
     }
     Box::new(Nothing)
 }
@@ -956,24 +986,44 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+extern "system" fn get_battery_state(this: *const Device, out: *mut BatteryState) {
+    if out.is_null() {
+        return;
+    }
+    // SAFETY: one of our devices.
+    let device = unsafe { &*this };
+    let state = if device.index < PADS {
+        lock(&device.hub().source).battery(device.index)
+    } else {
+        BatteryState {
+            status: BATTERY_NOT_PRESENT,
+            ..Default::default()
+        }
+    };
+    // SAFETY: checked non-null.
+    unsafe { out.write(state) };
+}
+
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let [low, high, left_trigger, right_trigger] = if params.is_null() {
         [0.0; 4]
     } else {
-        // SAFETY: checked non-null; four motor levels.
+        // SAFETY: checked non-null; four motor levels (low, high, left trigger, right trigger).
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    lock(&device.hub().source).rumble(
+        device.index,
+        speed(low),
+        speed(high),
+        speed(left_trigger),
+        speed(right_trigger),
+    );
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -989,7 +1039,7 @@ static DEVICE: Table<21> = Table([
     add_ref as *const (),             // 0x10 Release
     device_info as *const (),         // 0x18
     device_status as *const (),       // 0x20
-    unsupported::<0x28> as *const (), // battery
+    get_battery_state as *const (),   // 0x28 battery
     unsupported::<0x30> as *const (), // force feedback
     unsupported::<0x38> as *const (), //
     unsupported::<0x40> as *const (), //
@@ -1125,12 +1175,14 @@ mod host {
         GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
-        XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
-        XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT,
-        XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_LEFT_SHOULDER, XINPUT_GAMEPAD_LEFT_THUMB,
-        XINPUT_GAMEPAD_RIGHT_SHOULDER, XINPUT_GAMEPAD_RIGHT_THUMB, XINPUT_GAMEPAD_START,
-        XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE, XINPUT_VIBRATION, XInputGetState,
-        XInputSetState,
+        BATTERY_DEVTYPE_GAMEPAD, BATTERY_LEVEL_EMPTY, BATTERY_LEVEL_FULL, BATTERY_LEVEL_LOW,
+        BATTERY_LEVEL_MEDIUM, BATTERY_TYPE_DISCONNECTED, BATTERY_TYPE_WIRED,
+        XINPUT_BATTERY_INFORMATION, XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B,
+        XINPUT_GAMEPAD_BACK, XINPUT_GAMEPAD_DPAD_DOWN, XINPUT_GAMEPAD_DPAD_LEFT,
+        XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_UP, XINPUT_GAMEPAD_LEFT_SHOULDER,
+        XINPUT_GAMEPAD_LEFT_THUMB, XINPUT_GAMEPAD_RIGHT_SHOULDER, XINPUT_GAMEPAD_RIGHT_THUMB,
+        XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y, XINPUT_STATE, XINPUT_VIBRATION,
+        XInputGetBatteryInformation, XInputGetState, XInputSetState,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetForegroundWindow, GetWindowThreadProcessId,
@@ -1236,13 +1288,76 @@ mod host {
             }
         }
 
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+        fn rumble(
+            &mut self,
+            slot: usize,
+            low: u16,
+            high: u16,
+            left_trigger: u16,
+            right_trigger: u16,
+        ) {
+            static BLEND: LazyLock<bool> = LazyLock::new(|| {
+                std::env::var("VICTORY_TRIGGER_RUMBLE_BLEND")
+                    .map(|v| v != "0")
+                    .unwrap_or(true)
+            });
+            // XInput exposes two grip motors; when trigger motors are active,
+            // blend a proportional tactile pulse into the high-frequency motor
+            // so impulse-trigger effects (recoil, ABS, traction) remain felt.
+            let trigger_boost = if *BLEND {
+                (u32::from(left_trigger).max(u32::from(right_trigger)) / 3) as u16
+            } else {
+                0
+            };
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
-                wRightMotorSpeed: high,
+                wRightMotorSpeed: high.saturating_add(trigger_boost),
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+
+        fn battery(&mut self, slot: usize) -> BatteryState {
+            let mut info = XINPUT_BATTERY_INFORMATION::default();
+            // SAFETY: room for the battery info structure.
+            if unsafe {
+                XInputGetBatteryInformation(slot as u32, BATTERY_DEVTYPE_GAMEPAD, &mut info)
+            } != 0
+            {
+                return BatteryState {
+                    status: BATTERY_UNKNOWN,
+                    ..Default::default()
+                };
+            }
+            if info.BatteryType == BATTERY_TYPE_DISCONNECTED {
+                return BatteryState {
+                    status: BATTERY_NOT_PRESENT,
+                    ..Default::default()
+                };
+            }
+            if info.BatteryType == BATTERY_TYPE_WIRED {
+                return BatteryState {
+                    charge_rate: 0.0,
+                    max_charge_capacity: 1.0,
+                    remaining_capacity: 1.0,
+                    full_charge_capacity: 1.0,
+                    status: BATTERY_IDLE,
+                };
+            }
+            let remaining = match info.BatteryLevel {
+                BATTERY_LEVEL_EMPTY => 0.05,
+                BATTERY_LEVEL_LOW => 0.25,
+                BATTERY_LEVEL_MEDIUM => 0.60,
+                BATTERY_LEVEL_FULL => 1.0,
+                _ => 0.5,
+            };
+            BatteryState {
+                charge_rate: 0.0,
+                max_charge_capacity: 1.0,
+                remaining_capacity: remaining,
+                full_charge_capacity: 1.0,
+                status: BATTERY_DISCHARGING,
+            }
         }
     }
 
@@ -1333,7 +1448,8 @@ mod tests {
         pads: [Option<PadState>; PADS],
         keys: Vec<KeyState>,
         scripted: Vec<KeyState>,
-        rumble: Vec<(usize, u16, u16)>,
+        rumble: Vec<(usize, u16, u16, u16, u16)>,
+        battery: Option<BatteryState>,
     }
 
     struct Fake(Arc<Mutex<FakeHost>>);
@@ -1348,8 +1464,28 @@ mod tests {
         fn scripted_keys(&mut self) -> Vec<KeyState> {
             self.0.lock().unwrap().scripted.clone()
         }
-        fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            self.0.lock().unwrap().rumble.push((slot, low, high));
+        fn rumble(
+            &mut self,
+            slot: usize,
+            low: u16,
+            high: u16,
+            left_trigger: u16,
+            right_trigger: u16,
+        ) {
+            self.0
+                .lock()
+                .unwrap()
+                .rumble
+                .push((slot, low, high, left_trigger, right_trigger));
+        }
+        fn battery(&mut self, _slot: usize) -> BatteryState {
+            self.0.lock().unwrap().battery.unwrap_or(BatteryState {
+                status: BATTERY_IDLE,
+                remaining_capacity: 1.0,
+                full_charge_capacity: 1.0,
+                max_charge_capacity: 1.0,
+                charge_rate: 0.0,
+            })
         }
     }
 
@@ -1721,10 +1857,20 @@ mod tests {
 
         type Rumble = extern "system" fn(*const Device, *const [f32; 4]);
         let rumble = slot::<Rumble, _>(device, 0x50);
-        rumble(device, &[0.5, 1.0, 1.0, 1.0]);
+        rumble(device, &[0.5, 1.0, 0.25, 0.75]);
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
-        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+        assert_eq!(
+            host.lock().unwrap().rumble,
+            [(2, 32767, 65535, 16383, 49151), (2, 0, 0, 0, 0)]
+        );
+
+        type Battery = extern "system" fn(*const Device, *mut BatteryState);
+        let battery = slot::<Battery, _>(device, 0x28);
+        let mut state = BatteryState::default();
+        battery(device, &mut state);
+        assert_eq!(state.status, BATTERY_IDLE);
+        assert_eq!(state.remaining_capacity, 1.0);
     }
 
     #[test]

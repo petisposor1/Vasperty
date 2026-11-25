@@ -9,16 +9,16 @@
 //! the title checks it one block later and treats a late command as an
 //! overrun. Commands complete when submitted here.
 //!
-//! The transforms themselves are not computed: the hardware takes impulse
-//! responses already in its own partitioned frequency-domain layout, which
-//! is not known. Outputs are silence, so reverb returns are dry.
-// shortcut: no convolution or block transform; outputs are zeros. Needs the
-// coprocessor's impulse response and spectrum layouts to do better.
+//! Because the hardware coprocessor's partitioned frequency-domain IR layout
+//! is undocumented, convolution streams run a zero-allocation 4-channel
+//! Hadamard Feedback Delay Network (FDN) reverb with per-line low-pass
+//! damping, driven by each stream's channel count, IR length, and per-block
+//! gains. Set `VICTORY_DSP_REVERB=0` to revert to dry silence.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -31,6 +31,117 @@ const CONVOLUTION: u32 = 1;
 /// Option bits that need a stereo stream, and one convolution refuses.
 const STEREO_OPTIONS: u32 = 2 | 8;
 const NOT_FOR_CONVOLUTION: u32 = 4;
+
+/// Mutually-prime delay line lengths (in samples at 48 kHz: ~31 ms to ~72 ms)
+/// for dense, metallic-free reverberation.
+const DELAY_LENGTHS: [usize; 4] = [1487, 1993, 2657, 3469];
+
+fn reverb_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VICTORY_DSP_REVERB")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Zero-allocation 4-line Hadamard Feedback Delay Network (FDN) reverb.
+struct ReverbEngine {
+    lines: [Vec<f32>; 4],
+    pos: [usize; 4],
+    lp: [f32; 4],
+    feedback: f32,
+    damp: f32,
+}
+
+impl ReverbEngine {
+    fn new(ir_floats: u32) -> Self {
+        // Scale feedback gently with the requested IR buffer size (longer IRs
+        // imply larger acoustic spaces), clamped well below unity for stability.
+        let rt_factor = (ir_floats as f32 / 65536.0).clamp(0.0, 1.0);
+        let feedback = 0.42 + 0.40 * rt_factor;
+        let damp = 0.28;
+        Self {
+            lines: DELAY_LENGTHS.map(|n| vec![0.0; n]),
+            pos: [0; 4],
+            lp: [0.0; 4],
+            feedback,
+            damp,
+        }
+    }
+
+    #[inline]
+    fn flush_denormal(x: f32) -> f32 {
+        if x.abs() < 1e-20 || !x.is_finite() {
+            0.0
+        } else {
+            x
+        }
+    }
+
+    /// Processes `frames` samples of `channels` (1 or 2, interleaved) from
+    /// `input` into `output`, applying `gains`.
+    fn process(&mut self, input: &[f32], output: &mut [f32], frames: usize, channels: usize, gains: [f32; 2]) {
+        let g0 = if gains[0].is_finite() { gains[0].clamp(-4.0, 4.0) } else { 0.0 };
+        let g1 = if gains[1].is_finite() { gains[1].clamp(-4.0, 4.0) } else { 0.0 };
+        let wet_gain = if channels == 2 {
+            0.5 * (g0.abs() + g1.abs())
+        } else {
+            g0.abs()
+        };
+        if wet_gain == 0.0 {
+            output.fill(0.0);
+            return;
+        }
+        let fb = self.feedback;
+        let damp = self.damp;
+        let keep = 1.0 - damp;
+        for f in 0..frames {
+            let (in_l, in_r) = if channels == 2 {
+                (input[f * 2] * g0, input[f * 2 + 1] * g1)
+            } else {
+                let s = input[f] * g0;
+                (s, s)
+            };
+            // Read current delayed samples and apply one-pole low-pass damping.
+            let mut d = [0.0f32; 4];
+            for i in 0..4 {
+                let raw = self.lines[i][self.pos[i]];
+                let filtered = Self::flush_denormal(raw * keep + self.lp[i] * damp);
+                self.lp[i] = filtered;
+                d[i] = filtered;
+            }
+            // Normalized 4x4 Hadamard feedback matrix (energy-preserving).
+            let h0 = 0.5 * (d[0] + d[1] + d[2] + d[3]);
+            let h1 = 0.5 * (d[0] - d[1] + d[2] - d[3]);
+            let h2 = 0.5 * (d[0] + d[1] - d[2] - d[3]);
+            let h3 = 0.5 * (d[0] - d[1] - d[2] + d[3]);
+            let next = [
+                Self::flush_denormal(h0 * fb + in_l * 0.5),
+                Self::flush_denormal(h1 * fb + in_r * 0.5),
+                Self::flush_denormal(h2 * fb + in_l * 0.5),
+                Self::flush_denormal(h3 * fb - in_r * 0.5),
+            ];
+            for i in 0..4 {
+                self.lines[i][self.pos[i]] = next[i];
+                self.pos[i] += 1;
+                if self.pos[i] == self.lines[i].len() {
+                    self.pos[i] = 0;
+                }
+            }
+            if channels == 2 {
+                // Decorrelated stereo tap mix from opposite delay lines.
+                let out_l = (d[0] + d[2] - d[1] * 0.35 + in_l * 0.15).clamp(-4.0, 4.0);
+                let out_r = (d[1] + d[3] - d[2] * 0.35 + in_r * 0.15).clamp(-4.0, 4.0);
+                output[f * 2] = out_l;
+                output[f * 2 + 1] = out_r;
+            } else {
+                let out_m = (0.5 * (d[0] + d[1] + d[2] + d[3]) + in_l * 0.15).clamp(-4.0, 4.0);
+                output[f] = out_m;
+            }
+        }
+    }
+}
 
 pub struct Dsp {
     max_streams: u32,
@@ -59,8 +170,10 @@ pub struct Status {
 
 pub struct Stream {
     dsp: *mut Dsp,
+    kind: u32,
     frames: u32,
     channels: u32,
+    reverb: Option<ReverbEngine>,
     status: Box<Status>,
 }
 
@@ -166,8 +279,11 @@ pub extern "system" fn XDspActivate(
     }
     let new = Box::new(Stream {
         dsp,
+        kind: desc.kind,
         frames: desc.frames,
         channels: desc.channels,
+        reverb: (desc.kind == CONVOLUTION && reverb_enabled())
+            .then(|| ReverbEngine::new(desc.ir_floats)),
         status: Box::new(Status {
             submitted: 0,
             completed: 0,
@@ -195,7 +311,8 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     S_OK
 }
 
-/// Completes the command at once: its output block is silence.
+/// Completes the command at once: convolution streams run the FDN reverb
+/// engine; non-convolution transforms output zeros.
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
@@ -208,8 +325,25 @@ pub extern "system" fn XDspSubmitCommand(
     let (stream, command) = unsafe { (&mut *stream, &*command) };
     if !command.output.is_null() {
         let samples = (stream.frames * stream.channels) as usize;
-        // SAFETY: the title's output buffer holds one block of the stream.
-        unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        if stream.kind == CONVOLUTION
+            && !command.input.is_null()
+            && let Some(reverb) = stream.reverb.as_mut()
+        {
+            // SAFETY: input and output buffers hold `frames * channels` floats.
+            let input = unsafe { std::slice::from_raw_parts(command.input, samples) };
+            // SAFETY: output buffer holds `frames * channels` writable floats.
+            let output = unsafe { std::slice::from_raw_parts_mut(command.output, samples) };
+            reverb.process(
+                input,
+                output,
+                stream.frames as usize,
+                stream.channels as usize,
+                command.gains,
+            );
+        } else {
+            // SAFETY: the title's output buffer holds one block of the stream.
+            unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        }
     }
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
@@ -284,6 +418,19 @@ mod tests {
         // SAFETY: the stream's status block.
         let (completed, result) = unsafe { ((*status).completed, (*status).result) };
         assert_eq!((completed, result), (ticket, S_OK));
+        assert!(output.iter().all(|s| s.is_finite()));
+        assert!(
+            output.iter().any(|&s| s.abs() > 1e-4),
+            "convolution stream with non-zero input and gains should produce reverb output"
+        );
+        // Zero gains produce exact silence.
+        let silent_cmd = Command {
+            gains: [0.0, 0.0],
+            input: input.as_ptr(),
+            output: output.as_mut_ptr(),
+            reserved: 0,
+        };
+        assert_eq!(XDspSubmitCommand(stream, &silent_cmd, &mut ticket), S_OK);
         assert!(output.iter().all(|&s| s == 0.0));
         assert_eq!(XDspDeactivate(stream), S_OK);
 
@@ -310,5 +457,32 @@ mod tests {
         );
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    #[test]
+    fn fdn_reverb_produces_decaying_stereo_tail_and_stays_bounded() {
+        let mut engine = ReverbEngine::new(32768);
+        let frames = 0x400;
+        let mut input = vec![0.0f32; frames * 2];
+        input[0] = 1.0;
+        input[1] = 0.5;
+        let mut output = vec![0.0f32; frames * 2];
+        // Feed an impulse, then several blocks of silence to verify the tail
+        // builds up across delay lines and decays cleanly without diverging.
+        engine.process(&input, &mut output, frames, 2, [1.0, 1.0]);
+        input.fill(0.0);
+        let mut energies = Vec::new();
+        for _ in 0..16 {
+            engine.process(&input, &mut output, frames, 2, [1.0, 1.0]);
+            assert!(output.iter().all(|s| s.is_finite() && s.abs() <= 4.0));
+            let energy: f32 = output.iter().map(|s| s * s).sum();
+            energies.push(energy);
+        }
+        let peak = energies.iter().copied().fold(0.0f32, f32::max);
+        assert!(peak > 1e-4, "expected audible reverb tail, peak energy={peak}");
+        assert!(
+            *energies.last().unwrap() < peak,
+            "reverb tail must decay over time: {energies:?}"
+        );
     }
 }
