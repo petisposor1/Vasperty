@@ -7,6 +7,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:slice"
 
+import vasperty_app "vasperty:app"
 import vasperty_core "vasperty:core"
 import vasperty_formats "vasperty:formats"
 import vasperty_game "vasperty:game"
@@ -1312,6 +1313,28 @@ test_gpu_phase6 :: proc() {
 	fmt.println("ok")
 }
 
+test_app_phase7 :: proc() {
+	fmt.print("test_app_phase7... ")
+	rt, err := vasperty_app.app_init(.Series_X)
+	assert(err == .None && rt.initialized && rt.has_config)
+	defer vasperty_app.app_fini(&rt)
+
+	// Verify runtime config/policy/hooks wired end-to-end
+	hooks := vasperty_hle.get_gpu_hooks()
+	assert(hooks.create_device != nil && hooks.configure_virtual_memory != nil)
+	assert(vasperty_app.app_config() == 0)
+	assert(vasperty_app.app_doctor(false) == 0)
+	assert(vasperty_app.app_inspect(os.args[0], false, false) == 0)
+	assert(vasperty_app.app_census({os.args[0]}, false, false) == 0)
+
+	// Verify synthetic translate batch tally with clean teardown
+	tally: vasperty_app.Translate_Tally
+	vasperty_app.app_translate_blob([]u8{'D', 'X', 'B', 'C', 0, 0}, false, &tally)
+	assert(tally.containers == 1 && tally.failed == 1)
+
+	fmt.println("ok")
+}
+
 main :: proc() {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
@@ -1332,6 +1355,7 @@ main :: proc() {
 	test_hle_phase4()
 	test_shader_phase5()
 	test_gpu_phase6()
+	test_app_phase7()
 
 	if len(track.allocation_map) > 0 {
 		fmt.eprintf("\nFAIL: %d memory leaks detected!\n", len(track.allocation_map))
@@ -1347,5 +1371,5 @@ main :: proc() {
 		}
 		os.exit(1)
 	}
-	fmt.println("ALL ODIN PHASE 6 TESTS PASSED (0 leaks, 0 bad frees)")
+	fmt.println("ALL ODIN PHASE 7 TESTS PASSED (0 leaks, 0 bad frees)")
 }

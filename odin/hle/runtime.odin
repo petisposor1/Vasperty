@@ -293,6 +293,7 @@ fini_hle :: proc() {
 	fini_audio()
 	fini_apu()
 	fini_xgamesave()
+	fini_files()
 
 	sync.mutex_lock(&g_rt.mu)
 	defer sync.mutex_unlock(&g_rt.mu)
