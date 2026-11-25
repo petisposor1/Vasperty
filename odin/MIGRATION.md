@@ -25,7 +25,7 @@ Because developers on Windows often run without Visual Studio or Windows SDK lib
 | **2** | `victory-formats` (`bcpack`, `xma`) | `vasperty:formats` (`formats/`) | **Implemented (100%)** | Compile-time `#load` BCPack rANS tables + BC1/3/4/5/6H/7 + parallel `bcpack_decode_batch`, full XMA2 packets/VLC/IMDCT decoder |
 | **2** | `victory-game` (`pipelines`, `sgd5`) | `vasperty:game` (`game/`) | **Implemented (100%)** | Parallel CityHash64 raster/depth-stencil state resolvers, PSO stream builder, multi-core SGD5 raw-deflate unpacker |
 | **3** | `victory-loader` | `vasperty:loader` (`loader/`) | **Implemented** | PE prepare (`IMAGE_FILE_DLL`/TLS/relocs), atomic staging publish, x64 import thunk stubs, static TLS redirection, Win32 `LoadLibraryExW` + eager IAT binding |
-| **4** | `victory-hle` | `vasperty:hle` | Planned | Kernel/XMem/DirectStorage worker pool, GameInput rumble/battery, APU/XMA2 audio |
+| **4** | `victory-hle` | `vasperty:hle` (`hle/`) | **Implemented** | `QueryApiImpl` 12 COM runtime providers, `XAsync`/`XTaskQueue`, transactional `XGameSave`, `XMem`, `DirectStorage`, `XG`, `ACPHAL`/`APU`/`DSP`, loopback `net`, `rpcrt4`, virtual drive `files` |
 | **5** | `victory-shader` | `vasperty:shader` | Planned | RDNA2 scalar/vector/export decoder, CFG/SSA lowering, DXIL SM 6.6 bitcode emitter |
 | **6** | `victory-gpu` | `vasperty:gpu` | Planned | Direct3D 12 host backend (`vendor:directx/d3d12`), placed heaps, barriers, shadow copy-back, swapchain |
 | **7** | `apps/victory` (full host) | `vasperty:app` | Planned | Full end-to-end Odin runtime parity replacing the Rust host wrapper |

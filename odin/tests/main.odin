@@ -9,6 +9,7 @@ import "core:path/filepath"
 import vasperty_core "vasperty:core"
 import vasperty_formats "vasperty:formats"
 import vasperty_game "vasperty:game"
+import vasperty_hle "vasperty:hle"
 import vasperty_loader "vasperty:loader"
 import vasperty_pe "vasperty:pe"
 import vasperty_pipeline "vasperty:pipeline"
@@ -905,6 +906,185 @@ test_loader_phase3 :: proc() {
 	fmt.println("ok")
 }
 
+@(private)
+hle_vslot :: proc(obj: rawptr, byte_off: uintptr, $T: typeid) -> T {
+	vt := (cast(^[^]rawptr)obj)^
+	return cast(T)(vt[byte_off / 8])
+}
+
+test_hle_phase4 :: proc() {
+	fmt.print("[test] hle_resolver_com_saves_xmem_xg_dsp ... ")
+	vasperty_hle.init_hle()
+	defer {
+		vasperty_hle.fini_hle()
+		vasperty_hle.fini_files()
+		vasperty_hle.fini_lifecycle()
+		vasperty_hle.fini_xmem()
+	}
+
+	// 1. Manifest XML parsing
+	xml := `<!-- comment --><Game><Identity Name="T &amp; A"/><TitleId>4D5308AB</TitleId><StoreId>9NBLGGH12345</StoreId><PersistentLocalStorage><SizeMB>32</SizeMB></PersistentLocalStorage></Game>`
+	temp_base, _ := os.lookup_env("TEMP", context.allocator)
+	defer delete(temp_base)
+	hle_tmp, _ := filepath.join({temp_base, "vasperty_odin_hle_test"}, context.allocator)
+	defer delete(hle_tmp)
+	_ = os.make_directory_all(hle_tmp)
+
+	tinfo := vasperty_hle.parse_manifest_xml(xml, hle_tmp)
+	assert(tinfo.id == 0x4D5308AB && tinfo.store_id == "9NBLGGH12345" && tinfo.storage_bytes == (32 << 20))
+	vasperty_hle.set_title(tinfo)
+	vasperty_hle.destroy_title_info(&tinfo)
+
+	// 2. Hle_Resolver & Policy
+	pol := vasperty_hle.default_host_policy()
+	res := vasperty_hle.make_hle_resolver(pol)
+	defer vasperty_hle.destroy_hle_resolver(&res)
+
+	imp_cf := vasperty_pe.Import_Entry{name = "CreateFileW"}
+	r_cf := vasperty_hle.hle_resolve(&res, "kernel32.dll", &imp_cf)
+	assert(r_cf.found && r_cf.provenance == .Hle && r_cf.address == uintptr(rawptr(vasperty_hle.CreateFileW)))
+
+	imp_gtc := vasperty_pe.Import_Entry{name = "GetTickCount"}
+	r_gtc := vasperty_hle.hle_resolve(&res, "kernel32.dll", &imp_gtc)
+	assert(r_gtc.found && r_gtc.provenance == .Host && r_gtc.address != 0)
+
+	imp_net := vasperty_pe.Import_Entry{name = "InternetOpenA"}
+	r_net := vasperty_hle.hle_resolve(&res, "wininet.dll", &imp_net)
+	assert(!r_net.found)
+
+	imp_iid := vasperty_pe.Import_Entry{name = "IID_ID3D12Device"}
+	r_iid := vasperty_hle.hle_resolve(&res, "d3d12_xs.dll", &imp_iid)
+	assert(r_iid.found && r_iid.provenance == .Hle)
+	iid_ptr := cast(^[16]u8)rawptr(r_iid.address)
+	assert(iid_ptr^ == vasperty_hle.IID_ID3D12Device_DATA)
+
+	// 3. Registry ConsoleMode override
+	vasperty_hle.set_console(.Series_X)
+	key: rawptr = nil
+	sub_w := win32.utf8_to_wstring(`software\microsoft\windows nt\currentversion\oem`, context.allocator)
+	defer delete(sub_w)
+	assert(vasperty_hle.RegOpenKeyW(rawptr(vasperty_hle.REG_HKEY_LOCAL_MACHINE), cast([^]u16)sub_w, &key) == 0)
+	val_name := win32.utf8_to_wstring("ConsoleMode", context.allocator)
+	defer delete(val_name)
+	cm_val: u32 = 0
+	cm_sz: u32 = 4
+	cm_kind: u32 = 0
+	assert(vasperty_hle.RegQueryValueExW(key, cast([^]u16)val_name, nil, &cm_kind, cast([^]u8)&cm_val, &cm_sz) == 0)
+	assert(cm_val == 0x64 && cm_kind == 4)
+	assert(vasperty_hle.RegCloseKey(key) == 0)
+
+	// 4. QueryApiImpl + XUser + XStore + Speech
+	assert(vasperty_hle.InitializeApiImplEx2(1, 2, 0, nil) == vasperty_hle.S_OK)
+	prov_u := vasperty_hle.PROVIDER_XUSER
+	iid_u := vasperty_hle.IID_XUSER
+	uobj: rawptr = nil
+	assert(vasperty_hle.QueryApiImpl(&prov_u, &iid_u, &uobj) == vasperty_hle.S_OK && uobj != nil)
+
+	Add_Fn :: #type proc "system" (rawptr, u32, ^vasperty_hle.Async_Block) -> vasperty_hle.HRESULT
+	Res_Fn :: #type proc "system" (rawptr, ^vasperty_hle.Async_Block, ^rawptr) -> vasperty_hle.HRESULT
+	Get_Id_Fn :: #type proc "system" (rawptr, rawptr, ^u64) -> vasperty_hle.HRESULT
+	blk := vasperty_hle.Async_Block{}
+	assert(hle_vslot(uobj, 0x38, Add_Fn)(uobj, 1, &blk) == vasperty_hle.S_OK)
+	assert(vasperty_hle.XAsyncGetStatus(&blk, true) == vasperty_hle.S_OK)
+	uhandle: rawptr = nil
+	assert(hle_vslot(uobj, 0x40, Res_Fn)(uobj, &blk, &uhandle) == vasperty_hle.S_OK && uhandle != nil)
+	xuid: u64 = 0
+	assert(hle_vslot(uobj, 0x58, Get_Id_Fn)(uobj, uhandle, &xuid) == vasperty_hle.S_OK && xuid == vasperty_hle.XUSER_XUID)
+
+	prov_s := vasperty_hle.PROVIDER_XSTORE
+	iid_s := vasperty_hle.IID_XSTORE_2026
+	sobj: rawptr = nil
+	assert(vasperty_hle.QueryApiImpl(&prov_s, &iid_s, &sobj) == vasperty_hle.S_OK && sobj != nil)
+	GL_Async :: #type proc "system" (rawptr, rawptr, ^vasperty_hle.Async_Block) -> vasperty_hle.HRESULT
+	GL_Res :: #type proc "system" (rawptr, ^vasperty_hle.Async_Block, ^vasperty_hle.Store_Game_License) -> vasperty_hle.HRESULT
+	sblk := vasperty_hle.Async_Block{}
+	assert(hle_vslot(sobj, 0xe0, GL_Async)(sobj, nil, &sblk) == vasperty_hle.S_OK)
+	gl: vasperty_hle.Store_Game_License
+	assert(hle_vslot(sobj, 0xe8, GL_Res)(sobj, &sblk, &gl) == vasperty_hle.S_OK && gl.is_active)
+	assert(string(cstring(raw_data(gl.sku_store_id[:]))) == "9NBLGGH12345/0010")
+
+	// 5. XGameSave atomic update + read
+	prov_gs := vasperty_hle.PROVIDER_XGAMESAVE
+	iid_gs := vasperty_hle.IID_XGAMESAVE_2026
+	gsobj: rawptr = nil
+	assert(vasperty_hle.QueryApiImpl(&prov_gs, &iid_gs, &gsobj) == vasperty_hle.S_OK && gsobj != nil)
+	GS_Init :: #type proc "system" (rawptr, rawptr, cstring, bool, ^vasperty_hle.Async_Block) -> vasperty_hle.HRESULT
+	GS_Crt :: #type proc "system" (rawptr, ^vasperty_hle.Save_Provider, cstring, ^^vasperty_hle.Save_Container) -> vasperty_hle.HRESULT
+	GS_Upd :: #type proc "system" (rawptr, ^vasperty_hle.Save_Container, cstring, ^^vasperty_hle.Save_Update) -> vasperty_hle.HRESULT
+	GS_Wb :: #type proc "system" (rawptr, ^vasperty_hle.Save_Update, cstring, [^]u8, uint) -> vasperty_hle.HRESULT
+	GS_Sub :: #type proc "system" (rawptr, ^vasperty_hle.Save_Update, ^vasperty_hle.Async_Block) -> vasperty_hle.HRESULT
+	GS_Rd :: #type proc "system" (rawptr, ^vasperty_hle.Save_Container, [^]cstring, ^u32, [^]vasperty_hle.Save_Blob_Data) -> vasperty_hle.HRESULT
+	GS_CloseP :: #type proc "system" (rawptr, ^vasperty_hle.Save_Provider)
+	GS_CloseC :: #type proc "system" (rawptr, ^vasperty_hle.Save_Container)
+	GS_CloseU :: #type proc "system" (rawptr, ^vasperty_hle.Save_Update)
+
+	gs_blk := vasperty_hle.Async_Block{}
+	assert(hle_vslot(gsobj, 0x20, GS_Init)(gsobj, nil, "scid-1", false, &gs_blk) == vasperty_hle.S_OK)
+	sprov: ^vasperty_hle.Save_Provider = nil
+	assert(hle_vslot(gsobj, 0x28, Res_Fn)(gsobj, &gs_blk, cast(^rawptr)&sprov) == vasperty_hle.S_OK && sprov != nil)
+	scont: ^vasperty_hle.Save_Container = nil
+	assert(hle_vslot(gsobj, 0x80, GS_Crt)(gsobj, sprov, "slot0", &scont) == vasperty_hle.S_OK && scont != nil)
+	supd: ^vasperty_hle.Save_Update = nil
+	assert(hle_vslot(gsobj, 0xb8, GS_Upd)(gsobj, scont, "Slot 0", &supd) == vasperty_hle.S_OK && supd != nil)
+	save_bytes := [5]u8{1, 2, 3, 4, 5}
+	assert(hle_vslot(gsobj, 0xc8, GS_Wb)(gsobj, supd, "hdr", raw_data(save_bytes[:]), 5) == vasperty_hle.S_OK)
+	sub_blk := vasperty_hle.Async_Block{}
+	assert(hle_vslot(gsobj, 0xe0, GS_Sub)(gsobj, supd, &sub_blk) == vasperty_hle.S_OK)
+	assert(vasperty_hle.XAsyncGetStatus(&sub_blk, true) == vasperty_hle.S_OK)
+
+	req_name: [1]cstring = {"hdr"}
+	req_cnt: u32 = 1
+	rd_buf: [256]u8
+	out_blobs := cast([^]vasperty_hle.Save_Blob_Data)raw_data(rd_buf[:])
+	assert(hle_vslot(gsobj, 0xa0, GS_Rd)(gsobj, scont, raw_data(req_name[:]), &req_cnt, out_blobs) == vasperty_hle.S_OK)
+	assert(out_blobs[0].info.size == 5 && out_blobs[0].data[4] == 5)
+	hle_vslot(gsobj, 0xc0, GS_CloseU)(gsobj, supd)
+	hle_vslot(gsobj, 0x88, GS_CloseC)(gsobj, scont)
+	hle_vslot(gsobj, 0x30, GS_CloseP)(gsobj, sprov)
+
+	// 6. RPCRT4 UUID v4 + roundtrip + free
+	u1: vasperty_hle.Guid
+	assert(vasperty_hle.UuidCreate(&u1) == 0 && (u1.data3 >> 12) == 4 && (u1.data4[0] >> 6) == 2)
+	u_cstr: cstring = nil
+	assert(vasperty_hle.UuidToStringA(&u1, &u_cstr) == 0 && u_cstr != nil)
+	u2: vasperty_hle.Guid
+	assert(vasperty_hle.UuidFromStringA(u_cstr, &u2) == 0 && vasperty_hle.guid_eq(u1, u2))
+	u_raw := rawptr(u_cstr)
+	assert(vasperty_hle.RpcStringFreeA(&u_raw) == 0 && u_raw == nil)
+
+	// 7. XMem + XG + DSP FDN Reverb + APU TOC + Virtual Drive
+	xm_ptr := vasperty_hle.XMemAllocDefault(256, 0x6 << 24) // 64-byte aligned
+	assert(xm_ptr != nil && (uintptr(xm_ptr) & 63) == 0)
+	vasperty_hle.XMemFreeDefault(xm_ptr, 0)
+
+	xg_desc := vasperty_hle.XG_Resource_Desc{dimension = 3, width = 16, height = 16, depth_or_array = 1, mips = 1, format = 28, samples = 1}
+	xg_comp: ^vasperty_hle.XG_Computer = nil
+	assert(vasperty_hle.XGCreateTextureComputer(&xg_desc, &xg_comp) == vasperty_hle.S_OK && xg_comp != nil)
+	XG_Rel :: #type proc "system" (^vasperty_hle.XG_Computer) -> u32
+	assert(hle_vslot(xg_comp, 0x10, XG_Rel)(xg_comp) == 0)
+
+	dsp_inst: ^vasperty_hle.Dsp_Instance = nil
+	assert(vasperty_hle.XDspConnectWithMaximumStreamLimit(nil, 0, 4, &dsp_inst) == vasperty_hle.S_OK)
+	dsp_s: ^vasperty_hle.Dsp_Stream = nil
+	dsp_st: rawptr = nil
+	assert(vasperty_hle.XDspActivate(dsp_inst, 1, 0, 16384, 2, &dsp_s, &dsp_st) == vasperty_hle.S_OK)
+	dsp_in: [64]f32
+	dsp_out: [64]f32
+	dsp_in[0] = 1.0
+	gains := [2]f32{1.0, 1.0}
+	assert(vasperty_hle.XDspSubmitCommand(dsp_s, 42, 32, &gains, raw_data(dsp_in[:]), raw_data(dsp_out[:])) == vasperty_hle.S_OK)
+	assert((cast(^u32)dsp_st) != nil)
+	assert(vasperty_hle.XDspDeactivate(dsp_s) == vasperty_hle.S_OK)
+	assert(vasperty_hle.XDspDisconnect(dsp_inst) == vasperty_hle.S_OK)
+
+	nsamp, ok_toc := vasperty_hle.opus_packet_samples([]u8{0xF8, 0xFF, 0xFE}) // CELT FB 20ms code=0 => 960
+	assert(ok_toc && nsamp == 960)
+	assert(vasperty_hle.is_local_media_url(`file://localhost/C:/vid.mp4`) && !vasperty_hle.is_local_media_url(`https://example.invalid/x`))
+	assert(vasperty_hle.is_loopback_host_str("127.0.0.1") && !vasperty_hle.is_loopback_host_str("example.com"))
+
+	fmt.println("ok")
+}
+
 main :: proc() {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
@@ -922,6 +1102,7 @@ main :: proc() {
 	test_xma()
 	test_pipeline_cache()
 	test_loader_phase3()
+	test_hle_phase4()
 
 	if len(track.allocation_map) > 0 {
 		fmt.eprintf("\nFAIL: %d memory leaks detected!\n", len(track.allocation_map))
@@ -937,5 +1118,5 @@ main :: proc() {
 		}
 		os.exit(1)
 	}
-	fmt.println("ALL ODIN PHASE 3 TESTS PASSED (0 leaks, 0 bad frees)")
+	fmt.println("ALL ODIN PHASE 4 TESTS PASSED (0 leaks, 0 bad frees)")
 }

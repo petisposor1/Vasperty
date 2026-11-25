@@ -104,7 +104,7 @@ function Build-OdinBinary([string]$PkgDir, [string]$OutName, [switch]$Opt) {
     }
 
     & $Clang -municode $objPath $shimPath -o $exePath `
-        -lkernel32 -lbcrypt -lsynchronization -lntdll -luser32 -ladvapi32 -lshell32 -lws2_32 -lole32 -luuid
+        -lkernel32 -lbcrypt -lsynchronization -lntdll -luser32 -ladvapi32 -lshell32 -lws2_32 -lole32 -luuid -lwinmm
     if ($LASTEXITCODE -ne 0) {
         throw "clang link failed for $OutName (exit $LASTEXITCODE)"
     }
@@ -118,6 +118,7 @@ function Run-Check {
     Invoke-OdinCheck (Join-Path $OdinRoot "formats") "vasperty:formats" -NoEntry
     Invoke-OdinCheck (Join-Path $OdinRoot "pipeline") "vasperty:pipeline" -NoEntry
     Invoke-OdinCheck (Join-Path $OdinRoot "loader") "vasperty:loader" -NoEntry
+    Invoke-OdinCheck (Join-Path $OdinRoot "hle") "vasperty:hle" -NoEntry
     Invoke-OdinCheck (Join-Path $OdinRoot "cli") "vasperty:cli"
     Invoke-OdinCheck (Join-Path $OdinRoot "tests") "vasperty:tests"
 }
