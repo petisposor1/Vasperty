@@ -271,20 +271,39 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
     };
     let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
-    let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    let records = records.chunks_exact(stride);
-    let out = dst.chunks_exact_mut(block);
-    let t = tables;
-    match bc {
-        1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
-        3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
-        4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
-        5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
-        6 => bc6(records, out, &t.bc6),
-        _ => bc7(records, out, t),
+    let total = blocks * stride;
+    const MAX_SCRATCH_CAP: usize = 16 << 20;
+    thread_local! {
+        static RECORDS_SCRATCH: std::cell::RefCell<Vec<u8>> =
+            const { std::cell::RefCell::new(Vec::new()) };
     }
+    RECORDS_SCRATCH.with(|cell| {
+        let mut records = cell.borrow_mut();
+        if records.len() < total {
+            records.resize(total, 0);
+        }
+        let rec_slice = &mut records[..total];
+        let mut next = src.iter().copied();
+        let mut res = lanes(tables, widths, per, blocks, |_| next.next(), rec_slice);
+        if res.is_ok() {
+            let records_iter = rec_slice.chunks_exact(stride);
+            let out = dst.chunks_exact_mut(block);
+            let t = tables;
+            res = match bc {
+                1 => plain(records_iter, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
+                3 => plain(records_iter, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
+                4 => plain(records_iter, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
+                5 => plain(records_iter, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
+                6 => bc6(records_iter, out, &t.bc6),
+                _ => bc7(records_iter, out, t),
+            };
+        }
+        if records.capacity() > MAX_SCRATCH_CAP {
+            records.clear();
+            records.shrink_to(MAX_SCRATCH_CAP);
+        }
+        res
+    })
 }
 
 // Lanes.
@@ -309,10 +328,11 @@ struct Lane {
 impl Lane {
     /// One step: take the latched byte (header, length or payload) and
     /// decode at most one symbol.
-    fn step(&mut self, t: &Tables) -> Result<(), Error> {
+    #[inline]
+    fn step(&mut self, t: &Tables) {
         if self.phase != 3 {
             let Some(b) = self.latch.take() else {
-                return Ok(());
+                return;
             };
             self.need = true;
             match self.phase {
@@ -338,7 +358,7 @@ impl Lane {
                     self.phase = 3;
                 }
             }
-            return Ok(());
+            return;
         }
         let mut x = self.x;
         if x < LOW
@@ -379,14 +399,13 @@ impl Lane {
                 self.x = 0;
             }
         }
-        Ok(())
     }
 }
 
 /// The bucket holding `slot` (below 65536): the last whose start is at or
 /// below it. The window table gives the bucket of the window's first slot;
 /// later buckets that start inside the window are stepped over.
-#[inline]
+#[inline(always)]
 fn bucket_of(t: &Tables, model: u8, slot: u32) -> usize {
     let start = &t.start[usize::from(model)];
     let mut b = usize::from(t.bucket[usize::from(model)][(slot >> 8) as usize]);
@@ -428,7 +447,7 @@ fn lanes(
             let bit = 1 << j;
             let before = taken;
             if !lane.stalled {
-                lane.step(t)?;
+                lane.step(t);
             }
             let waiting = lane.out.is_some() && done & bit != 0;
             if lane.need && !waiting && taken < ROUND_BYTES {
@@ -469,6 +488,7 @@ fn lanes(
 // Blocks.
 
 /// The record's endpoint and index references.
+#[inline(always)]
 fn references(s: &[u8], paired: bool) -> (usize, usize) {
     let (d, ix) = if paired {
         (interleave(s[0], s[1]), interleave(s[2], s[3]))
@@ -479,14 +499,21 @@ fn references(s: &[u8], paired: bool) -> (usize, usize) {
     (usize::from(ix.wrapping_add(delta)), usize::from(ix))
 }
 
+/// Maps a 4-bit nibble into the even bit positions of a byte (`b3..b0 -> 0 b3 0 b2 0 b1 0 b0`).
+const SPREAD4: [u8; 16] = [
+    0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15,
+    0x40, 0x41, 0x44, 0x45, 0x50, 0x51, 0x54, 0x55,
+];
+
 /// Two 4-bit symbols, the first on the even bits.
+#[inline(always)]
 fn interleave(a: u8, b: u8) -> u8 {
-    let spread = |v: u8| (0..4).fold(0, |acc, k| acc | (v >> k & 1) << (2 * k));
-    spread(a) | spread(b) << 1
+    SPREAD4[(a & 0x0F) as usize] | (SPREAD4[(b & 0x0F) as usize] << 1)
 }
 
 /// Block `i`'s reference `r`: 0 none, else `r` blocks back, before the first
 /// block into the dictionary.
+#[inline(always)]
 fn pick<'a, T>(i: usize, r: usize, history: &'a [T], dictionary: &'a [T], zero: &'a T) -> &'a T {
     match r {
         0 => zero,
@@ -496,6 +523,7 @@ fn pick<'a, T>(i: usize, r: usize, history: &'a [T], dictionary: &'a [T], zero: 
 }
 
 /// Zigzag residual (0, -1, 1, -2, ...) modulo 2^bits.
+#[inline(always)]
 fn zz(v: u8, bits: u32) -> u8 {
     let mask = ((1u32 << bits) - 1) as u8;
     ((v >> 1) ^ if v & 1 != 0 { mask } else { 0 }) & mask
@@ -1470,7 +1498,7 @@ mod tests {
                             left: 1,
                             ..Default::default()
                         };
-                        lane.step(&t).unwrap();
+                        lane.step(&t);
                         let (sym, next) = reference_decode(&t, model, x);
                         assert_eq!(
                             (lane.out, lane.x),
@@ -1589,5 +1617,16 @@ mod tests {
             n += 1;
         }
         assert!(n > 0);
+    }
+
+    #[test]
+    fn interleave_lookup_matches_bit_spread_all_nibbles() {
+        let spread = |v: u8| (0..4).fold(0u8, |acc, k| acc | ((v >> k) & 1) << (2 * k));
+        for a in 0u8..16 {
+            for b in 0u8..16 {
+                let expected = spread(a) | (spread(b) << 1);
+                assert_eq!(interleave(a, b), expected, "a={a}, b={b}");
+            }
+        }
     }
 }

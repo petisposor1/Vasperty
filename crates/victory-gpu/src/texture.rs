@@ -146,8 +146,7 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         once!(?da, ?db, "an aliased texture not copied: its layouts differ on the host");
         return;
     }
-    let Some(buffer) = host.default_buffer(total) else { return };
-    list.keep(&buffer);
+    let Some(buffer) = list.default_temp(host, total) else { return };
     crate::texture::host_written(to);
     crate::list::ensure_state(list, from, COPY_SOURCE);
     crate::list::ensure_state(list, to, COPY_DEST);
@@ -177,6 +176,11 @@ pub(crate) fn alias_copy(list: &HostList, from: This, to: This) {
         for i in 0..n {
             l.CopyTextureRegion(&sub(b, i), 0, 0, 0, &place(&buffer, fb[i as usize]), None);
         }
+        l.ResourceBarrier(&[crate::host::transition(
+            &buffer,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        )]);
     }
     ALIAS_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static LOGGED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());

@@ -24,9 +24,14 @@ otherwise. See [docs/architecture.md](docs/architecture.md).
 | HDR Swap Chains, Tearing & 120 Hz | Negotiates `IDXGISwapChain3` color spaces (`HDR10` PQ/Rec.2020 and `scRGB` linear HDR; disable with `VICTORY_HDR=0`), `DXGI_FEATURE_PRESENT_ALLOW_TEARING` (toggle vsync with `VICTORY_VSYNC=1`), and enumerates 60 Hz, 120 Hz, and host-native display modes |
 | Indirect Mesh & Console Topologies | Unlocks `DispatchMeshX` indirect execution via GPU-clamped `ExecuteIndirect`, and expands `QUADS`, `QUAD_STRIP`, `TRIANGLE_FAN`, and `LINE_LOOP` (non-indexed and 16/32-bit indexed with primitive-restart cut handling) |
 | High-Resolution Frame Pacing | Uses Windows high-resolution waitable timers with sub-millisecond spin-wait precision and honors per-event `schedule` phase offsets |
-| Shadow Copy-Back & Pipeline Workers | Accelerates GPU-to-title copy-back with thread-local scratch reuse, 8-byte word-wide diff/merge, and scoped multi-threaded copy-back across independent buffers; adds `VICTORY_PIPELINE_WORKERS` and `VICTORY_PIPELINE_BUDGET_MS` tuning |
+| Shadow Copy-Back & Pipeline Workers | Accelerates GPU-to-title copy-back (including marked view-write pages) with shared thread-local scratch reuse, 8-byte word-wide diff/merge, and scoped multi-threaded copy-back across independent buffers; adds `VICTORY_PIPELINE_WORKERS` and `VICTORY_PIPELINE_BUDGET_MS` tuning |
 | GameInput Triggers & Battery | Advertises 4-motor rumble, blends left/right impulse trigger vibration proportionally into high-frequency rumble (`VICTORY_TRIGGER_RUMBLE_BLEND=0` to disable), and implements `GetBatteryState` via `XInputGetBatteryInformation` |
 | Real-Time Audio DSP Reverb | Replaces silent convolution output in `chad.dll` with a zero-allocation 4-line Hadamard Feedback Delay Network (FDN) stereo reverb with low-pass damping (`VICTORY_DSP_REVERB=0` to disable) |
+| GPU Transient Buffer Pooling | Power-of-two bucketed pools in `Host` for transient upload, query readback, and alias-copy default buffers, recycled on command list reset |
+| Parallel Texture Detiling | Multi-threaded row-strip and 3D-slice texture detiling (`>= 256 KiB` subresources) with 64/128-byte run unrolling in `victory-formats` |
+| Zero-Allocation DirectStorage & BCPack | Thread-local reusable worker/record scratch buffers across DirectStorage (`VICTORY_DSTORAGE_WORKERS`) and BCPack block decoding, plus lookup-table nibble interleaving and zero-branch rANS lane stepping |
+| Shader Wave Products & Float Fix | Adds GFX10 -> DXIL SM 6.6 `WaveActiveProduct` / `WavePrefixProduct` lowering (`v_mul_lo_u32` and `v_mul_f32` whole-wave reductions & prefixes) and fixes signedness metadata on inclusive float prefix sums |
+| Hardware Doctor & Benchmarks | Adds `victory doctor [--prune-cache]` (live D3D12 SM/Mesh/Atomics/Wave/Tier probing, DXIL validator check, env audit, pipeline cache stats/pruning) and `victory bench` (zero-asset detile, BCPack & DXIL throughput suite) |
 
 ## Status (2026-11-24)
 
@@ -88,6 +93,8 @@ cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)
 cargo test --workspace                   # needs no game data
 cargo run -p victory -- config           # check your paths
+cargo run -p victory -- doctor           # probe live D3D12 GPU features, dxil.dll, and cache health
+cargo run -p victory -- bench            # benchmark detiling, BCPack tables, and shader translation
 ```
 
 Run the title:

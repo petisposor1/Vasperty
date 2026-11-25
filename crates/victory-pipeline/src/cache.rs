@@ -32,6 +32,15 @@ pub struct Cache {
     root: PathBuf,
 }
 
+/// Aggregate statistics for the on-disk pipeline cache.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStats {
+    pub entries: usize,
+    pub total_bytes: u64,
+    pub stale_temps: usize,
+    pub stale_temp_bytes: u64,
+}
+
 impl Cache {
     /// Opens (creating) a cache at `root`. Refuses locations inside the repo.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
@@ -41,9 +50,76 @@ impl Cache {
         Ok(Cache { root })
     }
 
+    /// Root directory of this cache store.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn path_for(&self, key: &CacheKey) -> PathBuf {
         let hex = key.to_hex();
         self.root.join(&hex[..2]).join(&hex[2..])
+    }
+
+    /// Collects file counts and byte totals across shard directories,
+    /// distinguishing published entries from interrupted `.tmp-*` staging files.
+    pub fn stats(&self) -> Result<CacheStats> {
+        let mut stats = CacheStats::default();
+        if !self.root.exists() {
+            return Ok(stats);
+        }
+        for shard in std::fs::read_dir(&self.root)? {
+            let shard = shard?;
+            if !shard.file_type()?.is_dir() {
+                continue;
+            }
+            for item in std::fs::read_dir(shard.path())? {
+                let item = item?;
+                if !item.file_type()?.is_file() {
+                    continue;
+                }
+                let len = item.metadata()?.len();
+                let is_tmp = item.file_name().to_string_lossy().starts_with(".tmp-");
+                if is_tmp {
+                    stats.stale_temps += 1;
+                    stats.stale_temp_bytes += len;
+                } else {
+                    stats.entries += 1;
+                    stats.total_bytes += len;
+                }
+            }
+        }
+        Ok(stats)
+    }
+
+    /// Removes interrupted `.tmp-*` staging files from all shard directories,
+    /// returning `(removed_count, freed_bytes)`. Published cache entries are kept intact.
+    pub fn prune_stale_temps(&self) -> Result<(usize, u64)> {
+        let mut removed = 0usize;
+        let mut freed = 0u64;
+        if !self.root.exists() {
+            return Ok((0, 0));
+        }
+        for shard in std::fs::read_dir(&self.root)? {
+            let shard = shard?;
+            if !shard.file_type()?.is_dir() {
+                continue;
+            }
+            for item in std::fs::read_dir(shard.path())? {
+                let item = item?;
+                if !item.file_type()?.is_file() {
+                    continue;
+                }
+                if !item.file_name().to_string_lossy().starts_with(".tmp-") {
+                    continue;
+                }
+                let len = item.metadata().map(|m| m.len()).unwrap_or(0);
+                if std::fs::remove_file(item.path()).is_ok() {
+                    removed += 1;
+                    freed += len;
+                }
+            }
+        }
+        Ok((removed, freed))
     }
 
     /// Returns the cached output for `input`, converting it first if needed.
@@ -232,5 +308,36 @@ mod tests {
     fn refuses_cache_inside_repo() {
         let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("cache");
         assert!(Cache::open(inside).is_err());
+    }
+
+    #[test]
+    fn stats_and_prune_stale_temps_preserve_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let entry = cache.get_or_convert(&conv, b"abc").unwrap();
+        let shard = entry.parent().unwrap();
+        std::fs::write(shard.join(".tmp-999-0"), b"partial").unwrap();
+        std::fs::write(shard.join(".tmp-999-1"), b"junk-data").unwrap();
+
+        let before = cache.stats().unwrap();
+        assert_eq!(before.entries, 1);
+        assert_eq!(before.total_bytes, 3);
+        assert_eq!(before.stale_temps, 2);
+        assert_eq!(before.stale_temp_bytes, 16);
+
+        let (removed, freed) = cache.prune_stale_temps().unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(freed, 16);
+
+        let after = cache.stats().unwrap();
+        assert_eq!(after.entries, 1);
+        assert_eq!(after.total_bytes, 3);
+        assert_eq!(after.stale_temps, 0);
+        assert_eq!(after.stale_temp_bytes, 0);
+        assert_eq!(std::fs::read(entry).unwrap(), b"ABC");
     }
 }

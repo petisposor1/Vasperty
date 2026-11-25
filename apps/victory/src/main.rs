@@ -3,7 +3,9 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod bench;
 mod census;
+mod doctor;
 mod inspect;
 mod prebuild;
 mod run;
@@ -122,6 +124,20 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Probe live D3D12 hardware capabilities, DXIL validator, env switches,
+    /// and pipeline cache health.
+    Doctor {
+        /// Delete interrupted `.tmp-*` staging files from the pipeline cache.
+        #[arg(long)]
+        prune_cache: bool,
+    },
+    /// Run deterministic zero-asset microbenchmarks (texture detile, BCPack
+    /// tables, GFX10-to-DXIL shader translation).
+    Bench {
+        /// Number of benchmark iterations per workload.
+        #[arg(long, default_value_t = 5)]
+        iters: usize,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -193,6 +209,8 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Config => show_config(),
+        Command::Doctor { prune_cache } => doctor::run(prune_cache),
+        Command::Bench { iters } => bench::run(iters),
     }
 }
 

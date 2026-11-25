@@ -612,9 +612,16 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
-            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
-        })
+        self.walk_slice(
+            tiled,
+            mip,
+            slice,
+            linear.len(),
+            row_pitch,
+            depth_pitch,
+            linear,
+            true,
+        )
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -630,6 +637,169 @@ impl Layout {
         self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
             tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
         })
+    }
+
+    /// Detiles into `linear` (`detile_flag = true`), parallelizing across rows or
+    /// depth slices on large subresources (`>= 256 KiB`).
+    #[allow(clippy::too_many_arguments)]
+    fn walk_slice(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear_len: usize,
+        row_pitch: usize,
+        depth_pitch: usize,
+        linear: &mut [u8],
+        _detile_flag: bool,
+    ) -> Result<(), Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let depth = m.depth;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= self.slices {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let n = self.desc.element_bytes as usize;
+        let bytes = m.width as usize * n;
+        let slice_bytes = (m.height as usize - 1)
+            .checked_mul(row_pitch)
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
+        if depth > 1 && depth_pitch < slice_bytes {
+            return Err(Error::TooSmall);
+        }
+        let need = (depth as usize - 1)
+            .checked_mul(depth_pitch)
+            .and_then(|offset| offset.checked_add(slice_bytes))
+            .ok_or(Error::TooSmall)?;
+        if tiled.len() < self.size as usize || linear_len < need || row_pitch < bytes {
+            return Err(Error::TooSmall);
+        }
+        let linear_mode = self.desc.swizzle == Swizzle::LINEAR;
+        let runs = if linear_mode {
+            Vec::new()
+        } else {
+            self.row_runs(m, n, bytes)
+        };
+        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
+        let run_len = body
+            .first()
+            .map(|run| run.2)
+            .filter(|&len| body.iter().all(|run| run.2 == len));
+        let total_payload = depth as usize * m.height as usize * bytes;
+        let threads = std::thread::available_parallelism()
+            .map_or(2, std::num::NonZeroUsize::get)
+            .clamp(2, 8);
+        if depth == 1 && m.height >= 64 && total_payload >= (256 << 10) && row_pitch >= bytes {
+            let (s, inner) = self.split(first);
+            let base = u64::from(s) * self.slice_size + m.offset;
+            let height = m.height as usize;
+            let chunk_rows = height.div_ceil(threads).max(16);
+            let chunk_bytes = chunk_rows * row_pitch;
+            std::thread::scope(|scope| {
+                for (chunk_idx, out_chunk) in linear.chunks_mut(chunk_bytes).enumerate() {
+                    let y0 = chunk_idx * chunk_rows;
+                    if y0 >= height {
+                        break;
+                    }
+                    let y1 = (y0 + chunk_rows).min(height);
+                    scope.spawn(move || {
+                        for y in y0..y1 {
+                            let local_row = (y - y0) * row_pitch;
+                            if local_row + bytes > out_chunk.len() {
+                                break;
+                            }
+                            if linear_mode {
+                                let tiled_row =
+                                    (base + u64::from(y as u32) * u64::from(m.pitch) * n as u64)
+                                        as usize;
+                                out_chunk[local_row..local_row + bytes]
+                                    .copy_from_slice(&tiled[tiled_row..tiled_row + bytes]);
+                            } else {
+                                let tiled_row = (base + self.row(m, y as u32, inner)) as usize;
+                                let copy = |t: usize, l: usize, len: usize| {
+                                    out_chunk[local_row + l..local_row + l + len]
+                                        .copy_from_slice(&tiled[t..t + len]);
+                                };
+                                detile_row(body, last, run_len, tiled_row, copy);
+                            }
+                        }
+                    });
+                }
+            });
+            return Ok(());
+        }
+        if depth >= 4 && total_payload >= (256 << 10) && depth_pitch >= slice_bytes {
+            let slices_per = (depth as usize).div_ceil(threads).max(1);
+            let chunk_bytes = slices_per * depth_pitch;
+            std::thread::scope(|scope| {
+                for (chunk_idx, out_chunk) in linear.chunks_mut(chunk_bytes).enumerate() {
+                    let z0 = chunk_idx * slices_per;
+                    if z0 >= depth as usize {
+                        break;
+                    }
+                    let z1 = (z0 + slices_per).min(depth as usize);
+                    scope.spawn(move || {
+                        for z in z0..z1 {
+                            let local_slice = (z - z0) * depth_pitch;
+                            let (s, inner) = self.split(first + z as u32);
+                            let base = u64::from(s) * self.slice_size + m.offset;
+                            for y in 0..m.height {
+                                let local_row = local_slice + y as usize * row_pitch;
+                                if local_row + bytes > out_chunk.len() {
+                                    break;
+                                }
+                                if linear_mode {
+                                    let tiled_row =
+                                        (base + u64::from(y) * u64::from(m.pitch) * n as u64)
+                                            as usize;
+                                    out_chunk[local_row..local_row + bytes]
+                                        .copy_from_slice(&tiled[tiled_row..tiled_row + bytes]);
+                                } else {
+                                    let tiled_row = (base + self.row(m, y, inner)) as usize;
+                                    let copy = |t: usize, l: usize, len: usize| {
+                                        out_chunk[local_row + l..local_row + l + len]
+                                            .copy_from_slice(&tiled[t..t + len]);
+                                    };
+                                    detile_row(body, last, run_len, tiled_row, copy);
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            return Ok(());
+        }
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
+        })
+    }
+
+    fn row_runs(&self, m: &Mip, n: usize, bytes: usize) -> Vec<(usize, usize, usize)> {
+        let mut runs = Vec::new();
+        let mut first_linear = 0;
+        let mut first_tiled = self.column(m, 0) as usize;
+        for x in 1..m.width {
+            let offset = self.column(m, x) as usize;
+            let at = x as usize * n;
+            if offset != first_tiled + (at - first_linear) {
+                runs.push((first_tiled, first_linear, at - first_linear));
+                first_tiled = offset;
+                first_linear = at;
+            }
+        }
+        runs.push((first_tiled, first_linear, bytes - first_linear));
+        runs
     }
 
     /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
@@ -718,6 +888,8 @@ impl Layout {
                         Some(8) => copy_runs::<8>(body, tiled_row, linear_row, &mut copy),
                         Some(16) => copy_runs::<16>(body, tiled_row, linear_row, &mut copy),
                         Some(32) => copy_runs::<32>(body, tiled_row, linear_row, &mut copy),
+                        Some(64) => copy_runs::<64>(body, tiled_row, linear_row, &mut copy),
+                        Some(128) => copy_runs::<128>(body, tiled_row, linear_row, &mut copy),
                         _ => copy_runs::<0>(body, tiled_row, linear_row, &mut copy),
                     }
                     copy_runs::<0>(last, tiled_row, linear_row, &mut copy);
@@ -726,6 +898,24 @@ impl Layout {
         }
         Ok(())
     }
+}
+
+fn detile_row(
+    body: &[(usize, usize, usize)],
+    last: &[(usize, usize, usize)],
+    run_len: Option<usize>,
+    tiled_row: usize,
+    mut copy: impl FnMut(usize, usize, usize),
+) {
+    match run_len {
+        Some(8) => copy_runs::<8>(body, tiled_row, 0, &mut copy),
+        Some(16) => copy_runs::<16>(body, tiled_row, 0, &mut copy),
+        Some(32) => copy_runs::<32>(body, tiled_row, 0, &mut copy),
+        Some(64) => copy_runs::<64>(body, tiled_row, 0, &mut copy),
+        Some(128) => copy_runs::<128>(body, tiled_row, 0, &mut copy),
+        _ => copy_runs::<0>(body, tiled_row, 0, &mut copy),
+    }
+    copy_runs::<0>(last, tiled_row, 0, &mut copy);
 }
 
 /// Copy micro-tile runs inline at a known width, or use each run's length for N = 0.
@@ -1364,5 +1554,42 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn parallel_2d_and_3d_detile_matches_tile_round_trip() {
+        // Large 2D texture (>= 256 KiB and height >= 64) triggers row-strip parallel detile.
+        for swizzle in [Swizzle::SW_64KB_S, Swizzle::SW_64KB_D] {
+            let layout = Layout::new(&desc(512, 256, 1, 4, swizzle)).unwrap();
+            let row_pitch = 512 * 4;
+            let linear: Vec<u8> = (0..256 * row_pitch)
+                .map(|i| ((i * 13 + (i >> 9)) & 0xff) as u8)
+                .collect();
+            let mut tiled = vec![0u8; layout.size as usize];
+            layout.tile(&mut tiled, 0, 0, &linear, row_pitch, 0).unwrap();
+            let mut back = vec![0xccu8; linear.len()];
+            layout.detile(&tiled, 0, 0, &mut back, row_pitch, 0).unwrap();
+            assert_eq!(back, linear, "2D parallel detile mismatch for {swizzle:?}");
+        }
+
+        // Large 3D texture (depth >= 4 and >= 256 KiB) triggers slice-parallel detile.
+        let vol = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 8,
+            ..desc(128, 64, 1, 4, Swizzle::SW_64KB_S)
+        })
+        .unwrap();
+        let row_pitch = 128 * 4;
+        let depth_pitch = 64 * row_pitch;
+        let linear3d: Vec<u8> = (0..8 * depth_pitch)
+            .map(|i| ((i * 7 + (i >> 8)) & 0xff) as u8)
+            .collect();
+        let mut tiled3d = vec![0u8; vol.size as usize];
+        vol.tile(&mut tiled3d, 0, 0, &linear3d, row_pitch, depth_pitch)
+            .unwrap();
+        let mut back3d = vec![0x55u8; linear3d.len()];
+        vol.detile(&tiled3d, 0, 0, &mut back3d, row_pitch, depth_pitch)
+            .unwrap();
+        assert_eq!(back3d, linear3d, "3D parallel detile mismatch");
     }
 }

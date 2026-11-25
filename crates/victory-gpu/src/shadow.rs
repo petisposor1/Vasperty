@@ -181,13 +181,16 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) || title == host {
-            return 0;
-        }
-        {
+        let differing = with_title_scratch(n, |title| {
+            if !crate::host::read_into(from as *const u8, title) || title == host {
+                return false;
+            }
             let _writing = crate::watch::writing(from, n);
             crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
+            true
+        });
+        if !differing {
+            return 0;
         }
         // Our write is not the title's: the copy holds the page as it is.
         if let Some(t) = &self.tracked {
@@ -356,10 +359,6 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
-            thread_local! {
-                static TITLE_SCRATCH: std::cell::RefCell<Vec<u8>> =
-                    std::cell::RefCell::new(vec![0u8; PIECE]);
-            }
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -378,9 +377,7 @@ impl Shadow {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
                 if host != old {
-                    let copied = TITLE_SCRATCH.with(|buf| {
-                        let mut buf = buf.borrow_mut();
-                        let title = &mut buf[..n];
+                    let copied = with_title_scratch(n, |title| {
                         if !crate::host::read_into((start + at) as *const u8, title) {
                             return false;
                         }
@@ -453,36 +450,43 @@ impl Shadow {
         let n = to - from;
         // SAFETY: inside the mapping; only the submitting thread writes it.
         let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-        let mut title = vec![0u8; n];
-        if !crate::host::read_into(from as *const u8, &mut title) {
-            return 0;
-        }
-        let written = match &saved {
-            // The title's bytes are the copy's from before: what differs is
-            // the shaders'.
-            None => (*host != title[..]).then_some(host.as_ptr()),
-            Some(before) => {
-                let before = &before[from - page..to - page];
-                let mut changed = false;
-                for ((t, h), b) in title.iter_mut().zip(host.iter_mut()).zip(before) {
-                    if *h != *b && *t != *h {
-                        *t = *h;
-                        changed = true;
-                    }
-                    *h = *t;
-                }
-                changed.then_some(title.as_ptr())
+        let copied = with_title_scratch(n, |title| {
+            if !crate::host::read_into(from as *const u8, title) {
+                return None;
             }
+            let wrote = match &saved {
+                // The title's bytes are the copy's from before: what differs is
+                // the shaders'.
+                None => {
+                    if *host != title[..] {
+                        let _writing = crate::watch::writing(from, n);
+                        crate::host::write_mapped(from as *mut u8, host.as_ptr(), n);
+                        n
+                    } else {
+                        0
+                    }
+                }
+                Some(before) => {
+                    let before = &before[from - page..to - page];
+                    if merge_gpu_writes(title, host, before) {
+                        let _writing = crate::watch::writing(from, n);
+                        crate::host::write_mapped(from as *mut u8, title.as_ptr(), n);
+                        n
+                    } else {
+                        0
+                    }
+                }
+            };
+            Some(wrote)
+        });
+        let Some(wrote) = copied else {
+            return 0;
         };
-        if let Some(bytes) = written {
-            let _writing = crate::watch::writing(from, n);
-            crate::host::write_mapped(from as *mut u8, bytes, n);
-        }
         // Equal to title memory now: taken, unless it holds the page in part.
         if from == page && to == page + PAGE {
             t.taken(&[page / PAGE]);
         }
-        written.map_or(0, |_| n)
+        wrote
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -782,6 +786,22 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
         #[cfg(not(feature = "diagnostics"))]
         let _ = written;
     }
+}
+
+/// Runs `f` with a reusable thread-local buffer of `n` bytes (at least 64 KiB cached),
+/// avoiding per-page heap allocations during shadow copy-back.
+fn with_title_scratch<R>(n: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    thread_local! {
+        static TITLE_SCRATCH: std::cell::RefCell<Vec<u8>> =
+            std::cell::RefCell::new(vec![0u8; PAGE]);
+    }
+    TITLE_SCRATCH.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if buf.len() < n {
+            buf.resize(n, 0);
+        }
+        f(&mut buf[..n])
+    })
 }
 
 /// Merges GPU-written bytes from `host` (relative to `old`) into `title`
@@ -1131,10 +1151,6 @@ mod tests {
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
-    }
-
-        assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
-        assert_eq!(pages(0x2_0000, 0x1_0000), 1);
     }
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`

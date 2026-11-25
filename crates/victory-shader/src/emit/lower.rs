@@ -1162,14 +1162,16 @@ impl<'a> Lower<'a> {
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
         self.s.flags |= flags::WAVE_OPS;
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        let float = matches!(op, Op::AddF | Op::MulF | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
         let arg = if float { self.as_float(x) } else { x };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
-            (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+            (Op::AddU | Op::AddF | Op::MulU | Op::MulF, Some(inclusive)) => {
+                let code = u8::from(matches!(op, Op::MulU | Op::MulF));
+                let unsigned = u8::from(matches!(op, Op::AddU | Op::MulU));
+                let (k0, k1) = (self.s.m.i8(code), self.s.m.i8(unsigned));
                 let r = self.s.op(
                     c,
                     &format!("wavePrefixOp.{sfx}"),
@@ -1179,12 +1181,17 @@ impl<'a> Lower<'a> {
                     &[arg, k0, k1],
                 );
                 if inclusive {
-                    self.s.m.bin(c, Bin::Add, r, arg)
+                    let bin = if matches!(op, Op::MulU | Op::MulF) {
+                        Bin::Mul
+                    } else {
+                        Bin::Add
+                    };
+                    self.s.m.bin(c, bin, r, arg)
                 } else {
                     r
                 }
             }
-            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
+            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum or product"),
             (Op::Or | Op::And | Op::Xor, None) => {
                 let k = self.s.m.i8(match op {
                     Op::And => 0,
@@ -1198,6 +1205,8 @@ impl<'a> Lower<'a> {
                 let (code, unsigned) = match op {
                     Op::AddU => (0, 1),
                     Op::AddF => (0, 0),
+                    Op::MulU => (1, 1),
+                    Op::MulF => (1, 0),
                     Op::MinU => (2, 1),
                     Op::MaxU => (3, 1),
                     Op::MinI | Op::MinF => (2, 0),
@@ -10723,6 +10732,82 @@ mod tests {
         // No parameter starts in rows 1, 3 or 4.
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
+        }
+    }
+
+    #[test]
+    fn wave_product_and_inclusive_float_prefix_lower() {
+        const S_ENDPGM: u32 = 0xBF81_0000;
+        let sop1 = |sdst: u8, op: u8, ssrc0: u8| -> u32 {
+            0xBE80_0000 | (u32::from(sdst) << 16) | (u32::from(op) << 8) | u32::from(ssrc0)
+        };
+        let vop1 = |vdst: u8, op: u8, src0: u16| -> u32 {
+            0x7E00_0000 | (u32::from(vdst) << 17) | (u32::from(op) << 9) | u32::from(src0)
+        };
+        let vop2 = |vdst: u8, op: u8, src0: u16, vsrc1: u8| -> u32 {
+            (u32::from(op) << 25)
+                | (u32::from(vdst) << 17)
+                | (u32::from(vsrc1) << 9)
+                | u32::from(src0)
+        };
+        let dpp16 = |vsrc0: u8, ctrl: u16| -> u32 {
+            (0xF << 28) | (0xF << 24) | (u32::from(ctrl) << 8) | u32::from(vsrc0)
+        };
+        let vop3 = |vdst: u8, op: u16, src0: u16, src1: u16, src2: u16| -> [u32; 2] {
+            [
+                0xD400_0000 | (u32::from(op) << 16) | u32::from(vdst),
+                u32::from(src0 & 0x1FF)
+                    | (u32::from(src1 & 0x1FF) << 9)
+                    | (u32::from(src2 & 0x1FF) << 18),
+            ]
+        };
+
+        #[derive(Clone, Copy)]
+        enum Kind {
+            AddF,
+            MulF,
+            MulU,
+        }
+
+        for kind in [Kind::AddF, Kind::MulF, Kind::MulU] {
+            let ident_code = match kind {
+                Kind::AddF => 128,
+                Kind::MulF => 242,
+                Kind::MulU => 129,
+            };
+            let mut w = Vec::new();
+            w.push(sop1(0, 0x3D, 193)); // s_or_saveexec_b32 s0, -1
+            w.extend(vop3(1, 0x101, ident_code, 256, 0)); // v_cndmask_b32 v1, ident, v0, s0
+            for shift in [1u16, 2, 4, 8] {
+                w.push(vop1(3, 0x01, ident_code)); // v_mov_b32 v3, ident
+                w.push(vop1(3, 0x01, 0xFA)); // v_mov_b32 v3, v1_dpp
+                w.push(dpp16(1, 0x110 + shift));
+                match kind {
+                    Kind::AddF => w.push(vop2(1, 0x03, 259, 1)), // v_add_f32 v1, v3, v1
+                    Kind::MulF => w.push(vop2(1, 0x08, 259, 1)), // v_mul_f32 v1, v3, v1
+                    Kind::MulU => w.extend(vop3(1, 0x169, 259, 257, 0)), // v_mul_lo_u32 v1, v3, v1
+                }
+            }
+            w.extend(vop3(2, 0x360, 257, 128 + 15, 0)); // v_readlane_b32 s2, v1, 15
+            w.push(sop1(crate::ir::EXEC, 0x03, 255));
+            w.push(0xFFFF_0000);
+            match kind {
+                Kind::AddF => w.push(vop2(1, 0x03, 2, 1)), // v_add_f32 v1, s2, v1
+                Kind::MulF => w.push(vop2(1, 0x08, 2, 1)), // v_mul_f32 v1, s2, v1
+                Kind::MulU => w.extend(vop3(1, 0x169, 2, 257, 0)), // v_mul_lo_u32 v1, s2, v1
+            }
+            w.push(sop1(crate::ir::EXEC, 0x03, 0)); // s_mov_b32 exec_lo, s0
+            w.push(0xD834_0000);
+            w.push(0x0000_0100); // ds_write_b32 v0, v1
+            w.push(S_ENDPGM);
+
+            let lowered = lower_wave(&w, vec![], vec![], false)
+                .unwrap_or_else(|e| panic!("wave prefix failed to lower: {e}"));
+            assert!(lowered.wave_ops);
+            let container = crate::Container::parse(&lowered.dxil).unwrap();
+            let features = container.part(crate::FourCC::SFI0).unwrap();
+            let flags = u64::from_le_bytes(features.data.try_into().unwrap());
+            assert_ne!(flags & 0x4000, 0, "SFI0 {flags:#x}: missing WAVE_OPS");
         }
     }
 }

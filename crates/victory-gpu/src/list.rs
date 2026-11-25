@@ -911,11 +911,10 @@ extern "system" fn resolve_queries(
         && let Some((host_heap, heap_kind, heap_count)) = crate::query::host_heap(heap)
         && first.checked_add(count).is_some_and(|last| last <= heap_count)
         && let Some(ty) = crate::query::host_query_type(heap_kind, kind)
-        && let Some((readback, mapped)) = host.readback_buffer(total)
+        && let Some((readback, mapped)) = list.readback(host, total)
     {
         list.keep(&host_heap);
-        list.keep(&readback);
-        // SAFETY: open list, live heap and readback buffer kept until reset.
+        // SAFETY: open list, live heap and pooled readback buffer kept until reset.
         unsafe {
             list.list
                 .ResolveQueryData(&host_heap, ty, first, count, &readback, 0);
@@ -923,8 +922,7 @@ extern "system" fn resolve_queries(
         let dst = (data as usize).wrapping_add(offset as usize);
         let src = mapped as usize;
         let len = total as usize;
-        // Keep a strong handle to `readback` inside the closure so the mapped
-        // pointer stays valid even if the closure runs after other deferred work.
+        // `readback` stays alive in `Deferred::pooled_readbacks` until `HostList::reset()`.
         list.defer_after(move || {
             let _keep = &readback;
             crate::host::write_mapped(dst as *mut u8, src as *const u8, len);

@@ -36,6 +36,63 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
 
+const POOL_MAX_TOTAL_BYTES: u64 = 128 << 20;
+const POOL_MAX_ENTRY_BYTES: u64 = 32 << 20;
+
+/// Bounded, power-of-two bucketed pool for transient D3D12 buffers.
+struct BufferPool<T> {
+    entries: Mutex<(u64, Vec<(u64, T)>)>,
+    max_total_bytes: u64,
+}
+
+impl<T> BufferPool<T> {
+    fn new(max_total_bytes: u64) -> Self {
+        Self {
+            entries: Mutex::new((0, Vec::new())),
+            max_total_bytes,
+        }
+    }
+
+    fn bucket_size(min_bytes: u64) -> u64 {
+        min_bytes.max(4096).next_power_of_two()
+    }
+
+    fn take(&self, min_bytes: u64) -> Option<(u64, T)> {
+        let min_bytes = min_bytes.max(1);
+        let max_accept = min_bytes.max(4096).saturating_mul(2);
+        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let best = guard
+            .1
+            .iter()
+            .enumerate()
+            .filter(|(_, (cap, _))| *cap >= min_bytes && *cap <= max_accept)
+            .min_by_key(|(_, (cap, _))| *cap)
+            .map(|(idx, _)| idx)?;
+        let (cap, item) = guard.1.swap_remove(best);
+        guard.0 = guard.0.saturating_sub(cap);
+        Some((cap, item))
+    }
+
+    fn put(&self, capacity: u64, item: T) {
+        if capacity == 0 || capacity > POOL_MAX_ENTRY_BYTES || capacity > self.max_total_bytes {
+            return;
+        }
+        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        guard.0 += capacity;
+        guard.1.push((capacity, item));
+        while guard.0 > self.max_total_bytes && !guard.1.is_empty() {
+            let (evicted, _) = guard.1.remove(0);
+            guard.0 = guard.0.saturating_sub(evicted);
+        }
+    }
+
+    #[cfg(test)]
+    fn stats(&self) -> (usize, u64) {
+        let guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        (guard.1.len(), guard.0)
+    }
+}
+
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
     queue: ID3D12CommandQueue,
@@ -59,6 +116,9 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Presentation>,
+    upload_pool: BufferPool<(ID3D12Resource, usize)>,
+    readback_pool: BufferPool<(ID3D12Resource, usize)>,
+    default_pool: BufferPool<ID3D12Resource>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -254,6 +314,9 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(Presentation::default()),
+            upload_pool: BufferPool::new(POOL_MAX_TOTAL_BYTES),
+            readback_pool: BufferPool::new(POOL_MAX_TOTAL_BYTES),
+            default_pool: BufferPool::new(POOL_MAX_TOTAL_BYTES),
         })
     }
 }
@@ -473,6 +536,262 @@ mod tests {
             DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
         );
     }
+
+    #[test]
+    fn buffer_pool_buckets_evicts_and_recycles_on_host() {
+        assert_eq!(BufferPool::<()>::bucket_size(1), 4096);
+        assert_eq!(BufferPool::<()>::bucket_size(4096), 4096);
+        assert_eq!(BufferPool::<()>::bucket_size(4097), 8192);
+        let pool = BufferPool::new(16384);
+        pool.put(8192, 1u32);
+        pool.put(4096, 2u32);
+        assert_eq!(pool.stats(), (2, 12288));
+        // Best-fit picks 4096 over 8192 for a 3000-byte request.
+        assert_eq!(pool.take(3000), Some((4096, 2)));
+        assert_eq!(pool.stats(), (1, 8192));
+        // Evicts oldest when exceeding max_total_bytes (16384).
+        pool.put(8192, 3u32);
+        pool.put(4096, 4u32);
+        assert!(pool.stats().1 <= 16384);
+        // Oversized (> 32 MiB) is not retained.
+        pool.put(POOL_MAX_ENTRY_BYTES + 1, 99u32);
+        assert_eq!(pool.take(POOL_MAX_ENTRY_BYTES + 1), None);
+
+        // Live GPU buffer recycling across HostList::reset().
+        let Some(host) = host() else { return };
+        let list = host.new_list().unwrap();
+        let (u1, _) = list.upload(host, 1024).expect("pooled upload");
+        let (r1, _) = list.readback(host, 64).expect("pooled readback");
+        let u1_raw = u1.as_raw();
+        let r1_raw = r1.as_raw();
+        drop((u1, r1));
+        list.close();
+        list.reset();
+        let (u2, _) = list.upload(host, 1024).expect("reused upload");
+        let (r2, _) = list.readback(host, 64).expect("reused readback");
+        assert_eq!(u2.as_raw(), u1_raw, "upload buffer should be reused from pool");
+        assert_eq!(r2.as_raw(), r1_raw, "readback buffer should be reused from pool");
+        drop((u2, r2));
+        list.close();
+        list.reset();
+    }
+
+    #[test]
+    fn probe_capabilities_reports_live_adapter_details() {
+        let Some(caps) = super::probe_capabilities() else {
+            return;
+        };
+        assert!(!caps.adapter_name.is_empty());
+        assert!(caps.wave_lane_count_min >= 4 || !caps.wave_ops);
+        assert!(caps.display_mode_count >= 1);
+    }
+}
+
+/// Hardware feature matrix of the active host D3D12 GPU and primary display.
+#[derive(Debug, Clone)]
+pub struct HostCapabilities {
+    pub adapter_name: String,
+    pub vendor_id: u32,
+    pub device_id: u32,
+    pub dedicated_video_memory: u64,
+    pub shared_system_memory: u64,
+    pub highest_shader_model: &'static str,
+    pub mesh_shaders: bool,
+    pub mesh_shader_tier: u32,
+    pub depth_bounds: bool,
+    pub heap_atomics64: bool,
+    pub fuses_fmad: Option<bool>,
+    pub wave_ops: bool,
+    pub wave_lane_count_min: u32,
+    pub wave_lane_count_max: u32,
+    pub resource_binding_tier: u32,
+    pub resource_heap_tier: u32,
+    pub raytracing_tier: u32,
+    pub vrs_tier: u32,
+    pub allow_tearing: bool,
+    pub display_mode_count: usize,
+    pub max_refresh_hz: u32,
+}
+
+/// Probes the host D3D12 device, DXGI adapter metadata, shader/rendering tiers,
+/// and display refresh capabilities. Returns `None` if no host D3D12 device is available.
+pub fn probe_capabilities() -> Option<HostCapabilities> {
+    let host = host()?;
+    let (mut adapter_name, mut vendor_id, mut device_id, mut dedicated_video_memory, mut shared_system_memory) =
+        ("Unknown D3D12 Adapter".to_owned(), 0u32, 0u32, 0u64, 0u64);
+    let mut allow_tearing = false;
+
+    // SAFETY: standard COM/DXGI queries on the live D3D12 device.
+    unsafe {
+        let luid = host.device.GetAdapterLuid();
+        if let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) {
+            if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid)
+                && let Ok(desc) = adapter.GetDesc1()
+            {
+                let end = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                adapter_name = String::from_utf16_lossy(&desc.Description[..end]);
+                vendor_id = desc.VendorId;
+                device_id = desc.DeviceId;
+                dedicated_video_memory = desc.DedicatedVideoMemory as u64;
+                shared_system_memory = desc.SharedSystemMemory as u64;
+            }
+            if let Ok(f5) = factory.cast::<IDXGIFactory5>() {
+                let mut supported = 0u32;
+                allow_tearing = f5
+                    .CheckFeatureSupport(
+                        DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                        (&raw mut supported).cast(),
+                        size_of::<u32>() as u32,
+                    )
+                    .is_ok()
+                    && supported != 0;
+            }
+        }
+    }
+
+    let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_8,
+    };
+    // SAFETY: CheckFeatureSupport writes only the passed struct.
+    let sm_ok = unsafe {
+        host.device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+            .is_ok()
+    };
+    let highest_shader_model = if !sm_ok {
+        sm.HighestShaderModel = D3D_SHADER_MODEL_6_6;
+        // SAFETY: CheckFeatureSupport writes only the passed struct.
+        let ok66 = unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut sm).cast(),
+                    size_of_val(&sm) as u32,
+                )
+                .is_ok()
+        };
+        if ok66 {
+            shader_model_label(sm.HighestShaderModel.0)
+        } else {
+            "< SM 6.6"
+        }
+    } else {
+        shader_model_label(sm.HighestShaderModel.0)
+    };
+
+    let mut opt0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    let mut opt1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    let mut opt5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+    let mut opt6 = D3D12_FEATURE_DATA_D3D12_OPTIONS6::default();
+    let mut opt7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    // SAFETY: each CheckFeatureSupport populates its matching struct.
+    unsafe {
+        let _ = host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS,
+            (&raw mut opt0).cast(),
+            size_of_val(&opt0) as u32,
+        );
+        let _ = host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut opt1).cast(),
+            size_of_val(&opt1) as u32,
+        );
+        let _ = host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS5,
+            (&raw mut opt5).cast(),
+            size_of_val(&opt5) as u32,
+        );
+        let _ = host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS6,
+            (&raw mut opt6).cast(),
+            size_of_val(&opt6) as u32,
+        );
+        let _ = host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS7,
+            (&raw mut opt7).cast(),
+            size_of_val(&opt7) as u32,
+        );
+    }
+
+    let fuses_fmad = (victory_shader::emit::host::Host {
+        device: host.device.clone(),
+    })
+    .fuses_fmad()
+    .ok();
+
+    let (display_mode_count, max_refresh_hz) = {
+        use windows::Win32::Graphics::Gdi::{
+            DEVMODEW, ENUM_DISPLAY_SETTINGS_MODE, EnumDisplaySettingsW,
+        };
+        let mut count = 0usize;
+        let mut max_hz = 0u32;
+        let mut idx = 0u32;
+        loop {
+            let mut dev = DEVMODEW {
+                dmSize: size_of::<DEVMODEW>() as u16,
+                ..Default::default()
+            };
+            // SAFETY: `dev` is initialized with valid `dmSize`.
+            if !unsafe {
+                EnumDisplaySettingsW(None, ENUM_DISPLAY_SETTINGS_MODE(idx), &mut dev)
+            }
+            .as_bool()
+            {
+                break;
+            }
+            count += 1;
+            max_hz = max_hz.max(dev.dmDisplayFrequency);
+            idx = idx.saturating_add(1);
+        }
+        (count, max_hz)
+    };
+
+    Some(HostCapabilities {
+        adapter_name,
+        vendor_id,
+        device_id,
+        dedicated_video_memory,
+        shared_system_memory,
+        highest_shader_model,
+        mesh_shaders: host.mesh_shaders(),
+        mesh_shader_tier: opt7.MeshShaderTier.0 as u32,
+        depth_bounds: host.depth_bounds_supported(),
+        heap_atomics64: host.heap_atomics64(),
+        fuses_fmad,
+        wave_ops: opt1.WaveOps.as_bool(),
+        wave_lane_count_min: opt1.WaveLaneCountMin,
+        wave_lane_count_max: opt1.WaveLaneCountMax,
+        resource_binding_tier: opt0.ResourceBindingTier.0 as u32,
+        resource_heap_tier: opt0.ResourceHeapTier.0 as u32,
+        raytracing_tier: opt5.RaytracingTier.0 as u32,
+        vrs_tier: opt6.VariableShadingRateTier.0 as u32,
+        allow_tearing,
+        display_mode_count,
+        max_refresh_hz,
+    })
+}
+
+fn shader_model_label(raw: i32) -> &'static str {
+    match raw {
+        0x68 => "SM 6.8",
+        0x67 => "SM 6.7",
+        0x66 => "SM 6.6",
+        0x65 => "SM 6.5",
+        0x64 => "SM 6.4",
+        0x63 => "SM 6.3",
+        0x62 => "SM 6.2",
+        0x61 => "SM 6.1",
+        0x60 => "SM 6.0",
+        _ => "SM < 6.0",
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -674,6 +993,9 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    pooled_uploads: Vec<(ID3D12Resource, usize, u64)>,
+    pooled_readbacks: Vec<(ID3D12Resource, usize, u64)>,
+    pooled_defaults: Vec<(ID3D12Resource, u64)>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
@@ -1454,7 +1776,18 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        *self.deferred() = Deferred::default();
+        let old = std::mem::take(&mut *self.deferred());
+        if let Some(host) = host() {
+            for (buf, ptr, cap) in old.pooled_uploads {
+                host.recycle_upload(buf, ptr as *mut u8, cap);
+            }
+            for (buf, ptr, cap) in old.pooled_readbacks {
+                host.recycle_readback(buf, ptr as *const u8, cap);
+            }
+            for (buf, cap) in old.pooled_defaults {
+                host.recycle_default(buf, cap);
+            }
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1773,15 +2106,33 @@ impl HostList {
         self.deferred().writes.push((dst as usize, what, bytes));
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    /// A mapped upload buffer of `size` bytes, pooled across list resets.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
+        let (buffer, data, cap) = host.acquire_upload(size)?;
+        name(&buffer, || format!("list upload {cap:#x}"));
+        self.deferred()
+            .pooled_uploads
+            .push((buffer.clone(), data as usize, cap));
         Some((buffer, data))
+    }
+
+    /// A mapped readback buffer of `size` bytes, pooled across list resets.
+    pub(crate) fn readback(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *const u8)> {
+        let (buffer, data, cap) = host.acquire_readback(size)?;
+        name(&buffer, || format!("list readback {cap:#x}"));
+        self.deferred()
+            .pooled_readbacks
+            .push((buffer.clone(), data as usize, cap));
+        Some((buffer, data))
+    }
+
+    /// A default-heap temporary buffer of `size` bytes (starting and ending in
+    /// `COPY_DEST`), pooled across list resets.
+    pub(crate) fn default_temp(&self, host: &Host, size: u64) -> Option<ID3D12Resource> {
+        let (buffer, cap) = host.acquire_default(size)?;
+        name(&buffer, || format!("list default {cap:#x}"));
+        self.deferred().pooled_defaults.push((buffer.clone(), cap));
+        Some(buffer)
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
@@ -2391,6 +2742,45 @@ impl Host {
                 None
             }
         }
+    }
+
+    pub(crate) fn acquire_upload(&self, size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+        if let Some((cap, (buf, ptr))) = self.upload_pool.take(size) {
+            return Some((buf, ptr as *mut u8, cap));
+        }
+        let cap = BufferPool::<()>::bucket_size(size);
+        let (buf, ptr) = self.upload_buffer(cap)?;
+        Some((buf, ptr, cap))
+    }
+
+    pub(crate) fn recycle_upload(&self, buffer: ID3D12Resource, data: *mut u8, capacity: u64) {
+        self.upload_pool.put(capacity, (buffer, data as usize));
+    }
+
+    pub(crate) fn acquire_readback(&self, size: u64) -> Option<(ID3D12Resource, *const u8, u64)> {
+        if let Some((cap, (buf, ptr))) = self.readback_pool.take(size) {
+            return Some((buf, ptr as *const u8, cap));
+        }
+        let cap = BufferPool::<()>::bucket_size(size);
+        let (buf, ptr) = self.readback_buffer(cap)?;
+        Some((buf, ptr, cap))
+    }
+
+    pub(crate) fn recycle_readback(&self, buffer: ID3D12Resource, data: *const u8, capacity: u64) {
+        self.readback_pool.put(capacity, (buffer, data as usize));
+    }
+
+    pub(crate) fn acquire_default(&self, size: u64) -> Option<(ID3D12Resource, u64)> {
+        if let Some((cap, buf)) = self.default_pool.take(size) {
+            return Some((buf, cap));
+        }
+        let cap = BufferPool::<()>::bucket_size(size);
+        let buf = self.default_buffer(cap)?;
+        Some((buf, cap))
+    }
+
+    pub(crate) fn recycle_default(&self, buffer: ID3D12Resource, capacity: u64) {
+        self.default_pool.put(capacity, buffer);
     }
 }
 

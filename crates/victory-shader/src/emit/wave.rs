@@ -21,6 +21,8 @@ use crate::ir::{EXEC, Inst, Program, Reg, Value};
 pub(crate) enum Op {
     AddU,
     AddF,
+    MulU,
+    MulF,
     MinU,
     MaxU,
     MinI,
@@ -40,6 +42,8 @@ impl Op {
             // The low dwords of a 64-bit sum (the carry is not followed).
             "v_add_nc_u32" | "v_add_co_u32" => Op::AddU,
             "v_add_f32" => Op::AddF,
+            "v_mul_lo_u32" => Op::MulU,
+            "v_mul_f32" => Op::MulF,
             "v_min_u32" => Op::MinU,
             "v_max_u32" => Op::MaxU,
             "v_min_i32" => Op::MinI,
@@ -58,6 +62,8 @@ impl Op {
         match self {
             Op::AddU | Op::Or | Op::Xor | Op::MaxU => k == 0,
             Op::AddF => k == 0 || k == 0x8000_0000,
+            Op::MulU => k == 1,
+            Op::MulF => k == 0x3F80_0000,
             Op::MinU | Op::And => k == u32::MAX,
             Op::MinI => k == 0x7FFF_FFFF,
             Op::MaxI => k == 0x8000_0000,
@@ -69,7 +75,7 @@ impl Op {
 
     /// Counting a lane twice changes the result.
     fn counts(self) -> bool {
-        matches!(self, Op::AddU | Op::AddF | Op::Xor | Op::AddH)
+        matches!(self, Op::AddU | Op::AddF | Op::MulU | Op::MulF | Op::Xor | Op::AddH)
     }
 }
 
@@ -1041,6 +1047,88 @@ mod tests {
                 .collect();
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
+        }
+    }
+
+    #[test]
+    fn wave_product_ops_recognise_active_and_prefix() {
+        for wave64 in [false, true] {
+            let save_op = if wave64 { 0x25 } else { 0x3D };
+            let mov_exec = if wave64 { 0x04 } else { 0x03 };
+            let push_exec_lit = |w: &mut Vec<u32>, lit: u32| {
+                w.push(sop1(EXEC, 0x03, 255));
+                w.push(lit);
+            };
+            for &(is_float, ident_code, ident_bits) in &[
+                (true, 242u16, 1.0f32.to_bits()),
+                (false, 129u16, 1u32),
+            ] {
+                let mut w = Vec::new();
+                w.push(sop1(0, save_op, 193));
+                w.extend(vop3(1, 0x101, ident_code, 256, 0)); // v_cndmask_b32 v1, 1, v0, s0
+                for shift in [1u16, 2, 4, 8] {
+                    // Pre-fill out-of-bounds lanes of `v3` with the multiplicative identity.
+                    w.push(vop1(3, 0x01, ident_code));
+                    // v_mov_b32 v3, v1 row_shr:<shift> row_mask:0xf bank_mask:0xf
+                    w.push(vop1(3, 0x01, 0xFA));
+                    w.push(dpp16(1, 0x110 + shift, 0xF, 0xF, false));
+                    if is_float {
+                        w.push(vop2(1, 0x08, 259, 1)); // v_mul_f32 v1, v3, v1
+                    } else {
+                        w.extend(vop3(1, 0x169, 259, 257, 0)); // v_mul_lo_u32 v1, v3, v1
+                    }
+                }
+                // Cross-half-row 16-lane join (prefix across lanes 0..31): s2 = v1[15].
+                w.extend(vop3(2, 0x360, 257, 128 + 15, 0));
+                push_exec_lit(&mut w, 0xFFFF_0000);
+                if wave64 {
+                    w.push(sop1(EXEC + 1, 0x03, 128));
+                }
+                if is_float {
+                    w.push(vop2(1, 0x08, 2, 1)); // v_mul_f32 v1, s2, v1
+                } else {
+                    w.extend(vop3(1, 0x169, 2, 257, 0)); // v_mul_lo_u32 v1, s2, v1
+                }
+                if wave64 {
+                    w.push(sop1(EXEC, mov_exec, 193));
+                    w.extend(vop3(2, 0x360, 257, 128 + 31, 0));
+                    w.push(sop1(EXEC, 0x03, 128));
+                    w.push(sop1(EXEC + 1, 0x03, 255));
+                    w.push(0x0000_FFFF);
+                    if is_float {
+                        w.push(vop2(1, 0x08, 2, 1));
+                    } else {
+                        w.extend(vop3(1, 0x169, 2, 257, 0));
+                    }
+                    w.push(sop1(EXEC, mov_exec, 193));
+                    w.extend(vop3(2, 0x360, 257, 128 + 47, 0));
+                    w.push(sop1(EXEC, 0x03, 128));
+                    w.push(sop1(EXEC + 1, 0x03, 255));
+                    w.push(0xFFFF_0000);
+                    if is_float {
+                        w.push(vop2(1, 0x08, 2, 1));
+                    } else {
+                        w.extend(vop3(1, 0x169, 2, 257, 0));
+                    }
+                }
+                w.push(sop1(EXEC, mov_exec, 0)); // restore EXEC
+
+                let p = build(&w, wave64);
+                let insts = &p.blocks[0].insts;
+                let saved = insts[0].write(Reg::S(0)).unwrap();
+                let v0_in = p
+                    .inputs
+                    .iter()
+                    .find_map(|&(r, v)| (r == Reg::V(0)).then_some(v))
+                    .unwrap();
+                let v1_val = insts[insts.len() - 3].write(Reg::V(1)).unwrap();
+                let sec = &sections(&p, 0)[&0];
+                let expected_op = if is_float { Op::MulF } else { Op::MulU };
+                assert_eq!(
+                    sec.shapes.get(&v1_val),
+                    Some(&Shape::Prefix(expected_op, v0_in, saved, ident_bits, true))
+                );
+            }
         }
     }
 }
