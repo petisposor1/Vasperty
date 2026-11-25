@@ -930,6 +930,23 @@ fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
 
 /// The BCPack format's constant tables, parsed once for the process. If
 /// they do not parse every BCPack request fails: one warning, then debug.
+#[cfg(not(test))]
+fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    match Tables::shared() {
+        Ok(tables) => Ok(tables),
+        Err(why) if !WARNED.swap(true, Ordering::Relaxed) => {
+            tracing::warn!("dstorage: BCPack requests fail: {why} (more at debug)");
+            Err(E_NOTIMPL)
+        }
+        Err(_) => {
+            tracing::debug!("dstorage: BCPack request failed: no tables");
+            Err(E_NOTIMPL)
+        }
+    }
+}
+
+#[cfg(test)]
 fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
     static TABLES: OnceLock<Result<Tables, String>> = OnceLock::new();
     static WARNED: AtomicBool = AtomicBool::new(false);
@@ -944,12 +961,6 @@ fn bcpack_tables() -> Result<&'static Tables, HRESULT> {
             Err(E_NOTIMPL)
         }
     }
-}
-
-/// The tables VIctory ships with.
-#[cfg(not(test))]
-fn load_bcpack_tables() -> Result<Tables, String> {
-    Tables::builtin().map_err(|e| format!("the built-in BCPack tables: {e}"))
 }
 
 /// Tests decode streams made against tables of their own, from this folder.

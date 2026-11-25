@@ -20,7 +20,8 @@ pub fn run(iters: usize) -> Result<()> {
     println!("Vasperty Microbenchmarks ({iters} iterations/workload, {threads} CPUs)");
     println!("==================================================================");
 
-    // 1. 2D BC7 1024x1024 parallel texture detile (1 MiB)
+    // 1. 2D BC7 1024x1024 parallel texture tile & detile (1 MiB)
+    bench_tile_2d(iters)?;
     bench_detile_2d(iters)?;
 
     // 2. 3D RGBA8 64x64x32 parallel volume detile (512 KiB)
@@ -38,6 +39,48 @@ pub fn run(iters: usize) -> Result<()> {
     // 6. Parallel CityHash64 pipeline raster state-space resolution
     bench_pipeline_state_resolve(iters)?;
 
+    Ok(())
+}
+
+fn bench_tile_2d(iters: usize) -> Result<()> {
+    // 1024x1024 BC7 = 256x256 elements x 16 bytes = 1 MiB
+    let desc = Desc {
+        dimension: Dimension::Tex2d,
+        width: 1024,
+        height: 1024,
+        depth: 1,
+        mips: 1,
+        element_bytes: 16,
+        block: 4,
+        samples: 1,
+        swizzle: Swizzle::SW_64KB_S,
+    };
+    let layout = Layout::new(&desc).map_err(|e| anyhow::anyhow!("2D layout: {e:?}"))?;
+    let elem_w = (1024 / 4) as usize;
+    let elem_h = (1024 / 4) as usize;
+    let row_pitch = elem_w * 16;
+    let linear_len = row_pitch * elem_h;
+    let src_linear: Vec<u8> = (0..linear_len).map(|i| (i.wrapping_mul(17) & 0xff) as u8).collect();
+    let mut tiled = vec![0u8; layout.size as usize];
+
+    layout
+        .tile(&mut tiled, 0, 0, &src_linear, row_pitch, linear_len)
+        .map_err(|e| anyhow::anyhow!("2D tile warmup: {e:?}"))?;
+
+    let started = Instant::now();
+    for _ in 0..iters {
+        layout
+            .tile(
+                black_box(&mut tiled),
+                0,
+                0,
+                black_box(&src_linear),
+                row_pitch,
+                linear_len,
+            )
+            .map_err(|e| anyhow::anyhow!("2D tile: {e:?}"))?;
+    }
+    report_throughput("Tile 2D BC7 1024x1024", linear_len, iters, started.elapsed());
     Ok(())
 }
 

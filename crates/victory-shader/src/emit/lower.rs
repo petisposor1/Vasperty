@@ -3512,6 +3512,32 @@ impl<'a> Lower<'a> {
                     self.set(lo, Val::I32(r));
                     Ok(())
                 }
+                "s_flbit_i32_b64" | "s_flbit_i32_i64" => {
+                    // First bit from the top (differing from the sign bit for `i64`),
+                    // -1 when all bits match the fill bit.
+                    let (mut a, mut b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    if name == "s_flbit_i32_i64" {
+                        let k31 = self.s.m.i32(31);
+                        let s_mask = self.s.m.bin(c, Bin::AShr, b, k31);
+                        a = self.s.m.bin(c, Bin::Xor, a, s_mask);
+                        b = self.s.m.bin(c, Bin::Xor, b, s_mask);
+                    }
+                    let i32t = self.s.t.i32;
+                    let fa = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[a]);
+                    let fb = self
+                        .s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[b]);
+                    let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+                    let fa32 = self.s.m.bin(c, Bin::Add, fa, k32);
+                    let lo_zero = self.s.m.cmp(c, pred::EQ, a, z);
+                    let lo_res = self.s.m.select(c, lo_zero, fa, fa32);
+                    let hi_nz = self.s.m.cmp(c, pred::NE, b, z);
+                    let r = self.s.m.select(c, hi_nz, fb, lo_res);
+                    self.set(lo, Val::I32(r));
+                    Ok(())
+                }
                 "s_and_b64" | "s_or_b64" | "s_xor_b64" | "s_andn2_b64" | "s_orn2_b64"
                 | "s_nand_b64" | "s_nor_b64" | "s_xnor_b64" | "s_not_b64" => {
                     let ones = self.s.m.i32(u32::MAX);
@@ -6029,6 +6055,60 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
                 int(self, r)
             }
+            "v_cvt_pknorm_i16_f32" | "v_cvt_pknorm_u16_f32" => {
+                let (a, bb) = (f(self, 0)?, f(self, 1)?);
+                let signed = name == "v_cvt_pknorm_i16_f32";
+                let (lo_f, hi_f, scale_f) = if signed {
+                    (-1.0f32, 1.0f32, 32767.0f32)
+                } else {
+                    (0.0f32, 1.0f32, 65535.0f32)
+                };
+                let lo_v = self.s.m.f32(lo_f.to_bits());
+                let hi_v = self.s.m.f32(hi_f.to_bits());
+                let scale_v = self.s.m.f32(scale_f.to_bits());
+                let zero = self.s.m.i32(0);
+                let mask = self.s.m.i32(0xFFFF);
+                let mut halves = [zero; 2];
+                for (slot, x) in halves.iter_mut().zip([a, bb]) {
+                    let clamped_lo = self.binary(35, x, lo_v);
+                    let clamped = self.binary(36, clamped_lo, hi_v);
+                    let scaled = self.s.m.bin(c, Bin::Mul, clamped, scale_v);
+                    let rounded = self.unary(26, scaled);
+                    let int_val = self.s.m.cast(c, Cast::FpToSi, rounded, self.s.t.i32);
+                    let nan = self.s.m.cmp(c, pred::UNO, x, x);
+                    let picked = self.s.m.select(c, nan, zero, int_val);
+                    *slot = self.s.m.bin(c, Bin::And, picked, mask);
+                }
+                let k16 = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+                let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
+                int(self, r)
+            }
+            "v_cvt_pknorm_i16_f16" | "v_cvt_pknorm_u16_f16" => {
+                if v.clamp || v.omod != 0 {
+                    return Err("modifiers on a packed normalized f16 conversion");
+                }
+                let signed = name == "v_cvt_pknorm_i16_f16";
+                let k16 = self.s.m.i32(16);
+                let mut halves = Vec::with_capacity(2);
+                for k in 0..2 {
+                    let op = v.src.get(k).ok_or("a missing operand")?;
+                    let mut x = self.operand(inst, op)?;
+                    if v.opsel >> k & 1 != 0 {
+                        x = self.s.m.bin(c, Bin::LShr, x, k16);
+                    }
+                    let mask = self.s.m.i32(if v.abs >> k & 1 != 0 { 0x7FFF } else { 0xFFFF });
+                    x = self.s.m.bin(c, Bin::And, x, mask);
+                    if v.neg >> k & 1 != 0 {
+                        let sign = self.s.m.i32(0x8000);
+                        x = self.s.m.bin(c, Bin::Xor, x, sign);
+                    }
+                    halves.push(self.cvt_norm16_bits(x, signed));
+                }
+                let hi = self.s.m.bin(c, Bin::Shl, halves[1], k16);
+                let r = self.s.m.bin(c, Bin::Or, halves[0], hi);
+                int(self, r)
+            }
             "v_cvt_f16_f32" if v.opsel == 0 => {
                 // Rounded as MODE says (nearest even by default) into the low half.
                 let a = f(self, 0)?;
@@ -6682,16 +6762,21 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let c = self.cur;
-        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
         let mut h = self.half_src(inst, 0)?;
         if v.abs & 1 != 0 {
-            let m = k(self, 0x7FFF);
+            let m = self.s.m.i32(0x7FFF);
             h = self.s.m.bin(c, Bin::And, h, m);
         }
         if v.neg & 1 != 0 {
-            let m = k(self, 0x8000);
+            let m = self.s.m.i32(0x8000);
             h = self.s.m.bin(c, Bin::Xor, h, m);
         }
+        Ok(self.cvt_norm16_bits(h, signed))
+    }
+
+    fn cvt_norm16_bits(&mut self, h: V, signed: bool) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
         let scale = if signed { 0x7FFF } else { 0xFFFF };
         let (k0, k1, k10) = (k(self, 0), k(self, 1), k(self, 10));
         let mag_mask = k(self, 0x7FFF);
@@ -6740,7 +6825,7 @@ impl<'a> Lower<'a> {
             self.s.m.select(c, neg, k0, r)
         };
         let m16 = k(self, 0xFFFF);
-        Ok(self.s.m.bin(c, Bin::And, r, m16))
+        self.s.m.bin(c, Bin::And, r, m16)
     }
 
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low
@@ -11085,6 +11170,33 @@ mod tests {
         body.extend(vop3p(0x013, 0, [259, 256, 257], 0, 3)); // v_dot2_f32_f16 v0, v3, v0, v1
         body.extend(vop3(1, 0x37F, 256, 257, 0)); // v_add_nc_i32 v1, v0, v1
         body.extend(vop3(0, 0x376, 257, 258, 0)); // v_sub_nc_i32 v0, v1, v2
+        lowers_valu(&body).unwrap();
+    }
+
+    #[test]
+    fn pknorm_and_flbit64_ops_lower() {
+        let sop1 = |sdst: u8, op: u8, ssrc0: u8| -> u32 {
+            0xBE80_0000 | (u32::from(sdst) << 16) | (u32::from(op) << 8) | u32::from(ssrc0)
+        };
+        let vop3 = |vdst: u8, op: u16, src0: u16, src1: u16, src2: u16| -> [u32; 2] {
+            [
+                0xD400_0000 | (u32::from(op) << 16) | u32::from(vdst),
+                u32::from(src0 & 0x1FF)
+                    | (u32::from(src1 & 0x1FF) << 9)
+                    | (u32::from(src2 & 0x1FF) << 18),
+            ]
+        };
+
+        let mut body = vec![
+            sop1(6, 0x16, 0), // s_flbit_i32_b64 s6, s[0:1]
+            sop1(7, 0x18, 2), // s_flbit_i32_i64 s7, s[2:3]
+            0x7E00_0206,      // v_mov_b32 v0, s6
+            0x7E02_0207,      // v_mov_b32 v1, s7
+        ];
+        body.extend(vop3(2, 0x368, 256, 257, 0)); // v_cvt_pknorm_i16_f32 v2, v0, v1
+        body.extend(vop3(3, 0x369, 257, 258, 0)); // v_cvt_pknorm_u16_f32 v3, v1, v2
+        body.extend(vop3(1, 0x312, 258, 259, 0)); // v_cvt_pknorm_i16_f16 v1, v2, v3
+        body.extend(vop3(0, 0x313, 259, 257, 0)); // v_cvt_pknorm_u16_f16 v0, v3, v1
         lowers_valu(&body).unwrap();
     }
 }

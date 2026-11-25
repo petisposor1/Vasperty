@@ -289,8 +289,121 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+struct SaveJob {
+    dir: PathBuf,
+    blob: Vec<u8>,
+    early: Vec<u8>,
+    prebuilt: Option<Vec<u8>>,
+    made: u64,
+    loaded: u64,
+    early_started: u64,
+    created: u64,
+    distinct: usize,
+    shaders_cached: u64,
+    shaders_translated: u64,
+    early_len: usize,
+}
+
+#[derive(Default)]
+struct WriterState {
+    pending: Option<(u64, SaveJob)>,
+    next_gen: u64,
+    flushed_gen: u64,
+}
+
+struct DiskWriter {
+    state: Mutex<WriterState>,
+    ready: Condvar,
+    done: Condvar,
+}
+
+impl DiskWriter {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(WriterState {
+                pending: None,
+                next_gen: 0,
+                flushed_gen: 0,
+            }),
+            ready: Condvar::new(),
+            done: Condvar::new(),
+        }
+    }
+
+    fn enqueue(&'static self, job: SaveJob, sync: bool) {
+        self.start_worker();
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.next_gen += 1;
+        let target_gen = s.next_gen;
+        // Replace any older unstarted snapshot so redundant saves coalesce.
+        s.pending = Some((target_gen, job));
+        self.ready.notify_one();
+        if sync {
+            while s.flushed_gen < target_gen {
+                s = self.done.wait(s).unwrap_or_else(|e| e.into_inner());
+            }
+        }
+    }
+
+    fn start_worker(&'static self) {
+        static STARTED: OnceLock<()> = OnceLock::new();
+        let _ = STARTED.get_or_init(|| {
+            let _ = std::thread::Builder::new()
+                .name("victory-pipeline-io".into())
+                .spawn(move || self.run_loop());
+        });
+    }
+
+    fn run_loop(&self) -> ! {
+        loop {
+            let (seq, job) = {
+                let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if let Some(item) = s.pending.take() {
+                        break item;
+                    }
+                    s = self.ready.wait(s).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            let written = write_job(&job);
+            match written {
+                Ok(()) => tracing::info!(
+                    bytes = job.blob.len(),
+                    early = job.early_len,
+                    made = job.made,
+                    loaded = job.loaded,
+                    started_early = job.early_started,
+                    created = job.created,
+                    distinct = job.distinct,
+                    shaders_cached = job.shaders_cached,
+                    shaders_translated = job.shaders_translated,
+                    "host pipeline library saved"
+                ),
+                Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+            }
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            s.flushed_gen = seq;
+            self.done.notify_all();
+        }
+    }
+}
+
+fn write_job(job: &SaveJob) -> std::io::Result<()> {
+    std::fs::create_dir_all(&job.dir)
+        .and_then(|()| write_atomically(&job.dir.join(LIBRARY_FILE), &job.blob))
+        .and_then(|()| write_atomically(&job.dir.join(EARLY_FILE), &job.early))
+        .and_then(|()| match &job.prebuilt {
+            Some(list) => write_atomically(&job.dir.join(PREBUILT_FILE), list),
+            None => Ok(()),
+        })
+}
+
+static DISK_WRITER: DiskWriter = DiskWriter::new();
+
 /// Writes the library and the early list if pipelines were added since the
-/// last save and `SAVE_EVERY` has passed (or `now`).
+/// last save and `SAVE_EVERY` has passed (or `now`). Periodic saves offload
+/// disk writes to a coalescing background thread; shutdown saves (`now = true`)
+/// block until flushed.
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
@@ -318,7 +431,8 @@ pub(crate) fn save(now: bool) {
                 l.prebuilt_changed = false;
                 // Kept beside the bytes it holds for (also when a run adds
                 // pipelines).
-                let prebuilt = (!l.prebuilt.is_empty()).then(|| list(&tag(&bytes), &l.prebuilt));
+                let prebuilt = (!l.prebuilt.is_empty())
+                    .then(|| list(&tag(&bytes), &l.prebuilt).into_bytes());
                 (bytes, prebuilt)
             }
             Err(e) => {
@@ -328,30 +442,27 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used = USED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(Used::list).unwrap_or_default();
-    let written = std::fs::create_dir_all(dir)
-        .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
-        .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()))
-        .and_then(|()| match &prebuilt {
-            Some(list) => write_atomically(&dir.join(PREBUILT_FILE), list.as_bytes()),
-            None => Ok(()),
-        });
+    let early_len = used.len();
+    let early = used.join("\n").into_bytes();
     let (created, distinct) = created();
     let (shaders_cached, shaders_translated) = crate::shader_cache::counts();
-    match written {
-        Ok(()) => tracing::info!(
-            bytes = blob.len(),
-            early = used.len(),
-            made = MADE.load(Ordering::Relaxed),
-            loaded = LOADED.load(Ordering::Relaxed),
-            started_early = EARLY.load(Ordering::Relaxed),
+    DISK_WRITER.enqueue(
+        SaveJob {
+            dir: dir.clone(),
+            blob,
+            early,
+            prebuilt,
+            made: MADE.load(Ordering::Relaxed),
+            loaded: LOADED.load(Ordering::Relaxed),
+            early_started: EARLY.load(Ordering::Relaxed),
             created,
             distinct,
             shaders_cached,
             shaders_translated,
-            "host pipeline library saved"
-        ),
-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
-    }
+            early_len,
+        },
+        now,
+    );
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
@@ -672,5 +783,32 @@ mod tests {
         let final_bytes = std::fs::read(&target).unwrap();
         assert_eq!(final_bytes.len(), 4096);
         assert!(final_bytes.iter().all(|&b| b == final_bytes[0]));
+    }
+
+    #[test]
+    fn background_writer_coalesces_and_flushes_synchronously() {
+        static TEST_WRITER: DiskWriter = DiskWriter::new();
+        let dir = tempfile::tempdir().unwrap();
+        let make_job = |tag_byte: u8| SaveJob {
+            dir: dir.path().to_path_buf(),
+            blob: vec![tag_byte; 128],
+            early: format!("pipe-{tag_byte}\n").into_bytes(),
+            prebuilt: Some(format!("pre-{tag_byte}\n").into_bytes()),
+            made: 1,
+            loaded: 2,
+            early_started: 3,
+            created: 4,
+            distinct: 5,
+            shaders_cached: 6,
+            shaders_translated: 7,
+            early_len: 1,
+        };
+        TEST_WRITER.enqueue(make_job(1), false);
+        TEST_WRITER.enqueue(make_job(2), false);
+        TEST_WRITER.enqueue(make_job(9), true);
+
+        assert_eq!(std::fs::read(dir.path().join(LIBRARY_FILE)).unwrap(), vec![9u8; 128]);
+        assert_eq!(std::fs::read(dir.path().join(EARLY_FILE)).unwrap(), b"pipe-9\n");
+        assert_eq!(std::fs::read(dir.path().join(PREBUILT_FILE)).unwrap(), b"pre-9\n");
     }
 }

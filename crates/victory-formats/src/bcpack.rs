@@ -124,6 +124,12 @@ impl Tables {
         Tables::parse(include_bytes!("bcpack-tables.bin"))
     }
 
+    /// Process-wide cached built-in BCPack tables initialized once on first use.
+    pub fn shared() -> Result<&'static Tables, Error> {
+        static BUILTIN: std::sync::OnceLock<Result<Tables, Error>> = std::sync::OnceLock::new();
+        BUILTIN.get_or_init(Tables::builtin).as_ref().map_err(|&e| e)
+    }
+
     /// Reads the table file: 128 x 9 u16 model frequencies (per bucket, the
     /// frequency of each of its symbols), the rank tables (BC1 256 B, BC3
     /// alpha 64 B and colour 256 B, BC4 64 B, BC5 64 B), 512 u16 BC7 control
@@ -247,6 +253,11 @@ impl Tables {
             bc7,
         })
     }
+}
+
+/// Unpacks `src` using the cached process-wide built-in [`Tables::shared`].
+pub fn decode_builtin(bc: u8, src: &[u8], dst: &mut [u8]) -> Result<(), Error> {
+    decode(bc, src, dst, Tables::shared()?)
 }
 
 /// Unpacks `src` (BC number `bc`, 1 and 3-7) into `dst`, whose length gives
@@ -1628,5 +1639,20 @@ mod tests {
                 assert_eq!(interleave(a, b), expected, "a={a}, b={b}");
             }
         }
+    }
+
+    #[test]
+    fn shared_tables_matches_builtin_and_decodes() {
+        let a = Tables::shared().unwrap();
+        let b = Tables::shared().unwrap();
+        assert!(std::ptr::eq(a, b));
+
+        let records = vec![vec![0u8; 12]; 4];
+        let src = stream(a, &[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1, &records);
+        let mut via_shared = vec![0u8; 4 * 8];
+        let mut via_direct = vec![0u8; 4 * 8];
+        decode_builtin(1, &src, &mut via_shared).unwrap();
+        decode(1, &src, &mut via_direct, a).unwrap();
+        assert_eq!(via_shared, via_direct);
     }
 }

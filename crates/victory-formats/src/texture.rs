@@ -624,7 +624,9 @@ impl Layout {
         )
     }
 
-    /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
+    /// The reverse of [`Layout::detile`]: linear rows into tiled memory,
+    /// parallelizing across disjoint tile bands or depth slabs on large non-tail
+    /// subresources (`>= 256 KiB`).
     pub fn tile(
         &self,
         tiled: &mut [u8],
@@ -634,6 +636,187 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
+        let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+        let depth = m.depth;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            if slice != 0 {
+                return Err(Error::Invalid);
+            }
+            0
+        } else {
+            slice
+        };
+        if first >= self.slices {
+            return Err(Error::Invalid);
+        }
+        if !self.addressable() {
+            return Err(Error::Unsupported);
+        }
+        let n = self.desc.element_bytes as usize;
+        let bytes = m.width as usize * n;
+        let slice_bytes = (m.height as usize - 1)
+            .checked_mul(row_pitch)
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
+        if depth > 1 && depth_pitch < slice_bytes {
+            return Err(Error::TooSmall);
+        }
+        let need = (depth as usize - 1)
+            .checked_mul(depth_pitch)
+            .and_then(|offset| offset.checked_add(slice_bytes))
+            .ok_or(Error::TooSmall)?;
+        if tiled.len() < self.size as usize || linear.len() < need || row_pitch < bytes {
+            return Err(Error::TooSmall);
+        }
+
+        let total_payload = depth as usize * m.height as usize * bytes;
+        if m.tail.is_none() && total_payload >= (256 << 10) {
+            let linear_mode = self.desc.swizzle == Swizzle::LINEAR;
+            let runs = if linear_mode {
+                Vec::new()
+            } else {
+                self.row_runs(m, n, bytes)
+            };
+            let (body, last) = runs.split_at(runs.len().saturating_sub(1));
+            let run_len = body
+                .first()
+                .map(|run| run.2)
+                .filter(|&len| body.iter().all(|run| run.2 == len));
+            let threads = std::thread::available_parallelism()
+                .map_or(2, std::num::NonZeroUsize::get)
+                .clamp(2, 8);
+
+            if depth == 1 && linear_mode && m.height >= 64 {
+                let (s, _) = self.split(first);
+                let base = (u64::from(s) * self.slice_size + m.offset) as usize;
+                let tiled_row_stride = m.pitch as usize * n;
+                let height = m.height as usize;
+                if let Some(dst_mip) = tiled.get_mut(base..base + height * tiled_row_stride) {
+                    let chunk_rows = height.div_ceil(threads).max(16);
+                    let chunk_bytes = chunk_rows * tiled_row_stride;
+                    std::thread::scope(|scope| {
+                        for (chunk_idx, out_chunk) in dst_mip.chunks_mut(chunk_bytes).enumerate() {
+                            let y0 = chunk_idx * chunk_rows;
+                            if y0 >= height {
+                                break;
+                            }
+                            let y1 = (y0 + chunk_rows).min(height);
+                            scope.spawn(move || {
+                                for y in y0..y1 {
+                                    let dst_off = (y - y0) * tiled_row_stride;
+                                    let src_off = y * row_pitch;
+                                    out_chunk[dst_off..dst_off + bytes]
+                                        .copy_from_slice(&linear[src_off..src_off + bytes]);
+                                }
+                            });
+                        }
+                    });
+                    return Ok(());
+                }
+            } else if depth == 1 && !linear_mode {
+                let [bw, bh, _] = self.block;
+                let log2 = self.alignment.trailing_zeros();
+                let band_bytes = ((m.pitch / bw) as usize) << log2;
+                let bands = (m.height as usize).div_ceil(bh as usize);
+                let (s, inner) = self.split(first);
+                let base = (u64::from(s) * self.slice_size + m.offset) as usize;
+                if bands >= 2
+                    && band_bytes > 0
+                    && let Some(dst_mip) = tiled.get_mut(base..base + bands * band_bytes)
+                {
+                    let bands_per = bands.div_ceil(threads).max(1);
+                    let height = m.height as usize;
+                    std::thread::scope(|scope| {
+                        for (chunk_idx, out_chunk) in
+                            dst_mip.chunks_mut(bands_per * band_bytes).enumerate()
+                        {
+                            let band0 = chunk_idx * bands_per;
+                            if band0 >= bands {
+                                break;
+                            }
+                            let band1 = (band0 + bands_per).min(bands);
+                            let chunk_base = base + band0 * band_bytes;
+                            scope.spawn(move || {
+                                let y0 = band0 * bh as usize;
+                                let y1 = (band1 * bh as usize).min(height);
+                                for y in y0..y1 {
+                                    let tiled_row =
+                                        (base + self.row(m, y as u32, inner) as usize) - chunk_base;
+                                    let lin_row = y * row_pitch;
+                                    detile_row(body, last, run_len, tiled_row, |t, l, len| {
+                                        out_chunk[t..t + len]
+                                            .copy_from_slice(&linear[lin_row + l..lin_row + l + len]);
+                                    });
+                                }
+                            });
+                        }
+                    });
+                    return Ok(());
+                }
+            } else if depth >= 4 && depth_pitch >= slice_bytes {
+                let slab_depth = if self.thick { self.block[2] as usize } else { 1 };
+                let slabs = (depth as usize).div_ceil(slab_depth);
+                let slice_size = self.slice_size as usize;
+                let mip_off = m.offset as usize;
+                if slabs >= 2
+                    && slice_size > 0
+                    && let Some(dst_vol) = tiled.get_mut(..slabs * slice_size)
+                {
+                    let slabs_per = slabs.div_ceil(threads).max(1);
+                    std::thread::scope(|scope| {
+                        for (chunk_idx, out_chunk) in
+                            dst_vol.chunks_mut(slabs_per * slice_size).enumerate()
+                        {
+                            let s0 = chunk_idx * slabs_per;
+                            if s0 >= slabs {
+                                break;
+                            }
+                            let s1 = (s0 + slabs_per).min(slabs);
+                            scope.spawn(move || {
+                                for s in s0..s1 {
+                                    let slab_base = (s - s0) * slice_size + mip_off;
+                                    for inner in 0..slab_depth {
+                                        let z = s * slab_depth + inner;
+                                        if z >= depth as usize {
+                                            break;
+                                        }
+                                        let z_lin = z * depth_pitch;
+                                        for y in 0..m.height {
+                                            let lin_row = z_lin + y as usize * row_pitch;
+                                            if linear_mode {
+                                                let tiled_row = slab_base
+                                                    + (u64::from(y) * u64::from(m.pitch) * n as u64)
+                                                        as usize;
+                                                out_chunk[tiled_row..tiled_row + bytes]
+                                                    .copy_from_slice(
+                                                        &linear[lin_row..lin_row + bytes],
+                                                    );
+                                            } else {
+                                                let tiled_row = slab_base
+                                                    + self.row(m, y, inner as u32) as usize;
+                                                detile_row(
+                                                    body,
+                                                    last,
+                                                    run_len,
+                                                    tiled_row,
+                                                    |t, l, len| {
+                                                        out_chunk[t..t + len].copy_from_slice(
+                                                            &linear[lin_row + l..lin_row + l + len],
+                                                        );
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    });
+                    return Ok(());
+                }
+            }
+        }
+
         self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
             tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
         })
@@ -1591,5 +1774,55 @@ mod tests {
         vol.detile(&tiled3d, 0, 0, &mut back3d, row_pitch, depth_pitch)
             .unwrap();
         assert_eq!(back3d, linear3d, "3D parallel detile mismatch");
+    }
+
+    #[test]
+    fn parallel_2d_and_3d_tile_matches_serial_walk() {
+        let cases = [
+            Desc {
+                block: 4,
+                ..desc(1024, 1024, 1, 16, Swizzle::SW_64KB_S)
+            },
+            desc(512, 512, 1, 4, Swizzle::LINEAR),
+            Desc {
+                dimension: Dimension::Tex3d,
+                depth: 32,
+                ..desc(64, 64, 1, 4, Swizzle::SW_4KB_S)
+            },
+            Desc {
+                dimension: Dimension::Tex3d,
+                depth: 32,
+                ..desc(64, 64, 1, 4, Swizzle::SW_64KB_S)
+            },
+        ];
+        for d in cases {
+            let layout = Layout::new(&d).unwrap();
+            let m = layout.mips[0];
+            let n = d.element_bytes as usize;
+            let row_pitch = m.width as usize * n;
+            let depth_pitch = m.height as usize * row_pitch;
+            let linear: Vec<u8> = (0..m.depth as usize * depth_pitch)
+                .map(|i| ((i * 29 + (i >> 7)) & 0xff) as u8)
+                .collect();
+
+            let mut parallel_tiled = vec![0xA5u8; layout.size as usize];
+            layout
+                .tile(&mut parallel_tiled, 0, 0, &linear, row_pitch, depth_pitch)
+                .unwrap();
+
+            let mut serial_tiled = vec![0xA5u8; layout.size as usize];
+            layout
+                .walk(
+                    serial_tiled.len(),
+                    0,
+                    0,
+                    linear.len(),
+                    row_pitch,
+                    depth_pitch,
+                    |t, l, len| serial_tiled[t..t + len].copy_from_slice(&linear[l..l + len]),
+                )
+                .unwrap();
+            assert_eq!(parallel_tiled, serial_tiled, "tile mismatch for {d:?}");
+        }
     }
 }
