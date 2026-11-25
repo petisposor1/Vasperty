@@ -260,6 +260,41 @@ pub fn decode_builtin(bc: u8, src: &[u8], dst: &mut [u8]) -> Result<(), Error> {
     decode(bc, src, dst, Tables::shared()?)
 }
 
+/// Decodes a batch of `(bc, src, dst)` chunks in parallel across CPU cores when two or
+/// more chunks are supplied, reusing each worker thread's scratch buffer.
+pub fn decode_batch(chunks: &mut [(u8, &[u8], &mut [u8])], tables: &Tables) -> Result<(), Error> {
+    match chunks.len() {
+        0 => Ok(()),
+        1 => decode(chunks[0].0, chunks[0].1, chunks[0].2, tables),
+        n => {
+            let threads = std::thread::available_parallelism()
+                .map_or(2, std::num::NonZeroUsize::get)
+                .clamp(2, 8)
+                .min(n);
+            let per_worker = n.div_ceil(threads);
+            let mut results: Vec<Result<(), Error>> = vec![Ok(()); threads];
+            std::thread::scope(|s| {
+                for (slice, slot) in chunks.chunks_mut(per_worker).zip(results.iter_mut()) {
+                    s.spawn(move || {
+                        for (bc, src, dst) in slice {
+                            if let Err(e) = decode(*bc, src, dst, tables) {
+                                *slot = Err(e);
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            results.into_iter().collect::<Result<(), Error>>()
+        }
+    }
+}
+
+/// Parallel batch decode convenience wrapper using [`Tables::shared`].
+pub fn decode_batch_builtin(chunks: &mut [(u8, &[u8], &mut [u8])]) -> Result<(), Error> {
+    decode_batch(chunks, Tables::shared()?)
+}
+
 /// Unpacks `src` (BC number `bc`, 1 and 3-7) into `dst`, whose length gives
 /// the block count. The stream carries no size: bytes after the last one the
 /// lanes need are ignored, a stream that runs out is an error.
@@ -294,8 +329,19 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
             records.resize(total, 0);
         }
         let rec_slice = &mut records[..total];
-        let mut next = src.iter().copied();
-        let mut res = lanes(tables, widths, per, blocks, |_| next.next(), rec_slice);
+        let mut src_pos = 0usize;
+        let mut res = lanes(
+            tables,
+            widths,
+            per,
+            blocks,
+            |_| {
+                let b = src.get(src_pos).copied();
+                src_pos += usize::from(b.is_some());
+                b
+            },
+            rec_slice,
+        );
         if res.is_ok() {
             let records_iter = rec_slice.chunks_exact(stride);
             let out = dst.chunks_exact_mut(block);
@@ -1654,5 +1700,37 @@ mod tests {
         decode_builtin(1, &src, &mut via_shared).unwrap();
         decode(1, &src, &mut via_direct, a).unwrap();
         assert_eq!(via_shared, via_direct);
+    }
+
+    #[test]
+    fn decode_batch_matches_serial_across_formats() {
+        let t = Tables::shared().unwrap();
+        let specs: &[(u8, &[u8], usize, usize)] = &[
+            (1, &[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1, 8),
+            (4, &BC4_LANES, 1, 8),
+            (7, &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2, 16),
+            (1, &[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1, 8),
+        ];
+        let blocks = 8usize;
+        let mut inputs = Vec::new();
+        let mut expected = Vec::new();
+        let mut parallel_dsts = Vec::new();
+        for &(bc, widths, per, block_bytes) in specs {
+            let records = vec![vec![0u8; widths.len() * per]; blocks];
+            let src = stream(t, widths, per, &records);
+            let mut serial = vec![0u8; blocks * block_bytes];
+            decode(bc, &src, &mut serial, t).unwrap();
+            expected.push(serial);
+            inputs.push((bc, src));
+            parallel_dsts.push(vec![0u8; blocks * block_bytes]);
+        }
+
+        let mut job_slices: Vec<(u8, &[u8], &mut [u8])> = inputs
+            .iter()
+            .zip(parallel_dsts.iter_mut())
+            .map(|((bc, src), dst)| (*bc, src.as_slice(), dst.as_mut_slice()))
+            .collect();
+        decode_batch_builtin(&mut job_slices).unwrap();
+        assert_eq!(parallel_dsts, expected);
     }
 }

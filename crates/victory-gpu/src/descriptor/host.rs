@@ -31,9 +31,8 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// With it the view's own copy of title memory, if it has one.
     kept: Mutex<Vec<Kept>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Word-packed bitmap and scan cursor for free dynamic descriptor slots.
+    next: Mutex<DynamicBitmap>,
     /// Slot pairs kept for host copies' views (`crate::memory`), past the
     /// dynamic slots and below the null buffer views: the next never
     /// taken, those given back, and where they end.
@@ -194,7 +193,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new(DynamicBitmap::new(extra)),
             pairs: Mutex::new((count + extra, Vec::new())),
             pairs_end: match victory_shader::emit::NULL_BUFFER_VIEW {
                 null if !sampler && null > count + extra && null < total => null - 1,
@@ -291,6 +290,175 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// L1-resident `u64` bitmap allocator with wrap-around cursor and hardware `trailing_zeros` scan.
+struct DynamicBitmap {
+    cursor: u32,
+    len: u32,
+    words: Vec<u64>,
+}
+
+impl DynamicBitmap {
+    fn new(len: u32) -> Self {
+        let count = (len as usize).div_ceil(64);
+        let mut words = vec![0u64; count];
+        let rem = (len as usize) & 63;
+        if rem != 0
+            && let Some(last) = words.last_mut()
+        {
+            *last = u64::MAX << rem;
+        }
+        Self {
+            cursor: 0,
+            len,
+            words,
+        }
+    }
+
+    fn set_range(&mut self, start: usize, len: usize, taken: bool) {
+        if len == 0 {
+            return;
+        }
+        let end = start + len;
+        let w0 = start >> 6;
+        let w1 = (end - 1) >> 6;
+        let head_mask = u64::MAX << (start & 63);
+        let tail_shift = end & 63;
+        let tail_mask = if tail_shift == 0 {
+            u64::MAX
+        } else {
+            (1u64 << tail_shift) - 1
+        };
+        if w0 == w1 {
+            let mask = head_mask & tail_mask;
+            if taken {
+                self.words[w0] |= mask;
+            } else {
+                self.words[w0] &= !mask;
+            }
+            return;
+        }
+        if taken {
+            self.words[w0] |= head_mask;
+            self.words[w0 + 1..w1].fill(u64::MAX);
+            self.words[w1] |= tail_mask;
+        } else {
+            self.words[w0] &= !head_mask;
+            self.words[w0 + 1..w1].fill(0);
+            self.words[w1] &= !tail_mask;
+        }
+    }
+
+    fn scan_range(&self, from: usize, to: usize, n: usize) -> Option<usize> {
+        let mut run = 0usize;
+        let mut pos = from;
+        while pos < to {
+            let wi = pos >> 6;
+            let bit = pos & 63;
+            let avail = (64 - bit).min(to - pos);
+            let mask = if avail == 64 {
+                u64::MAX
+            } else {
+                (1u64 << avail) - 1
+            };
+            let w = (self.words[wi] >> bit) & mask;
+            if w == 0 {
+                run += avail;
+                if run >= n {
+                    return Some(pos + avail - run);
+                }
+                pos += avail;
+                continue;
+            }
+            if w == mask {
+                run = 0;
+                pos += avail;
+                continue;
+            }
+            let mut rem = avail;
+            let mut cur_w = w;
+            let mut cur_pos = pos;
+            while rem > 0 {
+                if cur_w == 0 {
+                    run += rem;
+                    if run >= n {
+                        return Some(cur_pos + rem - run);
+                    }
+                    cur_pos += rem;
+                    break;
+                }
+                let z = (cur_w.trailing_zeros() as usize).min(rem);
+                run += z;
+                if run >= n {
+                    return Some(cur_pos + z - run);
+                }
+                if z == rem {
+                    cur_pos += rem;
+                    break;
+                }
+                cur_w >>= z;
+                cur_pos += z;
+                rem -= z;
+                let ones = ((!cur_w).trailing_zeros() as usize).min(rem);
+                run = 0;
+                if ones == rem {
+                    cur_pos += rem;
+                    break;
+                }
+                cur_w >>= ones;
+                cur_pos += ones;
+                rem -= ones;
+            }
+            pos = cur_pos;
+        }
+        None
+    }
+
+    fn alloc(&mut self, n: u32) -> Option<u32> {
+        if n == 0 || n > self.len {
+            return None;
+        }
+        let end = self.len as usize;
+        if n == 1 {
+            let cursor = self.cursor as usize;
+            let w0 = cursor >> 6;
+            let bit0 = cursor & 63;
+            let first_word = self.words[w0] | ((1u64 << bit0) - 1);
+            let found = if first_word != u64::MAX {
+                Some((w0 << 6) + (!first_word).trailing_zeros() as usize)
+            } else {
+                ((w0 + 1)..self.words.len())
+                    .chain(0..=w0)
+                    .find_map(|wi| {
+                        let w = self.words[wi];
+                        (w != u64::MAX).then(|| (wi << 6) + (!w).trailing_zeros() as usize)
+                    })
+            };
+            let idx = found.filter(|&idx| idx < end)?;
+            self.words[idx >> 6] |= 1u64 << (idx & 63);
+            self.cursor = ((idx + 1) % end) as u32;
+            return Some(idx as u32);
+        }
+
+        let n_usize = n as usize;
+        let cursor = self.cursor as usize;
+        let second_end = cursor.saturating_add(n_usize - 1).min(end);
+        let first = self
+            .scan_range(cursor, end, n_usize)
+            .or_else(|| self.scan_range(0, second_end, n_usize))?;
+        self.set_range(first, n_usize, true);
+        self.cursor = ((first + n_usize) % end) as u32;
+        Some(first as u32)
+    }
+
+    fn release(&mut self, at: u32, n: u32) {
+        let start = at as usize;
+        let end = at.saturating_add(n).min(self.len) as usize;
+        if start < end {
+            self.set_range(start, end - start, false);
+        }
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -298,38 +466,17 @@ impl HostHeap {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
-        let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = self
+            .next
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .alloc(n);
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
-        Some(self.count + first as u32)
+        Some(self.count + first)
     }
 
     /// Two consecutive slots (view heaps only) kept until
@@ -376,11 +523,10 @@ impl HostHeap {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
+        self.next
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(at, n);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -1562,5 +1708,27 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    #[test]
+    fn dynamic_bitmap_allocates_wraps_and_releases() {
+        let mut map = DynamicBitmap::new(130);
+        // Single-slot allocations use the trailing_zeros fast path across word boundaries.
+        for expected in 0..130u32 {
+            assert_eq!(map.alloc(1), Some(expected));
+        }
+        assert_eq!(map.alloc(1), None);
+
+        // Free last slot + first slot: adjacent modulo len, must not form a 2-slot run.
+        map.release(0, 1);
+        map.release(129, 1);
+        assert_eq!(map.alloc(2), None);
+        assert_eq!(map.alloc(1), Some(0));
+        assert_eq!(map.alloc(1), Some(129));
+
+        // Release a 70-slot span crossing two u64 word boundaries (30..100).
+        map.release(30, 70);
+        assert_eq!(map.alloc(70), Some(30));
+        assert_eq!(map.alloc(1), None);
     }
 }

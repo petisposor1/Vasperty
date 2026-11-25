@@ -11,6 +11,7 @@ use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
 use victory_formats::xma::{Decoder as XmaDecoder, FRAME_SAMPLES as XMA_FRAME_SAMPLES};
 use victory_game::cityhash::city64;
 use victory_game::pipelines::{RASTER, resolve_raster_hashes};
+use victory_game::sgd5;
 use victory_shader::native::{ComputeIo, StageIo};
 use victory_shader::{Container, HwStage, NativeProgram, emit, io, ir, resource, structure};
 
@@ -38,6 +39,9 @@ pub fn run(iters: usize) -> Result<()> {
 
     // 6. Parallel CityHash64 pipeline raster state-space resolution
     bench_pipeline_state_resolve(iters)?;
+
+    // 7. Multi-core SGD5 shader container batch decompression
+    bench_sgd5_unpack(iters)?;
 
     Ok(())
 }
@@ -309,6 +313,45 @@ fn bench_pipeline_state_resolve(iters: usize) -> Result<()> {
     println!(
         "{:<28}: {per_ms:8.2} ms/batch  ({ops_sec:8.1} batches/s)",
         "Pipeline state resolve"
+    );
+    Ok(())
+}
+
+fn bench_sgd5_unpack(iters: usize) -> Result<()> {
+    // Build 16 stored raw-deflate SGD5 shader records (4 KiB unpacked each, 64 KiB/batch).
+    const RECORDS: usize = 16;
+    const PAYLOAD_LEN: usize = 4096;
+    let mut archive = Vec::new();
+    for i in 0..RECORDS {
+        let name = format!("SH_{i}");
+        archive.push(name.len() as u8 + 1);
+        archive.extend_from_slice(name.as_bytes());
+        archive.push(0);
+        archive.push(0x3c);
+        // Uncompressed RFC 1951 deflate block: BFINAL=1|BTYPE=00 (0x01), LEN=4096, NLEN=!4096.
+        let n = 5u32 + PAYLOAD_LEN as u32 + 12;
+        for w in [n, 0x000D_DCE7, n, PAYLOAD_LEN as u32] {
+            archive.extend_from_slice(&w.to_le_bytes());
+        }
+        archive.push(0x01);
+        archive.extend_from_slice(&(PAYLOAD_LEN as u16).to_le_bytes());
+        archive.extend_from_slice(&(!(PAYLOAD_LEN as u16)).to_le_bytes());
+        archive.extend(std::iter::repeat_n((i as u8).wrapping_mul(13), PAYLOAD_LEN));
+    }
+    let recs = sgd5::records(&archive);
+    let _ = sgd5::unpack_all(&recs);
+
+    let rounds = iters.saturating_mul(20);
+    let started = Instant::now();
+    for _ in 0..rounds {
+        let unpacked = sgd5::unpack_all(black_box(&recs));
+        black_box(unpacked);
+    }
+    report_throughput(
+        "SGD5 parallel unpack (16x4K)",
+        RECORDS * PAYLOAD_LEN,
+        rounds,
+        started.elapsed(),
     );
     Ok(())
 }

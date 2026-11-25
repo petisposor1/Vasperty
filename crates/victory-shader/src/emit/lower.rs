@@ -3443,7 +3443,10 @@ impl<'a> Lower<'a> {
             self.set(scc, Val::Bit(r));
             return Ok(());
         }
-        let wide = name.ends_with("_b64") || name.ends_with("_u64") || name.ends_with("_i64");
+        let wide = name.ends_with("_b64")
+            || name.ends_with("_u64")
+            || name.ends_with("_i64")
+            || name == "s_bitreplicate_b64_b32";
         if wide {
             let hi = dst_code.and_then(|c| inst.write(Reg::S(c + 1)));
             let nonzero = |l: &mut Self, a: V, b: V| {
@@ -3628,6 +3631,87 @@ impl<'a> Lower<'a> {
                     }
                     Ok(())
                 }
+                "s_cmov_b64" => {
+                    let cond = self.scc_in(inst)?;
+                    let base = dst_code.ok_or("a missing operand")?;
+                    for (h, v) in [(0u8, lo), (1u8, hi)] {
+                        let a = half(self, 0, h)?;
+                        let old = self.i32_of(
+                            inst.read(Reg::S(base + h)).ok_or("an unread operand")?,
+                        )?;
+                        let r = self.s.m.select(c, cond, a, old);
+                        self.set(v, Val::I32(r));
+                    }
+                    Ok(())
+                }
+                "s_brev_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let ra = self
+                        .s
+                        .op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[a]);
+                    let rb = self
+                        .s
+                        .op(c, "unary.i32", Attr::ReadNone, self.s.t.i32, 30, &[b]);
+                    self.set(lo, Val::I32(rb));
+                    self.set(hi, Val::I32(ra));
+                    Ok(())
+                }
+                "s_wqm_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let (wa, wb) = (self.wqm32(a), self.wqm32(b));
+                    self.set(lo, Val::I32(wa));
+                    self.set(hi, Val::I32(wb));
+                    let s = nonzero(self, wa, wb);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_bitset0_b64" | "s_bitset1_b64" => {
+                    let bit = src32(self, 0)?;
+                    let base = dst_code.ok_or("a missing operand")?;
+                    let old_lo =
+                        self.i32_of(inst.read(Reg::S(base)).ok_or("an unread operand")?)?;
+                    let old_hi =
+                        self.i32_of(inst.read(Reg::S(base + 1)).ok_or("an unread operand")?)?;
+                    let (k31, k32, one, zero) = (
+                        self.s.m.i32(31),
+                        self.s.m.i32(32),
+                        self.s.m.i32(1),
+                        self.s.m.i32(0),
+                    );
+                    let idx = self.s.m.bin(c, Bin::And, bit, k31);
+                    let mask = self.s.m.bin(c, Bin::Shl, one, idx);
+                    let hi_bit = self.s.m.bin(c, Bin::And, bit, k32);
+                    let upper = self.s.m.cmp(c, pred::NE, hi_bit, zero);
+                    let (lo_new, hi_new) = if name == "s_bitset1_b64" {
+                        (
+                            self.s.m.bin(c, Bin::Or, old_lo, mask),
+                            self.s.m.bin(c, Bin::Or, old_hi, mask),
+                        )
+                    } else {
+                        let ones = self.s.m.i32(u32::MAX);
+                        let inv = self.s.m.bin(c, Bin::Xor, mask, ones);
+                        (
+                            self.s.m.bin(c, Bin::And, old_lo, inv),
+                            self.s.m.bin(c, Bin::And, old_hi, inv),
+                        )
+                    };
+                    let rl = self.s.m.select(c, upper, old_lo, lo_new);
+                    let rh = self.s.m.select(c, upper, hi_new, old_hi);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    Ok(())
+                }
+                "s_bitreplicate_b64_b32" => {
+                    let a = src32(self, 0)?;
+                    let (k16, mask16) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+                    let lo_half = self.s.m.bin(c, Bin::And, a, mask16);
+                    let hi_half = self.s.m.bin(c, Bin::LShr, a, k16);
+                    let rl = self.replicate16(lo_half);
+                    let rh = self.replicate16(hi_half);
+                    self.set(lo, Val::I32(rl));
+                    self.set(hi, Val::I32(rh));
+                    Ok(())
+                }
                 _ => Err(name),
             };
         }
@@ -3644,6 +3728,20 @@ impl<'a> Lower<'a> {
                 let cond = self.scc_in(inst)?;
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 (self.s.m.select(c, cond, a, b), None)
+            }
+            "s_cmov_b32" | "s_cmovk_i32" => {
+                let cond = self.scc_in(inst)?;
+                let old = self.operand(inst, dst.as_ref().ok_or("a missing operand")?)?;
+                let val = if name == "s_cmovk_i32" {
+                    sext16(self)
+                } else {
+                    src32(self, 0)?
+                };
+                (self.s.m.select(c, cond, val, old), None)
+            }
+            "s_wqm_b32" => {
+                let a = src32(self, 0)?;
+                (self.wqm32(a), None)
             }
             "s_brev_b32" => {
                 let a = src32(self, 0)?;
@@ -3863,6 +3961,8 @@ impl<'a> Lower<'a> {
                     name,
                     "s_mov_b32"
                         | "s_movk_i32"
+                        | "s_cmov_b32"
+                        | "s_cmovk_i32"
                         | "s_cselect_b32"
                         | "s_brev_b32"
                         | "s_mul_i32"
@@ -3888,6 +3988,46 @@ impl<'a> Lower<'a> {
             self.vals.insert(scc, val);
         }
         Ok(())
+    }
+
+    /// Whole-quad mode over a 32-bit lane mask: expands every 4-bit aligned
+    /// quad containing a set bit to `0xF`.
+    fn wqm32(&mut self, x: V) -> V {
+        let c = self.cur;
+        let (k1, k2, even_mask, quad_mask, k_f) = (
+            self.s.m.i32(1),
+            self.s.m.i32(2),
+            self.s.m.i32(0x5555_5555),
+            self.s.m.i32(0x1111_1111),
+            self.s.m.i32(0xF),
+        );
+        let x_r1 = self.s.m.bin(c, Bin::LShr, x, k1);
+        let p = self.s.m.bin(c, Bin::Or, x, x_r1);
+        let p_even = self.s.m.bin(c, Bin::And, p, even_mask);
+        let p_r2 = self.s.m.bin(c, Bin::LShr, p_even, k2);
+        let q = self.s.m.bin(c, Bin::Or, p_even, p_r2);
+        let q_bit = self.s.m.bin(c, Bin::And, q, quad_mask);
+        self.s.m.bin(c, Bin::Mul, q_bit, k_f)
+    }
+
+    /// Replicates each low 16-bit bit `i` of `x` into bit pair `(2*i, 2*i+1)`.
+    fn replicate16(&mut self, mut x: V) -> V {
+        let c = self.cur;
+        for (shift, mask) in [
+            (8u32, 0x00FF_00FFu32),
+            (4, 0x0F0F_0F0F),
+            (2, 0x3333_3333),
+            (1, 0x5555_5555),
+        ] {
+            let k_sh = self.s.m.i32(shift);
+            let k_m = self.s.m.i32(mask);
+            let shifted = self.s.m.bin(c, Bin::Shl, x, k_sh);
+            let ored = self.s.m.bin(c, Bin::Or, x, shifted);
+            x = self.s.m.bin(c, Bin::And, ored, k_m);
+        }
+        let k1 = self.s.m.i32(1);
+        let x1 = self.s.m.bin(c, Bin::Shl, x, k1);
+        self.s.m.bin(c, Bin::Or, x, x1)
     }
 
     /// Packs whether each consecutive group of four pixels has a set bit.
@@ -11197,6 +11337,37 @@ mod tests {
         body.extend(vop3(3, 0x369, 257, 258, 0)); // v_cvt_pknorm_u16_f32 v3, v1, v2
         body.extend(vop3(1, 0x312, 258, 259, 0)); // v_cvt_pknorm_i16_f16 v1, v2, v3
         body.extend(vop3(0, 0x313, 259, 257, 0)); // v_cvt_pknorm_u16_f16 v0, v3, v1
+        lowers_valu(&body).unwrap();
+    }
+
+    #[test]
+    fn scalar_64bit_cmov_wqm_bitset_replicate_lower() {
+        let sop1 = |sdst: u8, op: u8, ssrc0: u8| -> u32 {
+            0xBE80_0000 | (u32::from(sdst) << 16) | (u32::from(op) << 8) | u32::from(ssrc0)
+        };
+        let sopk = |sdst: u8, op: u8, imm: u16| -> u32 {
+            0xB000_0000 | (u32::from(op) << 23) | (u32::from(sdst) << 16) | u32::from(imm)
+        };
+        let sopc = |op: u8, src0: u8, src1: u8| -> u32 {
+            0xBF00_0000 | (u32::from(op) << 16) | (u32::from(src1) << 8) | u32::from(src0)
+        };
+
+        let body = [
+            sopc(0x00, 0, 1),      // s_cmp_eq_i32 s0, s1
+            sop1(6, 0x03, 0),      // s_mov_b32 s6, s0
+            sop1(7, 0x03, 1),      // s_mov_b32 s7, s1
+            sop1(6, 0x05, 2),      // s_cmov_b32 s6, s2
+            sopk(7, 0x02, 42),     // s_cmovk_i32 s7, 42
+            sop1(6, 0x06, 2),      // s_cmov_b64 s[6:7], s[2:3]
+            sop1(6, 0x09, 6),      // s_wqm_b32 s6, s6
+            sop1(6, 0x0A, 6),      // s_wqm_b64 s[6:7], s[6:7]
+            sop1(6, 0x0C, 6),      // s_brev_b64 s[6:7], s[6:7]
+            sop1(6, 0x1C, 2),      // s_bitset0_b64 s[6:7], s2
+            sop1(6, 0x1E, 3),      // s_bitset1_b64 s[6:7], s3
+            sop1(6, 0x3B, 6),      // s_bitreplicate_b64_b32 s[6:7], s6
+            0x7E00_0206,           // v_mov_b32 v0, s6
+            0x7E02_0207,           // v_mov_b32 v1, s7
+        ];
         lowers_valu(&body).unwrap();
     }
 }

@@ -144,6 +144,30 @@ pub fn records(file: &[u8]) -> Vec<Record<'_>> {
         .collect()
 }
 
+/// Unpacks all `records` in parallel across CPU cores (`>= 4` records),
+/// returning one decompressed container buffer per input record in order.
+pub fn unpack_all(records: &[Record<'_>]) -> Vec<Option<Vec<u8>>> {
+    if records.len() < 4 {
+        return records.iter().map(Record::unpack).collect();
+    }
+    let threads = std::thread::available_parallelism()
+        .map_or(2, std::num::NonZeroUsize::get)
+        .clamp(2, 8)
+        .min(records.len());
+    let chunk = records.len().div_ceil(threads);
+    let mut out: Vec<Option<Vec<u8>>> = vec![None; records.len()];
+    std::thread::scope(|s| {
+        for (in_chunk, out_chunk) in records.chunks(chunk).zip(out.chunks_mut(chunk)) {
+            s.spawn(move || {
+                for (rec, slot) in in_chunk.iter().zip(out_chunk.iter_mut()) {
+                    *slot = rec.unpack();
+                }
+            });
+        }
+    });
+    out
+}
+
 fn record(file: &[u8], at: usize) -> Option<Record<'_>> {
     let u32_at = |o: usize| {
         file.get(o..o + 4)
@@ -568,5 +592,27 @@ mod tests {
         let found = records(&file);
         assert_eq!(found.len(), 4);
         assert_eq!(found[1].name, Some("PS_a"));
+    }
+
+    #[test]
+    fn unpack_all_matches_serial_unpack_and_preserves_corrupt_entries() {
+        let mut archive = Vec::new();
+        for i in 0..8u8 {
+            let payload = vec![i.wrapping_mul(19).wrapping_add(3); 64 + usize::from(i) * 8];
+            let mut chunk = record_bytes(&format!("SH_{i}"), 0x3c, &payload);
+            if i == 5 {
+                // Corrupt packed deflate stream on entry 5 only.
+                chunk[27] = 0xFF;
+            }
+            archive.extend_from_slice(&chunk);
+        }
+        let recs = records(&archive);
+        assert_eq!(recs.len(), 8);
+        let serial: Vec<_> = recs.iter().map(Record::unpack).collect();
+        let parallel = unpack_all(&recs);
+        assert_eq!(parallel, serial);
+        assert!(parallel[5].is_none());
+        assert!(parallel[0].is_some());
+        assert!(parallel[7].is_some());
     }
 }
