@@ -12,7 +12,7 @@ import vasperty_pe "vasperty:pe"
 import vasperty_pipeline "vasperty:pipeline"
 
 usage :: proc() {
-	fmt.println("Vasperty Native Odin CLI (Phase 1)")
+	fmt.println("Vasperty Native Odin CLI (Phase 2)")
 	fmt.println("Usage:")
 	fmt.println("  vasperty.exe status")
 	fmt.println("  vasperty.exe doctor")
@@ -22,8 +22,8 @@ usage :: proc() {
 
 cmd_status :: proc() -> int {
 	cores := os.get_processor_core_count()
-	fmt.printf("vasperty-odin: Phase 1 core packages online (cores=%d)\n", cores)
-	fmt.println("  packages: vasperty:core, vasperty:pe, vasperty:game, vasperty:formats, vasperty:pipeline")
+	fmt.printf("vasperty-odin: Phase 2 packages online (cores=%d)\n", cores)
+	fmt.println("  packages: vasperty:core, vasperty:pe, vasperty:game (100%), vasperty:formats (100%), vasperty:pipeline")
 	fmt.println("  baseline: Marvisak/VIctory upstream 13f91ca (GTA VI prologue)")
 	return 0
 }
@@ -58,6 +58,13 @@ cmd_doctor :: proc() -> int {
 		}
 	} else {
 		fmt.eprintf("doctor: cache open error: %v\n", c_err)
+		return 1
+	}
+	if tbl, b_err := vasperty_formats.bcpack_builtin_tables(); b_err == .None {
+		vasperty_formats.bcpack_destroy_tables(tbl)
+		fmt.println("BCPack tables   : loaded cleanly (128 rANS models, 6 dictionaries)")
+	} else {
+		fmt.eprintf("doctor: bcpack tables error: %v\n", b_err)
 		return 1
 	}
 	return 0
@@ -105,7 +112,8 @@ cmd_bench :: proc(secs: f64) -> int {
 	acc: u64 = 0
 	for {
 		for batch := 0; batch < 1024; batch += 1 {
-			city_buf[0] = u8(hashes + batch)
+			city_buf[0] = u8((hashes + batch) & 0xFF)
+			city_buf[1] = u8((hashes + batch) >> 8)
 			acc ~= vasperty_game.city64(city_buf[:])
 		}
 		hashes += 1024
@@ -173,7 +181,58 @@ cmd_bench :: proc(secs: f64) -> int {
 	detile_gb_s := (f64(detile_iters) * f64(lin_size)) / (1024.0 * 1024.0 * 1024.0 * el_detile)
 	fmt.printf("rdna2 detile 2D : %6d frames (4 MiB 64KB_S) in %.3fs -> %.2f GiB/s\n", detile_iters, el_detile, detile_gb_s)
 
-	// 3. Streaming multipart SHA-256 cache keying (zero-concat)
+	// 3. XMA2 tabled 512-sample IMDCT throughput
+	rot: vasperty_formats.Xma_Rotations
+	vasperty_formats.xma_init_rotations(&rot, 512)
+	mdct_in: [512]f32
+	mdct_out: [512]f32
+	for i := 0; i < 512; i += 1 {
+		mdct_in[i] = f32((i * 7919) % 97) - 48.0
+	}
+	tx := time.tick_now()
+	mdct_iters := 0
+	mdct_acc: f32 = 0
+	for {
+		for _ in 0 ..< 256 {
+			vasperty_formats.xma_imdct_with_rotations(&rot, mdct_in[:], mdct_out[:], 1.0)
+			mdct_acc += mdct_out[0]
+			mdct_in[0] += 0.0001
+		}
+		mdct_iters += 256
+		if time.duration_seconds(time.tick_since(tx)) >= dur_s {
+			break
+		}
+	}
+	el_mdct := time.duration_seconds(time.tick_since(tx))
+	ns_per_tx := (el_mdct * 1e9) / f64(mdct_iters)
+	fmt.printf("xma imdct-512   : %7d transforms in %.3fs -> %.0f ns/subframe (%.2f M/s) [%.3f]\n",
+		mdct_iters, el_mdct, ns_per_tx, f64(mdct_iters) / (1e6 * el_mdct), mdct_acc)
+
+	// 4. Parallel rasterizer state resolution throughput
+	r_state := [vasperty_game.STATE_RASTER]u8{
+		3, 2, 1, transmute(u8)i8(-4),
+		0, 0, 0, 0,
+		0, 0, 0xC0, 0x3F, // 1.5f32 LE
+		1, 0, 1, 2,
+	}
+	want_r := make(map[u64]bool)
+	want_r[vasperty_game.city64(r_state[:])] = true
+	defer delete(want_r)
+	tr := time.tick_now()
+	r_iters := 0
+	for {
+		found := vasperty_game.resolve_raster_hashes(&want_r)
+		delete(found)
+		r_iters += 1
+		if time.duration_seconds(time.tick_since(tr)) >= dur_s {
+			break
+		}
+	}
+	el_r := time.duration_seconds(time.tick_since(tr))
+	fmt.printf("pso raster res. : %6d solves in %.3fs -> %.2f ms/solve\n",
+		r_iters, el_r, (el_r * 1e3) / f64(r_iters))
+
+	// 5. Streaming multipart SHA-256 cache keying (zero-concat)
 	p0 := city_buf[:64]
 	p1 := city_buf[64:]
 	parts := [2][]u8{p0, p1}
@@ -182,7 +241,8 @@ cmd_bench :: proc(secs: f64) -> int {
 	key_acc: u8 = 0
 	for {
 		for b := 0; b < 512; b += 1 {
-			p0[0] = u8(keys + b)
+			p0[0] = u8((keys + b) & 0xFF)
+			p0[1] = u8((keys + b) >> 8)
 			k := vasperty_pipeline.cache_key_from_parts("dxil-sm66", 1, parts[:])
 			key_acc ~= k.digest[0]
 		}
