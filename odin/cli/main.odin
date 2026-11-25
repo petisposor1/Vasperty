@@ -9,6 +9,7 @@ import "core:time"
 import vasperty_core "vasperty:core"
 import vasperty_formats "vasperty:formats"
 import vasperty_game "vasperty:game"
+import vasperty_gpu "vasperty:gpu"
 import vasperty_loader "vasperty:loader"
 import vasperty_pe "vasperty:pe"
 import vasperty_pipeline "vasperty:pipeline"
@@ -265,11 +266,11 @@ cmd_bench :: proc(secs: f64) -> int {
 
 	// 6. RDNA2 GFX10 decode + SSA IR + BDD structurization throughput
 	shader_words := [6]u32{
-		0xbe80_0382, // s_mov_b32 s0, 2
-		0x7e00_0280, // v_mov_b32 v0, 0
-		0xd500_0001, // v_add_f32_e64 v1, v0, 1.0 (placeholder VOP3)
-		0x8100_0000,
-		0xbf8c_0000, // s_waitcnt 0
+		0xbe82_0300, // s_mov_b32 s2, s0
+		0x7e00_0202, // v_mov_b32 v0, s2
+		0x8000_8100, // s_add_u32 s0, s0, 1
+		0xbf06_8100, // s_cmp_eq_u32 s0, 1
+		0xbf84_0000, // s_cbranch_scc0 +0
 		0xbf81_0000, // s_endpgm
 	}
 	shader_bytes := slice.reinterpret([]u8, shader_words[:])
@@ -291,6 +292,13 @@ cmd_bench :: proc(secs: f64) -> int {
 	el_sh := time.duration_seconds(time.tick_since(t4))
 	fmt.printf("shader ir+bdd   : %6d shaders in %.3fs -> %.1f K shaders/s [0x%X]\n",
 		sh_iters, el_sh, f64(sh_iters) / (1e3 * el_sh), sh_acc)
+
+	// 7. Live D3D12/DXGI adapter & feature probe
+	caps := vasperty_gpu.probe_capabilities(true)
+	defer vasperty_gpu.destroy_host_capabilities(&caps)
+	fmt.printf("d3d12 adapter   : %s (%s, mesh=%v, wave=%v %d..%d, tearing=%v)\n",
+		caps.adapter_name, caps.highest_shader_model, caps.mesh_shaders,
+		caps.wave_ops, caps.wave_lane_count_min, caps.wave_lane_count_max, caps.allow_tearing)
 	return 0
 }
 

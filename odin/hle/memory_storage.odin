@@ -446,6 +446,8 @@ fini_dstorage :: proc() {
 	delete(ws)
 	delete(ds_state.workers)
 	delete(ds_state.queues)
+	ds_state.workers = nil
+	ds_state.queues = nil
 	ds_state.started = false
 	ds_state.stopping = false
 }

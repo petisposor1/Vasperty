@@ -10,6 +10,7 @@ import "core:slice"
 import vasperty_core "vasperty:core"
 import vasperty_formats "vasperty:formats"
 import vasperty_game "vasperty:game"
+import vasperty_gpu "vasperty:gpu"
 import vasperty_hle "vasperty:hle"
 import vasperty_loader "vasperty:loader"
 import vasperty_pe "vasperty:pe"
@@ -1203,6 +1204,114 @@ test_shader_phase5 :: proc() {
 	fmt.println("ok")
 }
 
+test_gpu_phase6 :: proc() {
+	fmt.print("test_gpu_phase6... ")
+	vasperty_hle.init_hle()
+	defer vasperty_hle.fini_hle()
+	vasperty_gpu.register_gpu_hooks()
+	defer vasperty_gpu.gpu_fini()
+
+	// 1. Live D3D12/DXGI capability probe (hardware or WARP)
+	caps := vasperty_gpu.probe_capabilities(true)
+	defer vasperty_gpu.destroy_host_capabilities(&caps)
+	assert(caps.adapter_name != "" && caps.highest_shader_model != "")
+
+	// 2. Virtual memory configuration & console Device COM object creation through HLE hooks
+	hooks := vasperty_hle.get_gpu_hooks()
+	assert(hooks.configure_virtual_memory != nil && hooks.create_device != nil)
+	vm: vasperty_gpu.Virtual_Memory_X
+	vm.flags = 1
+	assert(hooks.configure_virtual_memory(&vm, 0, nil) == vasperty_hle.S_OK)
+	assert(vm.highest > vm.lowest)
+
+	ver := vasperty_gpu.CHECKED_DEVICE_VERSION
+	dev_out: rawptr = nil
+	dev_iid := transmute(vasperty_hle.Guid)vasperty_gpu.IID_ID3D12Device
+	assert(hooks.create_device(nil, &ver, &dev_iid, &dev_out) == vasperty_hle.S_OK && dev_out != nil)
+	dev_obj := cast(^vasperty_gpu.Gpu_Object)dev_out
+	Vtbl_Dev :: struct {
+		QueryInterface:     rawptr,
+		AddRef:             proc "system" (^vasperty_gpu.Gpu_Object) -> u32,
+		Release:            proc "system" (^vasperty_gpu.Gpu_Object) -> u32,
+		GetPrivateData:     proc "system" (^vasperty_gpu.Gpu_Object, ^vasperty_gpu.Iid, ^u32, rawptr) -> vasperty_gpu.HRESULT,
+		SetPrivateData:     proc "system" (^vasperty_gpu.Gpu_Object, ^vasperty_gpu.Iid, u32, rawptr) -> vasperty_gpu.HRESULT,
+		SetPrivIfc:         rawptr,
+		SetName:            rawptr,
+		GetNodeCount:       proc "system" (^vasperty_gpu.Gpu_Object) -> u32,
+	}
+	dvt := (cast(^^Vtbl_Dev)dev_obj)^
+	assert(dvt.GetNodeCount(dev_obj) == 1)
+	priv_key := vasperty_gpu.guid(0x11223344, 0x5566, 0x7788, {1, 2, 3, 4, 5, 6, 7, 8})
+	priv_val := u32(0xDEAD_BEEF)
+	assert(dvt.SetPrivateData(dev_obj, &priv_key, 4, &priv_val) == vasperty_hle.S_OK)
+	got_val := u32(0)
+	got_sz := u32(4)
+	assert(dvt.GetPrivateData(dev_obj, &priv_key, &got_sz, &got_val) == vasperty_hle.S_OK && got_val == 0xDEAD_BEEF)
+	dvt.Release(dev_obj)
+
+	// 3. Placed heap coalescing allocator
+	pa := vasperty_gpu.placement_init()
+	defer vasperty_gpu.placement_destroy(&pa)
+	h1, o1, ok1 := vasperty_gpu.placement_alloc(&pa, 128 << 10, 64 << 10)
+	h2, o2, ok2 := vasperty_gpu.placement_alloc(&pa, 256 << 10, 64 << 10)
+	assert(ok1 && ok2 && h1 == h2 && o2 > o1)
+	vasperty_gpu.placement_free(&pa, h1, o1, 128 << 10, 64 << 10)
+	vasperty_gpu.placement_free(&pa, h2, o2, 256 << 10, 64 << 10)
+	h3, o3, ok3 := vasperty_gpu.placement_alloc(&pa, 384 << 10, 64 << 10)
+	assert(ok3 && h3 == h1 && o3 == 0)
+
+	// 4. Page table & host descriptor heap virtualization + shadow copy-back + barrier tracker
+	pt := vasperty_gpu.page_table_create()
+	defer vasperty_gpu.page_table_destroy(pt)
+	vasperty_gpu.page_table_map_range(pt, 0x1_0000_0000, 128 << 10, 42)
+	ent, found_pg := vasperty_gpu.page_table_lookup(pt, 0x1_0001_2345)
+	assert(found_pg && ent.srv_heap_slot == 42)
+
+	hh := vasperty_gpu.host_heap_create(false, 64, 16)
+	defer vasperty_gpu.host_heap_destroy(hh)
+	vasperty_gpu.host_heap_set_view_stride(hh, 5, 16 | vasperty_shader.VIEW_INTEGER)
+	dslot, dok := vasperty_gpu.host_heap_alloc_dyn(hh)
+	assert(dok && dslot == 64)
+	pslot := vasperty_gpu.host_heap_alloc_pair(hh)
+	assert(pslot == 80)
+	vasperty_gpu.host_heap_free_pair(hh, pslot)
+	assert(vasperty_gpu.host_heap_alloc_pair(hh) == pslot)
+
+	title_mem := make([]u8, 256)
+	defer delete(title_mem)
+	title_mem[12] = 0x77
+	sc := vasperty_gpu.shadow_create(0x1_0000_0000, 256, 42)
+	defer vasperty_gpu.shadow_destroy(sc)
+	vasperty_gpu.shadow_refresh_from(sc, title_mem)
+	assert(sc.backing[12] == 0x77)
+	sc.backing[20] = 0xAB
+	sc.backing[21] = 0xCD
+	copied := vasperty_gpu.shadow_copy_back(sc, title_mem)
+	assert(copied == 2 && title_mem[20] == 0xAB && title_mem[21] == 0xCD)
+
+	cl := vasperty_gpu.command_list_create(0)
+	defer vasperty_gpu.command_list_destroy(cl)
+	vasperty_gpu.command_list_transition(cl, 0xCAFE_0000, 0x0200_0008, true) // strip high bits & buffer-only bits
+	vasperty_gpu.command_list_transition(cl, 0xCAFE_0000, 0x0000_0008, true) // redundant -> coalesced away
+	assert(len(cl.barriers) == 1 && cl.barriers[0].after == 0x8)
+
+	// 5. Watch alias tracking & root signature console flag stripping
+	vasperty_gpu.watch_memory_aliased(0x2_0000_0000, 0x1_0000_0000)
+	assert(vasperty_gpu.watch_alias_count(0x1_0000_0000) == 1)
+	rs := vasperty_gpu.root_desc_without_console_flags(vasperty_gpu.Root_Sig_Desc{flags = 0xFF00_0009})
+	assert(rs.flags == 0x9)
+
+	// 6. Shader cache miss -> hit roundtrip
+	_, _, terr_miss := vasperty_gpu.host_shader_from_container([]u8{1, 2, 3, 4})
+	assert(terr_miss != .None)
+	_, hit2, _ := vasperty_gpu.host_shader_from_container([]u8{1, 2, 3, 4})
+	assert(hit2)
+	hits, misses := vasperty_gpu.shader_cache_counts()
+	assert(hits >= 1 && misses >= 1)
+
+	fmt.println("ok")
+}
+
 main :: proc() {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
@@ -1222,6 +1331,7 @@ main :: proc() {
 	test_loader_phase3()
 	test_hle_phase4()
 	test_shader_phase5()
+	test_gpu_phase6()
 
 	if len(track.allocation_map) > 0 {
 		fmt.eprintf("\nFAIL: %d memory leaks detected!\n", len(track.allocation_map))
@@ -1237,5 +1347,5 @@ main :: proc() {
 		}
 		os.exit(1)
 	}
-	fmt.println("ALL ODIN PHASE 5 TESTS PASSED (0 leaks, 0 bad frees)")
+	fmt.println("ALL ODIN PHASE 6 TESTS PASSED (0 leaks, 0 bad frees)")
 }

@@ -197,6 +197,9 @@ fini_xasync :: proc() {
 	delete(xasync_state.blocks)
 	delete(xasync_state.ports)
 	delete(xasync_state.queues)
+	xasync_state.blocks = nil
+	xasync_state.ports = nil
+	xasync_state.queues = nil
 	sync.mutex_unlock(&xasync_state.mu)
 
 	_ = pq

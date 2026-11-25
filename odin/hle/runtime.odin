@@ -313,6 +313,9 @@ fini_hle :: proc() {
 		delete(m.exports)
 	}
 	delete(g_rt.modules)
+	g_rt.images = nil
+	g_rt.host_modules = nil
+	g_rt.modules = nil
 	g_rt.initialized = false
 }
 

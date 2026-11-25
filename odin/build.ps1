@@ -120,6 +120,7 @@ function Run-Check {
     Invoke-OdinCheck (Join-Path $OdinRoot "loader") "vasperty:loader" -NoEntry
     Invoke-OdinCheck (Join-Path $OdinRoot "hle") "vasperty:hle" -NoEntry
     Invoke-OdinCheck (Join-Path $OdinRoot "shader") "vasperty:shader" -NoEntry
+    Invoke-OdinCheck (Join-Path $OdinRoot "gpu") "vasperty:gpu" -NoEntry
     Invoke-OdinCheck (Join-Path $OdinRoot "cli") "vasperty:cli"
     Invoke-OdinCheck (Join-Path $OdinRoot "tests") "vasperty:tests"
 }
