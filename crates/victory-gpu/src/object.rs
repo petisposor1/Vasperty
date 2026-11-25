@@ -82,6 +82,12 @@ fn decrement_refs(refs: &std::sync::atomic::AtomicU32, set: Ordering, fetch: Ord
     }
 }
 
+/// An object's reference count.
+pub(crate) fn refs(this: This) -> u32 {
+    // SAFETY: `this` is one of our objects.
+    unsafe { &*this }.refs.load(Ordering::Acquire)
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
