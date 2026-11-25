@@ -2,6 +2,7 @@ package vasperty_cli
 
 import "core:fmt"
 import "core:os"
+import "core:slice"
 import "core:strconv"
 import "core:time"
 
@@ -11,9 +12,10 @@ import vasperty_game "vasperty:game"
 import vasperty_loader "vasperty:loader"
 import vasperty_pe "vasperty:pe"
 import vasperty_pipeline "vasperty:pipeline"
+import vasperty_shader "vasperty:shader"
 
 usage :: proc() {
-	fmt.println("Vasperty Native Odin CLI (Phase 3)")
+	fmt.println("Vasperty Native Odin CLI (Phase 5)")
 	fmt.println("Usage:")
 	fmt.println("  vasperty.exe status")
 	fmt.println("  vasperty.exe doctor")
@@ -23,8 +25,8 @@ usage :: proc() {
 
 cmd_status :: proc() -> int {
 	cores := os.get_processor_core_count()
-	fmt.printf("vasperty-odin: Phase 3 packages online (cores=%d)\n", cores)
-	fmt.println("  packages: vasperty:core, vasperty:pe, vasperty:game (100%), vasperty:formats (100%), vasperty:pipeline, vasperty:loader")
+	fmt.printf("vasperty-odin: Phase 5 packages online (cores=%d)\n", cores)
+	fmt.println("  packages: vasperty:core, vasperty:pe, vasperty:game (100%), vasperty:formats (100%), vasperty:pipeline, vasperty:loader, vasperty:hle, vasperty:shader")
 	fmt.println("  baseline: Marvisak/VIctory upstream 13f91ca (GTA VI prologue)")
 	return 0
 }
@@ -260,6 +262,35 @@ cmd_bench :: proc(secs: f64) -> int {
 	}
 	el_key := time.duration_seconds(time.tick_since(t3))
 	fmt.printf("cache sha256    : %9d keys in %.3fs -> %.2f M keys/s [0x%02X]\n", keys, el_key, f64(keys) / (1e6 * el_key), key_acc)
+
+	// 6. RDNA2 GFX10 decode + SSA IR + BDD structurization throughput
+	shader_words := [6]u32{
+		0xbe80_0382, // s_mov_b32 s0, 2
+		0x7e00_0280, // v_mov_b32 v0, 0
+		0xd500_0001, // v_add_f32_e64 v1, v0, 1.0 (placeholder VOP3)
+		0x8100_0000,
+		0xbf8c_0000, // s_waitcnt 0
+		0xbf81_0000, // s_endpgm
+	}
+	shader_bytes := slice.reinterpret([]u8, shader_words[:])
+	t4 := time.tick_now()
+	sh_iters := 0
+	sh_acc: u64 = 0
+	for {
+		p, st, err := vasperty_shader.range_build(shader_bytes, false, 4)
+		if err == .None {
+			sh_acc += u64(len(p.blocks) + len(st.bools.nodes))
+			vasperty_shader.destroy_structured(&st)
+			vasperty_shader.destroy_program(&p)
+		}
+		sh_iters += 1
+		if time.duration_seconds(time.tick_since(t4)) >= dur_s {
+			break
+		}
+	}
+	el_sh := time.duration_seconds(time.tick_since(t4))
+	fmt.printf("shader ir+bdd   : %6d shaders in %.3fs -> %.1f K shaders/s [0x%X]\n",
+		sh_iters, el_sh, f64(sh_iters) / (1e3 * el_sh), sh_acc)
 	return 0
 }
 

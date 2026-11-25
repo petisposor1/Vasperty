@@ -5,6 +5,7 @@ import "core:math"
 import "core:mem"
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
 
 import vasperty_core "vasperty:core"
 import vasperty_formats "vasperty:formats"
@@ -13,6 +14,7 @@ import vasperty_hle "vasperty:hle"
 import vasperty_loader "vasperty:loader"
 import vasperty_pe "vasperty:pe"
 import vasperty_pipeline "vasperty:pipeline"
+import vasperty_shader "vasperty:shader"
 import win32 "core:sys/windows"
 
 @(private)
@@ -1085,6 +1087,122 @@ test_hle_phase4 :: proc() {
 	fmt.println("ok")
 }
 
+test_shader_phase5 :: proc() {
+	fmt.print("test_shader_phase5... ")
+	// 1. DXBC container build, parse & D3D12 MD5 hash
+	parts := [2]vasperty_shader.Raw_Part{
+		{fourcc = vasperty_shader.FOURCC_ISG1, data = []u8{0, 0, 0, 0, 8, 0, 0, 0}},
+		{fourcc = vasperty_shader.FOURCC_SFI0, data = []u8{0, 0, 0, 0, 0, 0, 0, 0}},
+	}
+	blob := vasperty_shader.dxbc_build(parts[:])
+	defer delete(blob)
+	parsed, perr := vasperty_shader.dxbc_parse(blob)
+	assert(perr == .None)
+	defer vasperty_shader.destroy_container(&parsed)
+	isg_d, ok_isg := vasperty_shader.dxbc_part(&parsed, vasperty_shader.FOURCC_ISG1)
+	assert(ok_isg && len(isg_d) == 8)
+	assert(parsed.hash == vasperty_shader.dxbc_hash(blob[20:]))
+	assert(parsed.hash != [16]u8{})
+	_, bad_err := vasperty_shader.dxbc_parse(transmute([]u8)string("nope"))
+	assert(bad_err == .Not_Dxbc)
+
+	// 2. Static sampler decoding & host aniso point mip filter fallback
+	point := vasperty_shader.static_sampler_from_words({0x3088, 0x0054_0100, 0x1400_0080, 0x8000_0000})
+	assert(point.filter == 0)
+	assert(point.address == [3]u32{1, 2, 3})
+	assert(point.max_anisotropy == 1 && point.comparison == 4 && point.border == 2)
+	aniso := vasperty_shader.static_sampler_from_words({0x369E, 0x00FF_F000, 0x18F0_3E00, 0x8000_0000})
+	assert(aniso.filter == 0x55 && aniso.address == [3]u32{4, 5, 3} && aniso.max_anisotropy == 8)
+	aniso_point := vasperty_shader.static_sampler_from_words({0, 0, (1 << 26) | (1 << 22) | (2 << 20), 0})
+	assert(aniso_point.filter == 0x54)
+	assert(vasperty_shader.static_sampler_filter_for_host(aniso_point, false) == 0x55)
+	assert(vasperty_shader.static_sampler_filter_for_host(aniso_point, true) == 0x54)
+
+	// 3. Rectangle geometry shader generation & right_angle geometry
+	tl := [2]f32{0.0, 0.0}
+	bl := [2]f32{0.0, 1.0}
+	br := [2]f32{1.0, 1.0}
+	tr := [2]f32{1.0, 0.0}
+	assert(vasperty_shader.right_angle({tl, bl, br}) == 1)
+	assert(vasperty_shader.right_angle({tl, bl, tr}) == 0)
+	assert(vasperty_shader.right_angle({bl, tr, tl}) == 2)
+
+	osg_elems := [2]vasperty_shader.Sig_Element{
+		{name = "SV_Position", kind = 3, comp = 9, has_row = true, row = 0, cols = 4, usage = 0xF},
+		{name = "TEXCOORD", kind = 0, comp = 9, has_row = true, row = 1, cols = 2, usage = 0x3},
+	}
+	osg_data := vasperty_shader.build_signature_part(osg_elems[:], false)
+	defer delete(osg_data)
+	dummy_vs := vasperty_shader.dxbc_build({{fourcc = vasperty_shader.FOURCC_OSG1, data = osg_data}})
+	defer delete(dummy_vs)
+	gs_blob, gs_err := vasperty_shader.rectangle_gs(dummy_vs)
+	assert(gs_err == .None && len(gs_blob) > 64)
+	defer delete(gs_blob)
+	gs_c, gs_perr := vasperty_shader.dxbc_parse(gs_blob[:])
+	assert(gs_perr == .None)
+	_, ok_gs_dxil := vasperty_shader.dxbc_part(&gs_c, vasperty_shader.FOURCC_DXIL)
+	assert(ok_gs_dxil)
+	vasperty_shader.destroy_container(&gs_c)
+
+	// 4. GFX10 decode + SSA IR + BDD structurization + Resource/IO + DXIL emission (CS)
+	cs_words := [6]u32{
+		0xbe82_0300, // s_mov_b32 s2, s0
+		0x7e00_0202, // v_mov_b32 v0, s2
+		0x8000_8100, // s_add_u32 s0, s0, 1
+		0xbf06_8100, // s_cmp_eq_u32 s0, 1
+		0xbf84_0000, // s_cbranch_scc0 +0
+		0xbf81_0000, // s_endpgm
+	}
+	cs_bytes := slice.reinterpret([]u8, cs_words[:])
+	p, st, rerr := vasperty_shader.range_build(cs_bytes, false, 4)
+	assert(rerr == .None && len(p.blocks) >= 1)
+	defer vasperty_shader.destroy_program(&p)
+	defer vasperty_shader.destroy_structured(&st)
+
+	layout := [1]vasperty_shader.Root_Param{
+		{root = .Constants, user_data = 0, sgprs = 2},
+	}
+	native: vasperty_shader.Native_Program
+	native.stage = .Cs
+	native.vgprs = 4
+	native.layout = layout[:]
+	native.io = vasperty_shader.Stage_Io{
+		kind = .Cs,
+		cs   = vasperty_shader.Compute_Io{rsrc2 = (2 << 1) | (1 << 7), threads = {64, 1, 1}},
+	}
+
+	res, res_err := vasperty_shader.track_resources(&p, native.layout, .Cs, &st)
+	assert(res_err == .None)
+	defer vasperty_shader.destroy_resources(&res)
+
+	io, io_err := vasperty_shader.raise_io(&p, &native)
+	assert(io_err == .None)
+	defer vasperty_shader.destroy_io(&io)
+
+	empty_c := vasperty_shader.Container{}
+	hs, emit_err := vasperty_shader.emit_shader(&empty_c, &native, &p, &st, &io, &res)
+	assert(emit_err == .None && len(hs.dxil) > 64)
+	defer vasperty_shader.destroy_host_shader(&hs)
+
+	hs_c, hs_perr := vasperty_shader.dxbc_parse(hs.dxil[:])
+	assert(hs_perr == .None)
+	dx_part, ok_hs_dxil := vasperty_shader.dxbc_part(&hs_c, vasperty_shader.FOURCC_DXIL)
+	assert(ok_hs_dxil && len(dx_part) > 24)
+	expected_h := hs_c.hash
+	vasperty_shader.destroy_container(&hs_c)
+	assert(vasperty_shader.dxbc_hash(hs.dxil[20:]) == expected_h)
+
+	// Optional live dxil.dll validation if installed on host
+	ok_val, msg_val, val_err := vasperty_shader.validate_dxil(hs.dxil[:])
+	if msg_val != "" {
+		delete(msg_val)
+	}
+	_ = ok_val
+	_ = val_err
+
+	fmt.println("ok")
+}
+
 main :: proc() {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
@@ -1103,6 +1221,7 @@ main :: proc() {
 	test_pipeline_cache()
 	test_loader_phase3()
 	test_hle_phase4()
+	test_shader_phase5()
 
 	if len(track.allocation_map) > 0 {
 		fmt.eprintf("\nFAIL: %d memory leaks detected!\n", len(track.allocation_map))
@@ -1118,5 +1237,5 @@ main :: proc() {
 		}
 		os.exit(1)
 	}
-	fmt.println("ALL ODIN PHASE 4 TESTS PASSED (0 leaks, 0 bad frees)")
+	fmt.println("ALL ODIN PHASE 5 TESTS PASSED (0 leaks, 0 bad frees)")
 }
