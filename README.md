@@ -38,6 +38,18 @@ otherwise. See [docs/architecture.md](docs/architecture.md).
 | Zero-Concat Streaming Cache | Adds `CacheKey::from_parts` and `Cache::read_or_convert_parts` in `victory-pipeline`, removing heap input concatenation and redundant miss-path disk reads in `victory-gpu` shader caching |
 | Parallel Shaderpack & SGD5 | Parallelizes CityHash64 rasterizer and depth-stencil state-space resolution (`resolve_raster_hashes`, `resolve_depth_hashes`) with early-exit termination, plus multi-core SGD5 shader container inflation (`sgd5::unpack_all`) |
 | Hardware Doctor & Benchmarks | Adds `victory doctor [--prune-cache]` (live D3D12 SM/Mesh/Atomics/Wave/Tier probing, DXIL validator check, env audit, pipeline cache stats/pruning) and `victory bench` (zero-asset tile/detile, BCPack, XMA2, DXIL, state-resolve & SGD5 unpack suite) |
+| Odin Rewrite (Phase 1) | Introduces native Odin rewrites (`odin/`) of `core`, `pe`, `game` (`CityHash64` & `PS\0\x09` `ShaderPack`), parallel `formats/texture` RDNA2 `tile`/`detile`, atomic SHA-256 `pipeline` cache, native `vasperty.exe` CLI, and `Tracking_Allocator` leak-verified test suite |
+
+## Vasperty Odin Subsystem (Phase 1)
+
+Alongside the synced Rust runtime, Vasperty is progressively rewriting the entire stack into **Odin** under [`odin/`](odin/MIGRATION.md) for direct memory control, explicit allocator lifetimes, zero-dependency builds, and data-oriented throughput:
+
+```powershell
+.\odin\build.ps1 all      # runs odin check -vet, Tracking_Allocator leak tests, vasperty.exe status/doctor/inspect/bench
+.\odin\build.ps1 build    # builds native x64 Release binary at odin\build\vasperty.exe (-o:speed)
+```
+
+Measured Phase 1 native Odin throughput (`vasperty.exe bench 2`, `-o:speed`): `CityHash64 (128 B)` at **11.4 M hashes/s**, parallel RDNA2 `64KB_S` 2D **7.23 GiB/s tile / 7.60 GiB/s detile**, and streaming multipart SHA-256 cache keying at **5.55 M keys/s** with **0 leaks / 0 bad frees** verified under `mem.Tracking_Allocator`. See [`odin/MIGRATION.md`](odin/MIGRATION.md) for the full 7-phase migration roadmap.
 
 ## Status (2026-11-25)
 

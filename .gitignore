@@ -10,6 +10,8 @@
 # Build output
 /target/
 /tests/fixtures/*/target/
+/odin/build/
+/.odin_cache/
 
 # Local configuration (contains paths to YOUR files)
 /victory.toml
