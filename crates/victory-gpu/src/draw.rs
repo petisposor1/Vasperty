@@ -232,11 +232,8 @@ impl State {
         self.topology = topology;
         let host = match topology {
             RECTANGLES => 4,
-            TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => {
-                once!(topology, "console topology drawn as a triangle list");
-                4
-            }
-            t => t,
+            t => crate::primitive::ConsoleTopology::from_console(t)
+                .map_or(t, crate::primitive::ConsoleTopology::host_topology),
         };
         // SAFETY: an open list.
         unsafe {
@@ -1022,6 +1019,16 @@ impl State {
     }
 
 
+    /// Runs an indirect mesh dispatch whose 12-byte `(x, y, z)` argument
+    /// record lies at title address `indirect`.
+    pub(crate) fn dispatch_mesh_indirect(&mut self, list: &HostList, indirect: u64) {
+        if !self.execute_indirect(list, (10, 12, 1), indirect, None) {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            dropped(list, self.pipeline, "mesh-indirect");
+        }
+    }
+
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
@@ -1388,6 +1395,53 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        if let Some(console) = crate::primitive::ConsoleTopology::from_console(self.topology) {
+            let expanded = crate::primitive::expanded_index_count(console, vertices);
+            if expanded == 0 {
+                return;
+            }
+            let ran = self.prepare(list, false)
+                && if let Some((gpu, to)) = list.scratch(u64::from(expanded) * 4) {
+                    let to = to as usize;
+                    let count = expanded as usize;
+                    list.defer_host(move || {
+                        // SAFETY: `to` points to `count` u32s in live scratch memory.
+                        let dst = unsafe { std::slice::from_raw_parts_mut(to as *mut u32, count) };
+                        crate::primitive::expand_non_indexed(console, vertices, dst);
+                    });
+                    let view = D3D12_INDEX_BUFFER_VIEW {
+                        BufferLocation: gpu,
+                        SizeInBytes: expanded * 4,
+                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                    };
+                    #[cfg(feature = "diagnostics")]
+                    list.note_op(|| {
+                        self.op_text(format!("draw-expanded {expanded}x{instances}"), false)
+                    });
+                    // SAFETY: an open list with live scratch index buffer and prepared state.
+                    unsafe {
+                        list.list.IASetIndexBuffer(Some(&view));
+                        list.list.DrawIndexedInstanced(
+                            expanded,
+                            instances,
+                            0,
+                            first as i32,
+                            first_instance,
+                        );
+                    }
+                    DRAWN.fetch_add(1, Ordering::Relaxed);
+                    true
+                } else {
+                    not_run("no scratch for expanded console topology");
+                    false
+                };
+            if !ran {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(list, self.pipeline, "draw");
+            }
+            return;
+        }
         // Rectangles: completed by the pipeline's geometry shader, else
         // expanded into vertex buffers of their own.
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
@@ -1492,6 +1546,106 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
+        if let Some(console) = crate::primitive::ConsoleTopology::from_console(self.topology) {
+            let expanded = crate::primitive::expanded_index_count(console, indices);
+            if expanded == 0 {
+                return;
+            }
+            let elem_bytes = match self.index.format {
+                57 => 2u64, // DXGI_FORMAT_R16_UINT
+                42 => 4u64, // DXGI_FORMAT_R32_UINT
+                _ => {
+                    not_run("unsupported index format for console topology");
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    dropped(list, self.pipeline, "indexed");
+                    return;
+                }
+            };
+            let valid = u64::from(first)
+                .checked_mul(elem_bytes)
+                .zip(u64::from(indices).checked_mul(elem_bytes))
+                .and_then(|(off, len)| off.checked_add(len).map(|end| (off, len, end)))
+                .filter(|&(_, _, end)| {
+                    self.index.address != 0
+                        && end <= u64::from(self.index.size)
+                        && crate::shadow::find(self.index.address, u64::from(self.index.size))
+                            .is_some()
+                });
+            let ran = if let Some((offset, byte_len, _)) = valid
+                && self.prepare(list, false)
+                && let Some((gpu, to)) = list.scratch(u64::from(expanded) * 4)
+            {
+                let cut = crate::pipeline::host_pipeline(self.pipeline as This)
+                    .map(|p| p.strip_cut)
+                    .unwrap_or(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED);
+                let src_addr = (self.index.address + offset) as usize;
+                let byte_len = byte_len as usize;
+                let to = to as usize;
+                let count = expanded as usize;
+                list.defer_host(move || {
+                    let mut raw = vec![0u8; byte_len];
+                    // SAFETY: `to` points to `count` u32s in live scratch memory.
+                    let dst = unsafe { std::slice::from_raw_parts_mut(to as *mut u32, count) };
+                    if !crate::host::read_into(src_addr as *const u8, &mut raw) {
+                        dst.fill(0);
+                        return;
+                    }
+                    if elem_bytes == 2 {
+                        let cut16 = (cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF)
+                            .then_some(u16::MAX);
+                        let src16: Vec<u16> = raw
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|c| u16::from_le_bytes(*c))
+                            .collect();
+                        crate::primitive::expand_indexed_u16(console, &src16, cut16, dst);
+                    } else {
+                        let cut32 = (cut == D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF)
+                            .then_some(u32::MAX);
+                        let src32: Vec<u32> = raw
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|c| u32::from_le_bytes(*c))
+                            .collect();
+                        crate::primitive::expand_indexed_u32(console, &src32, cut32, dst);
+                    }
+                });
+                let view = D3D12_INDEX_BUFFER_VIEW {
+                    BufferLocation: gpu,
+                    SizeInBytes: expanded * 4,
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                };
+                #[cfg(feature = "diagnostics")]
+                list.note_op(|| {
+                    self.op_text(format!("indexed-expanded {expanded}x{instances}"), false)
+                });
+                // SAFETY: an open list with live scratch index buffer and prepared state.
+                unsafe {
+                    list.list.IASetIndexBuffer(Some(&view));
+                    list.list.DrawIndexedInstanced(
+                        expanded,
+                        instances,
+                        0,
+                        base,
+                        first_instance,
+                    );
+                }
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+                true
+            } else {
+                not_run("indexed console topology outside buffer or no scratch");
+                false
+            };
+            if !ran {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(list, self.pipeline, "indexed");
+            }
+            return;
+        }
         let rects = self.topology == RECTANGLES && !self.completes_rectangles();
         if rects {
             once!("indexed rectangles not drawn");
@@ -1664,6 +1818,10 @@ impl State {
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
+    let host = crate::host::host()?;
+    if kind == 10 && !host.mesh_shaders() {
+        return None;
+    }
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1683,7 +1841,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     let mut signature: Option<ID3D12CommandSignature> = None;
     // SAFETY: a description of one argument; no root arguments.
     let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
+        host.device.CreateCommandSignature(
             &desc,
             None::<&ID3D12RootSignature>,
             &mut signature,
@@ -1835,12 +1993,8 @@ fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
     t.user_data.iter().any(is_root_view)
 }
 
-/// The console's own primitive topologies.
-const TRIANGLE_FAN: u32 = 6;
+/// The console's own rectangle primitive topology.
 const RECTANGLES: u32 = 17;
-const LINE_LOOP: u32 = 18;
-const QUADS: u32 = 19;
-const QUAD_STRIP: u32 = 20;
 
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
@@ -1861,6 +2015,24 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
+    if !crate::host::host().is_some_and(|h| h.depth_bounds_supported()) {
+        return;
+    }
+    if !min.is_finite() || !max.is_finite() {
+        return;
+    }
+    let min = min.clamp(0.0, 1.0);
+    let max = max.clamp(0.0, 1.0);
+    if min > max {
+        return;
+    }
+    if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+        // SAFETY: an open list; min/max are finite, clamped to [0, 1], with min <= max.
+        unsafe { list1.OMSetDepthBounds(min, max) };
+    }
 }
 
 #[cfg(test)]
@@ -2491,5 +2663,18 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop(found);
         slots.make_null(0);
         assert!(shown.upgrade().is_none(), "released with the slot");
+    }
+
+    #[test]
+    fn host_signature_supports_indirect_mesh_dispatch() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        if !host.mesh_shaders() {
+            assert!(host_signature(10, 12).is_none());
+            return;
+        }
+        // Kind 10 = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH with 12-byte (x,y,z) record.
+        assert!(host_signature(10, 12).is_some());
     }
 }

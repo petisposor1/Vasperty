@@ -816,46 +816,138 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
     }
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery(heap, type, index)`: records on the host GPU when backed by a
+/// host query heap (timestamps have no BeginQuery in D3D12).
+extern "system" fn begin_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if kind != 2
+        && let Some(list) = host_list(this)
+        && let Some((host_heap, heap_kind, count)) = crate::query::host_heap(heap)
+        && index < count
+        && let Some(ty) = crate::query::host_query_type(heap_kind, kind)
+    {
+        list.keep(&host_heap);
+        // SAFETY: an open list, live heap kept until reset, valid query index.
+        unsafe { list.list.BeginQuery(&host_heap, ty, index) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
 
-/// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
-/// each query's result into the buffer once the list has run. Timestamps
-/// (type 2) are the GPU clock then; occlusion counts (0) say a million
-/// samples passed and binary occlusion (1) visible, so nothing is culled
-/// by a query.
-/// shortcut: no query runs on the host GPU; results are plausible values,
-/// not measured ones (time spans come out as the submission's length).
+/// `EndQuery(heap, type, index)`: records on the host GPU when backed by a
+/// host query heap.
+extern "system" fn end_query(this: This, heap: This, kind: u32, index: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some((host_heap, heap_kind, count)) = crate::query::host_heap(heap)
+        && index < count
+        && let Some(ty) = crate::query::host_query_type(heap_kind, kind)
+    {
+        list.keep(&host_heap);
+        // SAFETY: an open list, live heap kept until reset, valid query index.
+        unsafe { list.list.EndQuery(&host_heap, ty, index) };
+    }
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// `SetPredication(buffer, aligned_offset, operation)`: conditional rendering
+/// from a query result buffer (or null to disable predication).
+extern "system" fn set_predication(this: This, buffer: This, offset: u64, operation: u32) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        use windows::Win32::Graphics::Direct3D12::D3D12_PREDICATION_OP;
+        let op = D3D12_PREDICATION_OP(operation as i32);
+        if buffer.is_null() {
+            // SAFETY: disabling predication on an open list.
+            unsafe { list.list.SetPredication(None, 0, op) };
+            return;
+        }
+        if let Some((data, size)) = crate::resource::buffer_bytes(buffer)
+            && offset.checked_add(8).is_some_and(|end| end <= size)
+            && let Some(address) = (data as u64).checked_add(offset)
+            && let Some(shadow) = crate::shadow::find(address, 8)
+        {
+            shadow.refresh(list, address, 8);
+            let aligned = shadow.offset(address);
+            list.keep(&shadow.buffer);
+            // SAFETY: open list, live shadow buffer kept until reset, 8-byte range valid.
+            unsafe { list.list.SetPredication(Some(&shadow.buffer), aligned, op) };
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (this, buffer, offset, operation);
+}
+
+/// `ResolveQueryData(heap, type, first, count, buffer, offset)`: resolves
+/// real host GPU queries into a readback buffer and copies them into the
+/// title's destination buffer once the list has executed. Falls back to
+/// synthetic plausible values when no host GPU or host query heap is present.
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
 ) {
+    let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
+        return;
+    };
+    let bytes = crate::query::result_size(kind);
+    let Some(total) = u64::from(count).checked_mul(bytes) else {
+        return;
+    };
+    let Some(end) = offset.checked_add(total) else {
+        return;
+    };
+    if count == 0 || end > size {
+        return;
+    }
+    #[cfg(windows)]
+    if let Some(list) = host_list(this)
+        && let Some(host) = crate::host::host()
+        && let Some((host_heap, heap_kind, heap_count)) = crate::query::host_heap(heap)
+        && first.checked_add(count).is_some_and(|last| last <= heap_count)
+        && let Some(ty) = crate::query::host_query_type(heap_kind, kind)
+        && let Some((readback, mapped)) = host.readback_buffer(total)
+    {
+        list.keep(&host_heap);
+        list.keep(&readback);
+        // SAFETY: open list, live heap and readback buffer kept until reset.
+        unsafe {
+            list.list
+                .ResolveQueryData(&host_heap, ty, first, count, &readback, 0);
+        }
+        let dst = (data as usize).wrapping_add(offset as usize);
+        let src = mapped as usize;
+        let len = total as usize;
+        // Keep a strong handle to `readback` inside the closure so the mapped
+        // pointer stays valid even if the closure runs after other deferred work.
+        list.defer_after(move || {
+            let _keep = &readback;
+            crate::host::write_mapped(dst as *mut u8, src as *const u8, len);
+            if let Some(shadow) = crate::shadow::find(dst as u64, len as u64) {
+                // SAFETY: `src` points to `len` readable bytes of the mapped readback buffer.
+                let slice = unsafe { std::slice::from_raw_parts(src as *const u8, len) };
+                shadow.write_host(dst as u64, slice);
+            }
+        });
+        return;
+    }
+    let _ = (heap, first);
     const OCCLUSION: u32 = 0;
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
-    let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
-        return;
+    let what = match kind {
+        OCCLUSION => Written::Value(1 << 20),
+        BINARY => Written::Value(1),
+        TIMESTAMP => Written::GpuTimestamp,
+        PIPELINE_STATISTICS => Written::Value(0),
+        _ => Written::Value(0),
     };
-    let (what, bytes) = match kind {
-        OCCLUSION => (Written::Value(1 << 20), 8),
-        BINARY => (Written::Value(1), 8),
-        TIMESTAMP => (Written::GpuTimestamp, 8),
-        PIPELINE_STATISTICS => (Written::Value(0), 88),
-        _ => (Written::Value(0), 16),
-    };
-    let Some(end) = offset.checked_add(u64::from(count) * bytes) else {
-        return;
-    };
-    if end > size {
-        return;
-    }
     for i in 0..u64::from(count) {
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
@@ -1056,6 +1148,11 @@ mod state {
             crate::draw::stencil_ref(list, reference);
         }
     }
+    pub(super) extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
+        if let Some(list) = host_list(this) {
+            crate::draw::depth_bounds(list, min, max);
+        }
+    }
     pub(super) extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
         with_state(this, |_, s| s.set_heaps(items(heaps, count)));
     }
@@ -1215,8 +1312,7 @@ mod state {
     ) {
         super::count_draw();
         if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+            with_state(this, |list, s| s.dispatch_mesh_indirect(list, indirect));
             return;
         }
         with_state(this, |list, s| s.dispatch_mesh(list, x));
@@ -1259,6 +1355,7 @@ mod state {
     pub(super) use super::ignored_state as index_buffer;
     pub(super) use super::ignored_state as scissors;
     pub(super) use super::ignored_state as stencil_ref;
+    pub(super) use super::ignored_state as depth_bounds;
     pub(super) use super::ignored_state as targets;
     pub(super) use super::ignored_state as topology;
     pub(super) use super::ignored_state as vertex_buffers;
@@ -1464,7 +1561,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (52, clear_rtv as *const ()),                 // 0x1a0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
-    (68, ignored_state as *const ()),             // 0x220 depth bounds
+    (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
     (71, wait_value as *const ()),                // 0x238, 32 bits
@@ -1476,13 +1573,14 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 12] = [
+const MORE_METHODS: [(usize, *const ()); 13] = [
     (53, state::clear_unordered_uint as *const ()), // 0x1a8
     (54, state::clear_unordered_float as *const ()), // 0x1b0
     (55, ignored_state as *const ()),               // 0x1b8 DiscardResource
-    (28, query_mark as *const ()),                  // 0xe0 BeginQuery
-    (29, query_mark as *const ()),                  // 0xe8 EndQuery
-    (30, resolve_queries as *const ()),             // 0xf0
+    (28, begin_query as *const ()),                 // 0xe0 BeginQuery
+    (29, end_query as *const ()),                   // 0xe8 EndQuery
+    (30, resolve_queries as *const ()),             // 0xf0 ResolveQueryData
+    (31, set_predication as *const ()),             // 0xf8 SetPredication
     (78, dispatch_x as *const ()),                  // 0x270
     (98, state::dispatch_mesh_x as *const ()),      // 0x310
     (99, driver_hint as *const ()),                 // 0x318

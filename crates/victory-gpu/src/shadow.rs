@@ -114,12 +114,16 @@ impl Shadow {
         unsafe { std::slice::from_raw_parts(self.data.add(at).cast::<u32>(), n).to_vec() }
     }
 
-    /// Writes `bytes` into the copy at title address `address`, as shaders
-    /// do (tests).
-    #[cfg(test)]
+    /// Writes `bytes` into the copy at title address `address` (query
+    /// readbacks and tests).
     pub(crate) fn write_host(&self, address: u64, bytes: &[u8]) {
+        if address < self.start {
+            return;
+        }
         let at = (address - self.start) as usize;
-        assert!(at + bytes.len() <= self.len as usize);
+        if at.checked_add(bytes.len()).is_none_or(|end| end > self.len as usize) {
+            return;
+        }
         // SAFETY: inside the mapping (checked).
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
     }
@@ -352,7 +356,10 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
-            let mut title = vec![0u8; PIECE];
+            thread_local! {
+                static TITLE_SCRATCH: std::cell::RefCell<Vec<u8>> =
+                    std::cell::RefCell::new(vec![0u8; PIECE]);
+            }
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
@@ -361,7 +368,6 @@ impl Shadow {
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
-                let title = &mut title[..n];
                 // A whole piece is compared once per submission, whichever
                 // declared ranges overlap it: then what the GPU wrote there
                 // went back.
@@ -371,23 +377,23 @@ impl Shadow {
                 }
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::CompareBytes, n as u64);
-                if host != old && crate::host::read_into((start + at) as *const u8, title) {
-                    // Title memory with the GPU's bytes put in; the copy
-                    // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                        if *h != *o && *t != *h {
-                            *t = *h;
-                            changed = true;
+                if host != old {
+                    let copied = TITLE_SCRATCH.with(|buf| {
+                        let mut buf = buf.borrow_mut();
+                        let title = &mut buf[..n];
+                        if !crate::host::read_into((start + at) as *const u8, title) {
+                            return false;
                         }
-                        *h = *t;
+                        if merge_gpu_writes(title, host, old) {
+                            let _writing = crate::watch::writing(start + at, n);
+                            crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                            written += n;
+                        }
+                        true
+                    });
+                    if copied {
+                        synced.push((start + at) / PAGE);
                     }
-                    if changed {
-                        let _writing = crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
-                    }
-                    synced.push((start + at) / PAGE);
                 }
                 at += n;
             }
@@ -778,6 +784,40 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)]) {
     }
 }
 
+/// Merges GPU-written bytes from `host` (relative to `old`) into `title`
+/// while refreshing `host` with any concurrent CPU writes in `title`.
+/// Processes 8 bytes at a time to skip untouched words quickly.
+fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> bool {
+    let mut changed = false;
+    let words = title.len() / 8;
+    let prefix = words * 8;
+    for i in 0..words {
+        let at = i * 8;
+        let h_word = u64::from_ne_bytes(host[at..at + 8].try_into().unwrap());
+        let o_word = u64::from_ne_bytes(old[at..at + 8].try_into().unwrap());
+        if h_word == o_word {
+            // Fast path: GPU wrote nothing in these 8 bytes; mirror title into host.
+            host[at..at + 8].copy_from_slice(&title[at..at + 8]);
+        } else {
+            for k in at..at + 8 {
+                if host[k] != old[k] && title[k] != host[k] {
+                    title[k] = host[k];
+                    changed = true;
+                }
+                host[k] = title[k];
+            }
+        }
+    }
+    for k in prefix..title.len() {
+        if host[k] != old[k] && title[k] != host[k] {
+            title[k] = host[k];
+            changed = true;
+        }
+        host[k] = title[k];
+    }
+    changed
+}
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
@@ -1093,6 +1133,10 @@ mod tests {
         unregister(p, p as u64);
     }
 
+        assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
+        assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
     /// "Write marks") go back by the bytes the GPU changed. The title writes
     /// a marked page after the copy took it (the guard saves its bytes from
@@ -1157,5 +1201,37 @@ mod tests {
         assert_eq!(m.take(5), Some(0));
         assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
         assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    #[test]
+    fn merge_gpu_writes_matches_bytewise_reference() {
+        let cases = [0usize, 1, 7, 8, 9, 15, 64, 131];
+        for (seed, len) in cases.into_iter().enumerate() {
+            let old: Vec<u8> = (0..len).map(|i| ((i * 7 + seed) & 0xff) as u8).collect();
+            let mut host = old.clone();
+            let mut title = old.clone();
+            for i in 0..len {
+                if i % 5 == 0 {
+                    host[i] = host[i].wrapping_add(13); // GPU wrote
+                }
+                if i % 7 == 0 {
+                    title[i] = title[i].wrapping_add(29); // CPU also wrote
+                }
+            }
+            let mut ref_title = title.clone();
+            let mut ref_host = host.clone();
+            let mut ref_changed = false;
+            for ((t, h), o) in ref_title.iter_mut().zip(ref_host.iter_mut()).zip(&old) {
+                if *h != *o && *t != *h {
+                    *t = *h;
+                    ref_changed = true;
+                }
+                *h = *t;
+            }
+            let got_changed = super::merge_gpu_writes(&mut title, &mut host, &old);
+            assert_eq!(got_changed, ref_changed, "len={len}");
+            assert_eq!(title, ref_title, "title mismatch len={len}");
+            assert_eq!(host, ref_host, "host mismatch len={len}");
+        }
     }
 }

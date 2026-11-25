@@ -1,16 +1,185 @@
-//! Console primitive types the host lacks. A rectangle list gives three
-//! corners per rectangle, the second the one between the other two, and
-//! the hardware adds the fourth at `v0 + v2 - v1` (Grand Theft Auto VI's
-//! full-screen rectangles come as top left, bottom left, bottom right); on
-//! the host each rectangle becomes two triangles, with the fourth vertex
-//! made from the other three on the CPU.
+//! Console primitive types the host lacks.
 //!
-//! shortcut: the fourth vertex is computed from vertex inputs, not from
-//! vertex shader outputs as the hardware does; that is the same for vertex
-//! shaders linear in their inputs (blits, 2D quads). Inputs in formats
-//! [`components`] does not know keep the first vertex's value, and so do
-//! components past the end of the vertex (an element that reaches into the
-//! next one, which the layout allows).
+//! 1. Rectangle lists (`RECTANGLES`): three corners per rectangle, the second
+//!    between the other two, with the fourth added at `v0 + v2 - v1`.
+//! 2. `QUADS`, `QUAD_STRIP`, `TRIANGLE_FAN`, and `LINE_LOOP`: expanded into
+//!    host triangle lists (`D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST`) or line lists
+//!    (`D3D_PRIMITIVE_TOPOLOGY_LINELIST`) via a generated 32-bit index buffer.
+//!
+//! shortcut: for rectangle lists without a geometry shader, the fourth vertex
+//! is computed from vertex inputs, not from vertex shader outputs.
+
+/// Console-only topologies expanded into host triangle/line index buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConsoleTopology {
+    TriangleFan,
+    LineLoop,
+    Quads,
+    QuadStrip,
+}
+
+impl ConsoleTopology {
+    pub(crate) fn from_console(topology: u32) -> Option<Self> {
+        match topology {
+            6 => Some(Self::TriangleFan),
+            18 => Some(Self::LineLoop),
+            19 => Some(Self::Quads),
+            20 => Some(Self::QuadStrip),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn host_topology(self) -> u32 {
+        match self {
+            Self::LineLoop => 2, // D3D_PRIMITIVE_TOPOLOGY_LINELIST
+            Self::TriangleFan | Self::Quads | Self::QuadStrip => 4, // TRIANGLELIST
+        }
+    }
+}
+
+/// Maximum number of host indices produced when expanding `input_count`
+/// console vertices/indices of `kind`.
+pub(crate) fn expanded_index_count(kind: ConsoleTopology, input_count: u32) -> u32 {
+    match kind {
+        ConsoleTopology::Quads => (input_count / 4).saturating_mul(6),
+        ConsoleTopology::QuadStrip => {
+            if input_count >= 4 {
+                ((input_count - 2) / 2).saturating_mul(6)
+            } else {
+                0
+            }
+        }
+        ConsoleTopology::TriangleFan => {
+            if input_count >= 3 {
+                (input_count - 2).saturating_mul(3)
+            } else {
+                0
+            }
+        }
+        ConsoleTopology::LineLoop => {
+            if input_count >= 2 {
+                input_count.saturating_mul(2)
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn emit_run<I: Copy + PartialEq>(
+    kind: ConsoleTopology,
+    run: &[I],
+    to_u32: impl Fn(I) -> u32,
+    out: &mut [u32],
+    written: &mut usize,
+) {
+    let mut push = |v: u32| {
+        if *written < out.len() {
+            out[*written] = v;
+            *written += 1;
+        }
+    };
+    match kind {
+        ConsoleTopology::Quads => {
+            for q in run.as_chunks::<4>().0 {
+                let (v0, v1, v2, v3) = (to_u32(q[0]), to_u32(q[1]), to_u32(q[2]), to_u32(q[3]));
+                for idx in [v0, v1, v2, v0, v2, v3] {
+                    push(idx);
+                }
+            }
+        }
+        ConsoleTopology::QuadStrip => {
+            for pair in 0..run.len().saturating_sub(2) / 2 {
+                let i = pair * 2;
+                let (v0, v1, v2, v3) = (
+                    to_u32(run[i]),
+                    to_u32(run[i + 1]),
+                    to_u32(run[i + 2]),
+                    to_u32(run[i + 3]),
+                );
+                // Keep consistent winding across the quad: (0,1,3) and (0,3,2).
+                for idx in [v0, v1, v3, v0, v3, v2] {
+                    push(idx);
+                }
+            }
+        }
+        ConsoleTopology::TriangleFan => {
+            if run.len() >= 3 {
+                let v0 = to_u32(run[0]);
+                for i in 1..run.len() - 1 {
+                    push(v0);
+                    push(to_u32(run[i]));
+                    push(to_u32(run[i + 1]));
+                }
+            }
+        }
+        ConsoleTopology::LineLoop => {
+            if run.len() >= 2 {
+                for i in 0..run.len() {
+                    push(to_u32(run[i]));
+                    push(to_u32(run[(i + 1) % run.len()]));
+                }
+            }
+        }
+    }
+}
+
+/// Expands a non-indexed draw of `count` vertices into 32-bit host indices.
+pub(crate) fn expand_non_indexed(kind: ConsoleTopology, count: u32, dst: &mut [u32]) -> usize {
+    let mut written = 0;
+    let run: Vec<u32> = (0..count).collect();
+    emit_run(kind, &run, |x| x, dst, &mut written);
+    if written < dst.len() {
+        dst[written..].fill(0);
+    }
+    written
+}
+
+/// Expands a 16-bit indexed draw, splitting runs on `cut` (if enabled) and
+/// padding any unused tail with zeroed degenerate indices.
+pub(crate) fn expand_indexed_u16(
+    kind: ConsoleTopology,
+    src: &[u16],
+    cut: Option<u16>,
+    dst: &mut [u32],
+) -> usize {
+    let mut written = 0;
+    match cut {
+        Some(cut) => {
+            for run in src.split(|&idx| idx == cut) {
+                emit_run(kind, run, u32::from, dst, &mut written);
+            }
+        }
+        None => emit_run(kind, src, u32::from, dst, &mut written),
+    }
+    if written < dst.len() {
+        dst[written..].fill(0);
+    }
+    written
+}
+
+/// Expands a 32-bit indexed draw, splitting runs on `cut` (if enabled) and
+/// padding any unused tail with zeroed degenerate indices.
+pub(crate) fn expand_indexed_u32(
+    kind: ConsoleTopology,
+    src: &[u32],
+    cut: Option<u32>,
+    dst: &mut [u32],
+) -> usize {
+    let mut written = 0;
+    match cut {
+        Some(cut) => {
+            for run in src.split(|&idx| idx == cut) {
+                emit_run(kind, run, |x| x, dst, &mut written);
+            }
+        }
+        None => emit_run(kind, src, |x| x, dst, &mut written),
+    }
+    if written < dst.len() {
+        dst[written..].fill(0);
+    }
+    written
+}
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
@@ -356,5 +525,49 @@ mod tests {
             &dst[11 * 16..12 * 16],
             &v([14.0, 20.0, 1.0], [0.75, 0.5])[..]
         );
+    }
+
+    #[test]
+    fn non_indexed_console_topologies_expand_correctly() {
+        assert_eq!(expanded_index_count(ConsoleTopology::Quads, 8), 12);
+        assert_eq!(expanded_index_count(ConsoleTopology::Quads, 3), 0);
+        let mut out = vec![0u32; 12];
+        assert_eq!(expand_non_indexed(ConsoleTopology::Quads, 8, &mut out), 12);
+        assert_eq!(out, [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+
+        assert_eq!(expanded_index_count(ConsoleTopology::QuadStrip, 6), 12);
+        let mut out = vec![0u32; 12];
+        assert_eq!(expand_non_indexed(ConsoleTopology::QuadStrip, 6, &mut out), 12);
+        assert_eq!(out, [0, 1, 3, 0, 3, 2, 2, 3, 5, 2, 5, 4]);
+
+        assert_eq!(expanded_index_count(ConsoleTopology::TriangleFan, 5), 9);
+        let mut out = vec![0u32; 9];
+        assert_eq!(expand_non_indexed(ConsoleTopology::TriangleFan, 5, &mut out), 9);
+        assert_eq!(out, [0, 1, 2, 0, 2, 3, 0, 3, 4]);
+
+        assert_eq!(expanded_index_count(ConsoleTopology::LineLoop, 4), 8);
+        let mut out = vec![0u32; 8];
+        assert_eq!(expand_non_indexed(ConsoleTopology::LineLoop, 4, &mut out), 8);
+        assert_eq!(out, [0, 1, 1, 2, 2, 3, 3, 0]);
+    }
+
+    #[test]
+    fn indexed_topologies_respect_primitive_restart_cuts() {
+        let src16 = [10u16, 11, 12, 13, 0xFFFF, 20, 21, 22];
+        let max = expanded_index_count(ConsoleTopology::TriangleFan, src16.len() as u32) as usize;
+        let mut out = vec![99u32; max];
+        let written = expand_indexed_u16(ConsoleTopology::TriangleFan, &src16, Some(0xFFFF), &mut out);
+        assert_eq!(written, 9);
+        // First fan (10,11,12,13) -> 2 triangles; second fan (20,21,22) -> 1 triangle; tail zero-padded.
+        assert_eq!(&out[..9], &[10, 11, 12, 10, 12, 13, 20, 21, 22]);
+        assert!(out[9..].iter().all(|&x| x == 0));
+
+        let src32 = [1u32, 2, 3, u32::MAX, 4, 5, 6, 7];
+        let max32 = expanded_index_count(ConsoleTopology::LineLoop, src32.len() as u32) as usize;
+        let mut out32 = vec![99u32; max32];
+        let written32 = expand_indexed_u32(ConsoleTopology::LineLoop, &src32, Some(u32::MAX), &mut out32);
+        assert_eq!(written32, 14);
+        assert_eq!(&out32[..14], &[1, 2, 2, 3, 3, 1, 4, 5, 5, 6, 6, 7, 7, 4]);
+        assert!(out32[14..].iter().all(|&x| x == 0));
     }
 }

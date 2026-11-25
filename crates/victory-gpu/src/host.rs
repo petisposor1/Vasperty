@@ -457,6 +457,22 @@ mod tests {
         node.pCommandListDebugNameA = longer.as_ptr().cast();
         assert!(!list.is_node(&node), "a number that only starts with ours is no match");
     }
+
+    #[test]
+    fn hdr_color_spaces_match_swap_chain_formats() {
+        assert_eq!(
+            color_space_for_format(DXGI_FORMAT_R10G10B10A2_UNORM),
+            DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+        );
+        assert_eq!(
+            color_space_for_format(DXGI_FORMAT_R16G16B16A16_FLOAT),
+            DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+        );
+        assert_eq!(
+            color_space_for_format(DXGI_FORMAT_R8G8B8A8_UNORM),
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+        );
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -717,6 +733,28 @@ impl Host {
         })
     }
 
+    /// Whether the host GPU supports hardware depth bounds testing
+    /// (`OMSetDepthBounds` and `D3D12_DEPTH_STENCIL_DESC1`); logged once.
+    pub(crate) fn depth_bounds_supported(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
+            // SAFETY: writes its own structure of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS2,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let supported = ok && options.DepthBoundsTestSupported.as_bool();
+            tracing::info!(supported, "host depth bounds test support");
+            supported
+        })
+    }
+
     /// Whether the host runs 64-bit atomics on typed resources in the
     /// descriptor heap (translated 64-bit image atomics); logged once.
     pub(crate) fn heap_atomics64(&self) -> bool {
@@ -956,8 +994,9 @@ impl Host {
         let copying = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
+        type ShadowWrite = (std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool);
         // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool)> = Vec::new();
+        let mut back: Vec<ShadowWrite> = Vec::new();
         let mut index: std::collections::HashMap<(usize, usize, usize), usize> = std::collections::HashMap::new();
         for list in runs {
             let deferred = list.deferred();
@@ -986,14 +1025,64 @@ impl Host {
             .map(|(s, a, n, _)| (s.clone(), *a, *n))
             .collect();
         crate::shadow::copy_back_marks(&withheld);
-        for (shadow, address, len, goes_back) in &back {
-            let (address, len) = (*address, *len);
-            if *goes_back {
-                let written = shadow.copy_back(address, len);
-                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        let total_back: usize = back.iter().map(|(_, _, len, _)| *len).sum();
+        if back.len() >= 2 && total_back >= (512 << 10) {
+            let mut groups: std::collections::HashMap<usize, Vec<ShadowWrite>> =
+                std::collections::HashMap::new();
+            for entry in back {
+                let key = std::sync::Arc::as_ptr(&entry.0) as usize;
+                groups.entry(key).or_default().push(entry);
+            }
+            if groups.len() >= 2 {
+                let written_total = std::sync::atomic::AtomicUsize::new(0);
+                let withheld_total = std::sync::atomic::AtomicU64::new(0);
+                std::thread::scope(|s| {
+                    for (_, group) in groups {
+                        let wt = &written_total;
+                        let wh = &withheld_total;
+                        s.spawn(move || {
+                            for (shadow, address, len, goes_back) in group {
+                                if goes_back {
+                                    wt.fetch_add(shadow.copy_back(address, len), Ordering::Relaxed);
+                                } else {
+                                    shadow.keep_writes(address, len);
+                                    wh.fetch_add(len as u64, Ordering::Relaxed);
+                                }
+                            }
+                        });
+                    }
+                });
+                COPY_BACK[1].fetch_add(
+                    written_total.into_inner() as u64,
+                    Ordering::Relaxed,
+                );
+                let withheld = withheld_total.into_inner();
+                if withheld > 0 {
+                    crate::memory::note_withheld(withheld);
+                }
             } else {
-                shadow.keep_writes(address, len);
-                crate::memory::note_withheld(len as u64);
+                for (_, group) in groups {
+                    for (shadow, address, len, goes_back) in group {
+                        if goes_back {
+                            let written = shadow.copy_back(address, len);
+                            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                        } else {
+                            shadow.keep_writes(address, len);
+                            crate::memory::note_withheld(len as u64);
+                        }
+                    }
+                }
+            }
+        } else {
+            for (shadow, address, len, goes_back) in &back {
+                let (address, len) = (*address, *len);
+                if *goes_back {
+                    let written = shadow.copy_back(address, len);
+                    COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                } else {
+                    shadow.keep_writes(address, len);
+                    crate::memory::note_withheld(len as u64);
+                }
             }
         }
         for list in runs {
@@ -2256,6 +2345,53 @@ impl Host {
             }
         }
     }
+
+    /// A buffer in the readback heap, mapped for CPU reading once the GPU
+    /// has written to it (e.g. `ResolveQueryData`).
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<(ID3D12Resource, *const u8)> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a readback buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no readback buffer");
+                None
+            }
+        }
+    }
 }
 
 /// The swap chain formats a presented texture can be copied into: its own
@@ -2300,11 +2436,37 @@ impl SwapChainRetry {
     }
 }
 
+/// Selects the DXGI swap-chain color space matching a swap-chain format:
+/// HDR10 (PQ / Rec.2020) for 10-bit surfaces, scRGB linear HDR for FP16
+/// surfaces, and standard sRGB for 8-bit surfaces.
+fn color_space_for_format(format: DXGI_FORMAT) -> DXGI_COLOR_SPACE_TYPE {
+    match format {
+        DXGI_FORMAT_R10G10B10A2_UNORM => DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020,
+        DXGI_FORMAT_R16G16B16A16_FLOAT => DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709,
+        _ => DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709,
+    }
+}
+
+fn hdr_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VICTORY_HDR")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+fn vsync_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| crate::switch::on("VICTORY_VSYNC"))
+}
+
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
+    allow_tearing: bool,
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
@@ -2534,7 +2696,14 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let (sync_interval, present_flags) = if vsync_enabled() {
+                (1, DXGI_PRESENT(0))
+            } else if p.allow_tearing {
+                (0, DXGI_PRESENT_ALLOW_TEARING)
+            } else {
+                (0, DXGI_PRESENT(0))
+            };
+            let _ = p.swap_chain.Present(sync_interval, present_flags);
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -2557,6 +2726,16 @@ impl Host {
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))
                 .map_err(|e| ("DXGI factory", e))?;
+            let allow_tearing = factory.cast::<IDXGIFactory5>().ok().is_some_and(|f5| {
+                let mut supported = 0u32;
+                f5.CheckFeatureSupport(
+                    DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                    (&raw mut supported).cast(),
+                    size_of::<u32>() as u32,
+                )
+                .is_ok()
+                    && supported != 0
+            });
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -2567,21 +2746,45 @@ impl Host {
                 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
+                Scaling: DXGI_SCALING_STRETCH,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: if allow_tearing {
+                    DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING.0 as u32
+                } else {
+                    0
+                },
                 ..Default::default()
             };
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)
                 .and_then(|chain| chain.cast::<IDXGISwapChain3>())
                 .map_err(|e| ("swap chain", e))?;
+            let color_space = color_space_for_format(format);
+            let mut hdr_active = false;
+            if hdr_enabled()
+                && color_space != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+                && let Ok(support) = swap_chain.CheckColorSpaceSupport(color_space)
+                && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT.0 as u32) != 0
+                && swap_chain.SetColorSpace1(color_space).is_ok()
+            {
+                hdr_active = true;
+            }
             let copy = self.new_list().map_err(|e| ("copy list", e))?;
             copy.close();
-            tracing::info!(width, height, format = format.0, "presenting to a window");
+            tracing::info!(
+                width,
+                height,
+                format = format.0,
+                allow_tearing,
+                hdr_active,
+                "presenting to a window"
+            );
             Ok(Presenter {
                 swap_chain,
                 width,
                 height,
                 format,
+                allow_tearing,
                 copy,
                 hwnd,
                 meter: Meter::new(),

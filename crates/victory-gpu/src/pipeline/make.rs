@@ -161,8 +161,36 @@ fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
-const BUDGET: Duration = Duration::from_millis(500);
+/// Default waiting allowed per title frame (`VICTORY_PIPELINE_BUDGET_MS` overrides).
+const DEFAULT_BUDGET_MS: u64 = 500;
+
+fn parse_budget_ms(value: Option<&str>) -> Duration {
+    let ms = value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(DEFAULT_BUDGET_MS);
+    Duration::from_millis(ms.min(10_000))
+}
+
+fn frame_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| parse_budget_ms(std::env::var("VICTORY_PIPELINE_BUDGET_MS").ok().as_deref()))
+}
+
+fn parse_worker_count(parallelism: usize, override_val: Option<&str>) -> usize {
+    if let Some(n) = override_val
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n.clamp(1, 32);
+    }
+    ((parallelism * 3) / 4).clamp(2, 16)
+}
+
+fn worker_count() -> usize {
+    let n = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    parse_worker_count(n, std::env::var("VICTORY_PIPELINE_WORKERS").ok().as_deref())
+}
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -224,7 +252,7 @@ fn wait(p: &Pending, frame: u64) {
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
         WAITED_US.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let left = frame_budget().saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -243,12 +271,12 @@ fn wait(p: &Pending, frame: u64) {
 static QUEUES: (Mutex<[VecDeque<Arc<Pending>>; 2]>, Condvar) =
     (Mutex::new([VecDeque::new(), VecDeque::new()]), Condvar::new());
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
+/// Hands `p` to the workers (three-quarters of logical processors, 2 to 16,
+/// or `VICTORY_PIPELINE_WORKERS`), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     let workers = *WORKERS.get_or_init(|| {
-        let n = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let n = worker_count();
         (0..n)
             .filter(|i| {
                 let spawned = std::thread::Builder::new()
@@ -368,5 +396,20 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn worker_count_and_budget_respect_overrides_and_bounds() {
+        assert_eq!(parse_worker_count(16, None), 12);
+        assert_eq!(parse_worker_count(2, None), 2);
+        assert_eq!(parse_worker_count(64, None), 16);
+        assert_eq!(parse_worker_count(16, Some("6")), 6);
+        assert_eq!(parse_worker_count(16, Some("999")), 32);
+        assert_eq!(parse_worker_count(16, Some("0")), 12);
+
+        assert_eq!(parse_budget_ms(None), Duration::from_millis(500));
+        assert_eq!(parse_budget_ms(Some("1200")), Duration::from_millis(1200));
+        assert_eq!(parse_budget_ms(Some("0")), Duration::from_millis(500));
+        assert_eq!(parse_budget_ms(Some("999999")), Duration::from_millis(10_000));
     }
 }

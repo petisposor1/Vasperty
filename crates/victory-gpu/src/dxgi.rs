@@ -216,6 +216,7 @@ static FACTORY_FUNCTIONS: Table<32> = {
 /// A display mode as the console lists it: size, refresh rate (numerator,
 /// denominator), format, scanline order, scaling, flags.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Mode {
     width: u32,
     height: u32,
@@ -227,13 +228,51 @@ struct Mode {
 }
 const _: () = assert!(size_of::<Mode>() == 32);
 
-/// The console's mode list: one 4K mode at 60 Hz (Grand Theft Auto VI looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
-/// shortcut: fixed mode, not the host display's; report the host's rates if
-/// a title paces by them.
+/// The console's mode list: reports 4K at 60 Hz and 120 Hz (plus the host
+/// display's native mode if it differs), allowing titles such as Grand Theft
+/// Auto VI to select 60 Hz or 120 Hz frame intervals cleanly.
+fn display_modes(format: u32) -> Vec<Mode> {
+    let make = |width: u32, height: u32, hz: u32| Mode {
+        width,
+        height,
+        refresh: [hz, 1],
+        format,
+        scanlines: 1, // progressive
+        scaling: 0,
+        flags: 0,
+    };
+    let mut list = vec![make(3840, 2160, 60), make(3840, 2160, 120)];
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Gdi::{
+            DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW,
+        };
+        let mut dev = DEVMODEW {
+            dmSize: size_of::<DEVMODEW>() as u16,
+            ..Default::default()
+        };
+        // SAFETY: `dev` is zero-initialized with `dmSize` set.
+        if unsafe { EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, &mut dev) }.as_bool()
+            && dev.dmPelsWidth > 0
+            && dev.dmPelsHeight > 0
+            && dev.dmDisplayFrequency >= 30
+        {
+            let host_mode = make(dev.dmPelsWidth, dev.dmPelsHeight, dev.dmDisplayFrequency);
+            if !list.iter().any(|m| {
+                m.width == host_mode.width
+                    && m.height == host_mode.height
+                    && m.refresh == host_mode.refresh
+            }) {
+                list.push(host_mode);
+            }
+        }
+    }
+    list
+}
+
 extern "system" fn modes(
     _: This,
-    _format: u32,
+    format: u32,
     _flags: u32,
     count: *mut u32,
     out: *mut Mode,
@@ -242,25 +281,19 @@ extern "system" fn modes(
     let Some(count) = (unsafe { count.as_mut() }) else {
         return E_INVALIDARG;
     };
+    let list = display_modes(format);
+    let total = list.len() as u32;
     if out.is_null() {
-        *count = 1;
+        *count = total;
         return S_OK;
     }
-    if *count < 1 {
+    if *count < total {
+        *count = total;
         return MORE_DATA;
     }
-    *count = 1;
-    let mode = Mode {
-        width: 3840,
-        height: 2160,
-        refresh: [60, 1],
-        format: 0,
-        scanlines: 1, // progressive
-        scaling: 0,
-        flags: 0,
-    };
-    // SAFETY: checked non-null; room for `count` >= 1 modes.
-    unsafe { out.write(mode) };
+    *count = total;
+    // SAFETY: checked non-null; caller provided room for at least `total` modes.
+    unsafe { std::ptr::copy_nonoverlapping(list.as_ptr(), out, list.len()) };
     S_OK
 }
 
@@ -337,5 +370,42 @@ mod tests {
             assert_eq!(enumerate(object, 1, &mut out), NOT_FOUND, "{method}");
             assert!(out.is_null(), "{method} left a stale output pointer");
         }
+    }
+
+    #[test]
+    fn output_modes_enumerate_60hz_and_120hz() {
+        type GetModes = extern "system" fn(This, u32, u32, *mut u32, *mut Mode) -> HRESULT;
+        let get_modes = slot::<GetModes>(&OUTPUT_OBJECT, 0xa8);
+        let mut count = 0u32;
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, 28, 0, &mut count, std::ptr::null_mut()),
+            S_OK
+        );
+        assert!(count >= 2, "expected at least 60 Hz and 120 Hz modes, got {count}");
+        let mut small = 1u32;
+        let mut one = std::mem::MaybeUninit::<Mode>::uninit();
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, 28, 0, &mut small, one.as_mut_ptr()),
+            MORE_DATA
+        );
+        assert_eq!(small, count);
+        let mut list = vec![
+            Mode {
+                width: 0,
+                height: 0,
+                refresh: [0, 0],
+                format: 0,
+                scanlines: 0,
+                scaling: 0,
+                flags: 0,
+            };
+            count as usize
+        ];
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, 28, 0, &mut count, list.as_mut_ptr()),
+            S_OK
+        );
+        assert!(list.iter().any(|m| m.width == 3840 && m.height == 2160 && m.refresh == [60, 1]));
+        assert!(list.iter().any(|m| m.width == 3840 && m.height == 2160 && m.refresh == [120, 1]));
     }
 }

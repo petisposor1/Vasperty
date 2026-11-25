@@ -68,15 +68,98 @@ pub(crate) extern "system" fn set_interval(
     S_OK
 }
 
-/// Device method: events are scheduled at every tick.
+/// Per event kind (origin, vblank, flip): scheduled offset in microseconds.
+static OFFSETS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Device method: sets a per-event-kind phase offset in microseconds.
 pub(crate) extern "system" fn schedule(
     _: This,
-    _kind: u32,
-    _offset: u32,
+    kind: u32,
+    offset: u32,
     _list: *const u8,
     _flags: u32,
 ) -> HRESULT {
+    OFFSETS[(kind as usize).min(OFFSETS.len() - 1)].store(u64::from(offset), Ordering::Relaxed);
     S_OK
+}
+
+/// Sleeps until `wait` has elapsed using Windows' high-resolution waitable
+/// timer for the bulk of the interval and a brief spin-yield tail for
+/// sub-millisecond frame pacing accuracy.
+fn sleep_precise(wait: Duration) {
+    if wait.is_zero() {
+        return;
+    }
+    let deadline = Instant::now() + wait;
+    #[cfg(windows)]
+    if wait > Duration::from_micros(600) {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::Threading::{
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, INFINITE,
+            SetWaitableTimer, TIMER_ALL_ACCESS, WaitForSingleObject,
+        };
+        struct Timer(HANDLE);
+        impl Drop for Timer {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    // SAFETY: valid timer handle owned by this thread-local.
+                    unsafe { CloseHandle(self.0) };
+                }
+            }
+        }
+        thread_local! {
+            static TIMER: Timer = {
+                // SAFETY: creates a thread-local waitable timer (high-res if supported).
+                let h = unsafe {
+                    let hi = CreateWaitableTimerExW(
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                        TIMER_ALL_ACCESS,
+                    );
+                    if !hi.is_null() {
+                        hi
+                    } else {
+                        CreateWaitableTimerExW(
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            0,
+                            TIMER_ALL_ACCESS,
+                        )
+                    }
+                };
+                Timer(h)
+            };
+        }
+        let coarse_ns = wait.as_nanos().saturating_sub(500_000);
+        let due_100ns = -((coarse_ns / 100).min(i64::MAX as u128) as i64);
+        if due_100ns < 0 {
+            let waited = TIMER.with(|t| {
+                if t.0.is_null() {
+                    return false;
+                }
+                // SAFETY: `t.0` is a live waitable timer handle, `due_100ns` is valid.
+                unsafe {
+                    if SetWaitableTimer(t.0, &due_100ns, 0, None, std::ptr::null(), 0) != 0 {
+                        WaitForSingleObject(t.0, INFINITE);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            });
+            if !waited {
+                std::thread::sleep(Duration::from_nanos(coarse_ns as u64));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    if wait > Duration::from_millis(2) {
+        std::thread::sleep(wait - Duration::from_millis(1));
+    }
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
+    }
 }
 
 /// Frames begun so far (frame waits that ended).
@@ -106,9 +189,11 @@ fn next_tick(kind: u32, limit: Duration) -> (u64, Duration) {
     });
     let elapsed = c.start.elapsed().as_nanos();
     let interval = c.interval.as_nanos().max(1);
-    let tick =
-        (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
-    let at = u128::from(tick - c.first) * interval;
+    let offset_ns = u128::from(OFFSETS[(kind as usize).min(OFFSETS.len() - 1)].load(Ordering::Relaxed)) * 1_000;
+    let phase = offset_ns % interval;
+    let tick = (c.first + (elapsed.saturating_sub(phase) / interval + 1) as u64)
+        .max(last(kind).load(Ordering::Relaxed) + 1);
+    let at = u128::from(tick - c.first) * interval + phase;
     let wait = Duration::from_nanos(at.saturating_sub(elapsed) as u64);
     if wait <= limit {
         last(kind).fetch_max(tick, Ordering::Relaxed);
@@ -134,10 +219,10 @@ pub(crate) extern "system" fn wait(
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let (tick, wait) = next_tick(kind, limit);
     let hr = if wait > limit {
-        std::thread::sleep(limit);
+        sleep_precise(limit);
         TIMEOUT
     } else {
-        std::thread::sleep(wait);
+        sleep_precise(wait);
         S_OK
     };
     // A frame begun on a time-out takes no tick: its flip still does.
@@ -242,5 +327,25 @@ mod tests {
         assert!(second > first, "{second} after {first}");
         next_tick(VBLANK, Duration::ZERO);
         assert_eq!(last(VBLANK).load(Ordering::Relaxed), second);
+    }
+
+    #[test]
+    fn high_res_sleep_and_schedule_offsets_behave_cleanly() {
+        let start = Instant::now();
+        sleep_precise(Duration::from_millis(3));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(2) && elapsed < Duration::from_millis(25),
+            "precise sleep drifted: {elapsed:?}"
+        );
+        // Zero duration returns immediately.
+        sleep_precise(Duration::ZERO);
+        // Schedule offset shifts target tick phase without breaking monotonicity.
+        assert_eq!(set_interval(std::ptr::null(), std::ptr::null(), 10_000, 1, 0), S_OK);
+        assert_eq!(schedule(std::ptr::null(), 1, 2_500, std::ptr::null(), 0), S_OK);
+        let (t1, _) = next_tick(1, Duration::from_secs(1));
+        let (t2, _) = next_tick(1, Duration::from_secs(1));
+        assert!(t2 > t1);
+        assert_eq!(schedule(std::ptr::null(), 1, 0, std::ptr::null(), 0), S_OK);
     }
 }
