@@ -5,9 +5,12 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use std::collections::HashSet;
 use victory_formats::bcpack::Tables;
 use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
 use victory_formats::xma::{Decoder as XmaDecoder, FRAME_SAMPLES as XMA_FRAME_SAMPLES};
+use victory_game::cityhash::city64;
+use victory_game::pipelines::{RASTER, resolve_raster_hashes};
 use victory_shader::native::{ComputeIo, StageIo};
 use victory_shader::{Container, HwStage, NativeProgram, emit, io, ir, resource, structure};
 
@@ -31,6 +34,9 @@ pub fn run(iters: usize) -> Result<()> {
 
     // 5. GFX10 -> IR -> Structure -> Resource -> I/O -> DXIL SM 6.6 pipeline
     bench_shader_translate(iters)?;
+
+    // 6. Parallel CityHash64 pipeline raster state-space resolution
+    bench_pipeline_state_resolve(iters)?;
 
     Ok(())
 }
@@ -235,6 +241,31 @@ fn bench_shader_translate(iters: usize) -> Result<()> {
     println!(
         "{:<28}: {per_us:8.1} us/shader ({shaders_sec:8.1} shaders/s, {dxil_bytes} B DXIL)",
         "Shader GFX10->DXIL (wave)"
+    );
+    Ok(())
+}
+
+fn bench_pipeline_state_resolve(iters: usize) -> Result<()> {
+    let mut r = [0u8; RASTER];
+    r[..3].copy_from_slice(&[3, 2, 1]);
+    r[3] = (-2i8) as u8;
+    r[8..12].copy_from_slice(&1.0f32.to_le_bytes());
+    r[12..].copy_from_slice(&[1, 0, 1, 0]);
+    let want = HashSet::from([city64(&r)]);
+    let _ = resolve_raster_hashes(&want);
+
+    let rounds = iters.saturating_mul(2);
+    let started = Instant::now();
+    for _ in 0..rounds {
+        let resolved = resolve_raster_hashes(black_box(&want));
+        black_box(resolved);
+    }
+    let elapsed = started.elapsed();
+    let per_ms = elapsed.as_secs_f64() * 1e3 / rounds as f64;
+    let ops_sec = rounds as f64 / elapsed.as_secs_f64().max(1e-9);
+    println!(
+        "{:<28}: {per_ms:8.2} ms/batch  ({ops_sec:8.1} batches/s)",
+        "Pipeline state resolve"
     );
     Ok(())
 }

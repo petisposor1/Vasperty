@@ -31,8 +31,11 @@ otherwise. See [docs/architecture.md](docs/architecture.md).
 | Parallel Texture Detiling | Multi-threaded row-strip and 3D-slice texture detiling (`>= 256 KiB` subresources) with 64/128-byte run unrolling in `victory-formats` |
 | XMA2 & BCPack Format Acceleration | Precomputed bit-exact `quant_scale` LUT and contiguous intra-packet `Cursor::bits` extraction in XMA2 audio, plus thread-local BCPack scratch, `SPREAD4` nibble interleaving, and zero-branch rANS stepping |
 | Zero-Allocation DirectStorage | Thread-local reusable worker scratch buffers (`SCRATCH_SRC`, `SCRATCH_PACKED`, `SCRATCH_DEST`) capped at 16 MiB plus tunable `VICTORY_DSTORAGE_WORKERS` |
-| Shader ISA & Wave Products | Adds GFX10 → DXIL SM 6.6 `WaveActiveProduct` / `WavePrefixProduct` (`v_mul_lo_u32`, `v_mul_f32`), fixes inclusive float prefix signedness, and expands ISA coverage with `s_absdiff_i32`, `s_sext_i32_i8/i16`, `s_bcnt0_i32_b32/b64`, `s_ff0_i32_b32/b64`, `s_cmp_*_i64`, `v_ffbh_u32/i32`, `v_lerp_u8`, and `v_cvt_pk_u16/i16` |
-| Hardware Doctor & Benchmarks | Adds `victory doctor [--prune-cache]` (live D3D12 SM/Mesh/Atomics/Wave/Tier probing, DXIL validator check, env audit, pipeline cache stats/pruning) and `victory bench` (zero-asset detile, BCPack, XMA2 & DXIL throughput suite) |
+| Shader ISA & Wave Products | Adds GFX10 → DXIL SM 6.6 `WaveActiveProduct` / `WavePrefixProduct` (`v_mul_lo_u32`, `v_mul_f32`), fixes inclusive float prefix signedness, and expands ISA coverage with `s_absdiff_i32`, `s_sext_i32_i8/i16`, `s_bcnt0_i32_b32/b64`, `s_ff0_i32_b32/b64`, `s_cmp_*_i64`, `s_pack_{ll,lh,hh}_b32_b16`, `v_ffbh_u32/i32`, `v_lerp_u8`, `v_cvt_pk_u16/i16`, `v_add_nc_i32/v_sub_nc_i32`, `v_dot4_u32_u8`, `v_dot2_i32_i16/u32_u16`, and `v_dot2_f32_f16` |
+| Blocking D3D12 Fence Waits | Implements blocking `ID3D12Fence::SetEventOnCompletion(value, NULL)` synchronization via `Condvar` wakeup on fence signal instead of failing with `E_NOTIMPL` |
+| Zero-Concat Streaming Cache | Adds `CacheKey::from_parts` and `Cache::read_or_convert_parts` in `victory-pipeline`, removing heap input concatenation and redundant miss-path disk reads in `victory-gpu` shader caching |
+| Parallel Shaderpack Enumeration | Parallelizes CityHash64 rasterizer and depth-stencil state-space resolution (`resolve_raster_hashes`, `resolve_depth_hashes`) across CPU cores with shared early-exit termination |
+| Hardware Doctor & Benchmarks | Adds `victory doctor [--prune-cache]` (live D3D12 SM/Mesh/Atomics/Wave/Tier probing, DXIL validator check, env audit, pipeline cache stats/pruning) and `victory bench` (zero-asset detile, BCPack, XMA2, DXIL & state-resolve throughput suite) |
 
 ## Status (2026-11-24)
 

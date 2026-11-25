@@ -17,7 +17,7 @@
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
@@ -92,14 +92,11 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     }
 }
 
-/// The cache entry's converter: the build and the container in, the
-/// encoded translation (or refusal) out. `ran` tells a miss from a hit.
-struct Translate<F> {
-    translate: F,
-    ran: AtomicBool,
-}
+/// Key identity for shader cache entries; conversion is executed directly via
+/// [`Cache::read_or_convert_parts`] without concatenating `build` and `container`.
+struct ShaderCacheMeta;
 
-impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Translate<F> {
+impl Converter for ShaderCacheMeta {
     fn id(&self) -> &'static str {
         "shader.dxil"
     }
@@ -107,9 +104,8 @@ impl<F: Fn(&[u8]) -> Result<HostShader, String> + Send + Sync> Converter for Tra
         // The build fingerprint in the input does the versioning.
         1
     }
-    fn convert(&self, input: &[u8]) -> anyhow::Result<Vec<u8>> {
-        self.ran.store(true, Ordering::Relaxed);
-        Ok(encode(&(self.translate)(&input[32..])))
+    fn convert(&self, _input: &[u8]) -> anyhow::Result<Vec<u8>> {
+        anyhow::bail!("shader cache uses streaming read_or_convert_parts")
     }
 }
 
@@ -119,21 +115,18 @@ fn cached(
     container: &[u8],
     translate: impl Fn(&[u8]) -> Result<HostShader, String> + Send + Sync,
 ) -> (Result<HostShader, String>, bool) {
-    let input = [&build[..], container].concat();
-    let converter = Translate {
-        translate,
-        ran: AtomicBool::new(false),
-    };
+    let parts = [&build[..], container];
     for _ in 0..2 {
-        let path = match cache.get_or_convert(&converter, &input) {
-            Ok(path) => path,
+        let (bytes, path, hit) = match cache.read_or_convert_parts(&ShaderCacheMeta, &parts, || {
+            Ok(encode(&translate(container)))
+        }) {
+            Ok(entry) => entry,
             Err(e) => {
                 tracing::warn!(error = format!("{e:#}"), "shader cache entry not written");
                 break;
             }
         };
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
-            let hit = !converter.ran.load(Ordering::Relaxed);
+        if let Some(shader) = decode(&bytes) {
             let (counter, what) = if hit {
                 (&HITS, "from the cache")
             } else {
@@ -147,7 +140,7 @@ fn cached(
         let _ = std::fs::remove_file(&path);
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    ((converter.translate)(container), false)
+    (translate(container), false)
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";

@@ -3720,6 +3720,26 @@ impl<'a> Lower<'a> {
                 let d2 = self.s.m.bin(c, Bin::Sub, b, a);
                 (self.s.m.select(c, gt, d1, d2), None)
             }
+            "s_pack_ll_b32_b16" | "s_pack_lh_b32_b16" | "s_pack_hh_b32_b16" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let (k16, low_mask, hi_mask) = (
+                    self.s.m.i32(16),
+                    self.s.m.i32(0xFFFF),
+                    self.s.m.i32(0xFFFF_0000),
+                );
+                let lo = if name == "s_pack_hh_b32_b16" {
+                    self.s.m.bin(c, Bin::LShr, a, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, a, low_mask)
+                };
+                let hi = if name == "s_pack_ll_b32_b16" {
+                    let masked = self.s.m.bin(c, Bin::And, b, low_mask);
+                    self.s.m.bin(c, Bin::Shl, masked, k16)
+                } else {
+                    self.s.m.bin(c, Bin::And, b, hi_mask)
+                };
+                (self.s.m.bin(c, Bin::Or, lo, hi), None)
+            }
             "s_bfe_u32" | "s_bfe_i32" => {
                 // src1: offset in bits 0-4, width in bits 16-22.
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -3824,6 +3844,9 @@ impl<'a> Lower<'a> {
                         | "s_sext_i32_i8"
                         | "s_sext_i32_i16"
                         | "s_ff0_i32_b32"
+                        | "s_pack_ll_b32_b16"
+                        | "s_pack_lh_b32_b16"
+                        | "s_pack_hh_b32_b16"
                 ) =>
                 {
                     return Ok(());
@@ -5652,7 +5675,7 @@ impl<'a> Lower<'a> {
                 );
                 int(self, r)
             }
-            "v_dot4_i32_i8" => {
+            "v_dot4_i32_i8" | "v_dot4_u32_u8" => {
                 // VOP3P: op_sel picks the half each multiplicand's low half
                 // reads, op_sel_hi its high half's; the accumulator is read
                 // whole (as AMD's compilers fold constants into it).
@@ -5678,15 +5701,72 @@ impl<'a> Lower<'a> {
                 }
                 let acc = s(self, 2)?;
                 let i32_ty = self.s.t.i32;
+                let op = if name == "v_dot4_i32_i8" { 163 } else { 164 };
                 let r = self.s.op(
                     c,
                     "dot4AddPacked.i32",
                     Attr::ReadNone,
                     i32_ty,
-                    163,
+                    op,
                     &[acc, xs[0], xs[1]],
                 );
                 int(self, r)
+            }
+            "v_dot2_i32_i16" | "v_dot2_u32_u16" => {
+                if v.clamp || v.neg_hi != 0 {
+                    return Err("a saturating or negated dot product");
+                }
+                let signed = name == "v_dot2_i32_i16";
+                let k16 = self.s.m.i32(16);
+                let mut products = Vec::with_capacity(2);
+                for high in [false, true] {
+                    let mut a = self.packed_src(inst, 0, high, false)?;
+                    let mut b = self.packed_src(inst, 1, high, false)?;
+                    if signed {
+                        let a_sh = self.s.m.bin(c, Bin::Shl, a, k16);
+                        a = self.s.m.bin(c, Bin::AShr, a_sh, k16);
+                        let b_sh = self.s.m.bin(c, Bin::Shl, b, k16);
+                        b = self.s.m.bin(c, Bin::AShr, b_sh, k16);
+                    }
+                    products.push(self.s.m.bin(c, Bin::Mul, a, b));
+                }
+                let acc = s(self, 2)?;
+                let sum01 = self.s.m.bin(c, Bin::Add, products[0], products[1]);
+                let r = self.s.m.bin(c, Bin::Add, sum01, acc);
+                int(self, r)
+            }
+            "v_dot2_f32_f16" => {
+                if v.omod != 0 {
+                    return Err("modifiers on a 16-bit float dot product");
+                }
+                let f32t = self.s.t.f32;
+                let mut pairs = Vec::with_capacity(2);
+                for high in [false, true] {
+                    let neg = if high { v.neg_hi } else { v.neg };
+                    let ah = self.packed_src(inst, 0, high, true)?;
+                    let bh = self.packed_src(inst, 1, high, true)?;
+                    let mut af = self
+                        .s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[ah]);
+                    let mut bf = self
+                        .s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[bh]);
+                    let neg_zero = self.s.m.f32(0x8000_0000);
+                    if neg & 1 != 0 {
+                        af = self.s.m.bin(c, Bin::Sub, neg_zero, af);
+                    }
+                    if neg & 2 != 0 {
+                        bf = self.s.m.bin(c, Bin::Sub, neg_zero, bf);
+                    }
+                    pairs.push((af, bf));
+                }
+                let acc = f(self, 2)?;
+                let t = self.fmad(pairs[0].0, pairs[0].1, acc);
+                let mut r = self.fmad(pairs[1].0, pairs[1].1, t);
+                if v.clamp {
+                    r = self.unary(7, r);
+                }
+                float(self, r)
             }
             "v_mov_b32" => {
                 if v.abs != 0 || v.neg != 0 || v.clamp || v.omod != 0 {
@@ -6836,15 +6916,20 @@ impl<'a> Lower<'a> {
             l.s.m.bin(c, Bin::And, x, k31)
         };
         Ok(match name {
-            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_sub_nc_u32"
-            | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+            "v_and_b32" | "v_or_b32" | "v_xor_b32" | "v_add_nc_u32" | "v_add_nc_i32"
+            | "v_sub_nc_u32" | "v_sub_nc_i32" | "v_subrev_nc_u32" | "v_mul_lo_u32" => {
+                if matches!(name, "v_add_nc_i32" | "v_sub_nc_i32")
+                    && matches!(&inst.fields, Fields::Valu(v) if v.clamp)
+                {
+                    return Err("a saturating integer operation");
+                }
                 let (a, b) = (s(self, 0)?, s(self, 1)?);
                 let (op, a, b) = match name {
                     "v_and_b32" => (Bin::And, a, b),
                     "v_or_b32" => (Bin::Or, a, b),
                     "v_xor_b32" => (Bin::Xor, a, b),
-                    "v_add_nc_u32" => (Bin::Add, a, b),
-                    "v_sub_nc_u32" => (Bin::Sub, a, b),
+                    "v_add_nc_u32" | "v_add_nc_i32" => (Bin::Add, a, b),
+                    "v_sub_nc_u32" | "v_sub_nc_i32" => (Bin::Sub, a, b),
                     "v_subrev_nc_u32" => (Bin::Sub, b, a),
                     _ => (Bin::Mul, a, b),
                 };
@@ -10954,6 +11039,52 @@ mod tests {
         body.extend(vop3(2, 0x14D, 257, 258, 259)); // v_lerp_u8 v2, v1, v2, v3
         body.extend(vop3(3, 0x36A, 258, 259, 0));   // v_cvt_pk_u16_u32 v3, v2, v3
         body.extend(vop3(0, 0x36B, 259, 256, 0));   // v_cvt_pk_i16_i32 v0, v3, v0
+        lowers_valu(&body).unwrap();
+    }
+
+    #[test]
+    fn dot_and_scalar_pack_ops_lower() {
+        let sop2 = |sdst: u8, op: u8, src0: u8, src1: u8| -> u32 {
+            0x8000_0000
+                | (u32::from(op) << 23)
+                | (u32::from(sdst) << 16)
+                | (u32::from(src1) << 8)
+                | u32::from(src0)
+        };
+        let vop3 = |vdst: u8, op: u16, src0: u16, src1: u16, src2: u16| -> [u32; 2] {
+            [
+                0xD400_0000 | (u32::from(op) << 16) | u32::from(vdst),
+                u32::from(src0 & 0x1FF)
+                    | (u32::from(src1 & 0x1FF) << 9)
+                    | (u32::from(src2 & 0x1FF) << 18),
+            ]
+        };
+        let vop3p = |op: u16, vdst: u8, src: [u16; 3], opsel: u8, opsel_hi: u8| -> [u32; 2] {
+            [
+                0xCC00_0000
+                    | (u32::from(op) << 16)
+                    | (u32::from((opsel_hi >> 2) & 1) << 14)
+                    | (u32::from(opsel & 7) << 11)
+                    | u32::from(vdst),
+                (u32::from(opsel_hi & 3) << 27)
+                    | (u32::from(src[2] & 0x1FF) << 18)
+                    | (u32::from(src[1] & 0x1FF) << 9)
+                    | u32::from(src[0] & 0x1FF),
+            ]
+        };
+
+        let mut body = vec![
+            sop2(6, 0x32, 0, 1), // s_pack_ll_b32_b16 s6, s0, s1
+            sop2(7, 0x33, 6, 2), // s_pack_lh_b32_b16 s7, s6, s2
+            sop2(6, 0x34, 7, 3), // s_pack_hh_b32_b16 s6, s7, s3
+            0x7E00_0206,         // v_mov_b32 v0, s6
+        ];
+        body.extend(vop3p(0x017, 1, [256, 257, 258], 0, 7)); // v_dot4_u32_u8 v1, v0, v1, v2
+        body.extend(vop3p(0x014, 2, [257, 258, 259], 0, 3)); // v_dot2_i32_i16 v2, v1, v2, v3
+        body.extend(vop3p(0x015, 3, [258, 259, 256], 0, 3)); // v_dot2_u32_u16 v3, v2, v3, v0
+        body.extend(vop3p(0x013, 0, [259, 256, 257], 0, 3)); // v_dot2_f32_f16 v0, v3, v0, v1
+        body.extend(vop3(1, 0x37F, 256, 257, 0)); // v_add_nc_i32 v1, v0, v1
+        body.extend(vop3(0, 0x376, 257, 258, 0)); // v_sub_nc_i32 v0, v1, v2
         lowers_valu(&body).unwrap();
     }
 }

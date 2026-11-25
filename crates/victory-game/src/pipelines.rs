@@ -31,6 +31,8 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::cityhash::city64;
 use crate::sgd5::Database;
@@ -88,8 +90,22 @@ impl Named {
         // Rasterisers have no register image here; depth states some
         // registers do not keep.
         named.finding = "enumeration";
-        depth_space(|b| named.try_depth(&mut want, &b));
-        raster_space(|b| named.try_raster(&mut want, &b));
+        if !want.depth.is_empty() {
+            for (hash, b) in resolve_depth_hashes(&want.depth) {
+                if want.depth.remove(&hash) {
+                    named.depth.insert(hash, b);
+                    named.source.insert(hash, named.finding);
+                }
+            }
+        }
+        if !want.raster.is_empty() {
+            for (hash, b) in resolve_raster_hashes(&want.raster) {
+                if want.raster.remove(&hash) {
+                    named.raster.insert(hash, b);
+                    named.source.insert(hash, named.finding);
+                }
+            }
+        }
         named
     }
 
@@ -146,33 +162,91 @@ const SLOPES: [f32; 29] = [
     -1.0, -1.5, -2.0, -4.0, 0.75, 1.25, 6.0, 7.0, 20.0, 32.0, 64.0, 100.0,
 ];
 
-fn raster_space(mut f: impl FnMut([u8; RASTER])) {
+fn resolve_hash_space<const N: usize, T: Sync>(
+    want: &HashSet<u64>,
+    slices: &[T],
+    visit_slice: impl Fn(&T, &dyn Fn([u8; N]) -> bool) + Sync,
+) -> HashMap<u64, [u8; N]> {
+    if want.is_empty() || slices.is_empty() {
+        return HashMap::new();
+    }
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(slices.len());
+    let cursor = AtomicUsize::new(0);
+    let remaining = AtomicUsize::new(want.len());
+    let found = Mutex::new(HashMap::with_capacity(want.len()));
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                let check = |b: [u8; N]| -> bool {
+                    if remaining.load(Ordering::Relaxed) == 0 {
+                        return false;
+                    }
+                    let hash = city64(&b);
+                    if want.contains(&hash) {
+                        let mut guard = found.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.insert(hash, b).is_none() {
+                            let left = want.len().saturating_sub(guard.len());
+                            remaining.store(left, Ordering::Release);
+                        }
+                    }
+                    remaining.load(Ordering::Relaxed) > 0
+                };
+                loop {
+                    if remaining.load(Ordering::Relaxed) == 0 {
+                        break;
+                    }
+                    let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                    let Some(slice) = slices.get(idx) else {
+                        break;
+                    };
+                    visit_slice(slice, &check);
+                }
+            });
+        }
+    });
+    found.into_inner().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Resolves compact rasterizer descriptions matching `want` in parallel across CPU cores,
+/// stopping early once all requested hashes are recovered.
+pub fn resolve_raster_hashes(want: &HashSet<u64>) -> HashMap<u64, [u8; RASTER]> {
     let mut biases: Vec<i8> = (-16..=16).collect();
     biases.extend([-128, 127, 100, -100, 50, -50, 64, -64, 32, -32]);
-    for fill in [2, 3] {
-        for cull in [1, 2, 3] {
-            for ccw in [0, 1] {
-                for tail in 0..32u8 {
-                    // Depth clip, the unused byte, multisample, line modes.
-                    let tail = [tail & 1, tail >> 1 & 1, tail >> 2 & 1, tail >> 3];
-                    let mut b = [0u8; RASTER];
-                    b[..3].copy_from_slice(&[fill, cull, ccw]);
-                    b[12..].copy_from_slice(&tail);
-                    f(b);
-                    for &bias in &biases {
-                        for slope in SLOPES {
-                            if bias == 0 && slope == 0.0 {
-                                continue;
-                            }
-                            b[3] = bias as u8;
-                            b[8..12].copy_from_slice(&slope.to_le_bytes());
-                            f(b);
-                        }
+    let mut slices = Vec::with_capacity(12);
+    for fill in [2u8, 3] {
+        for cull in [1u8, 2, 3] {
+            for ccw in [0u8, 1] {
+                slices.push((fill, cull, ccw));
+            }
+        }
+    }
+    resolve_hash_space(want, &slices, |&(fill, cull, ccw), check| {
+        for tail in 0..32u8 {
+            // Depth clip, the unused byte, multisample, line modes.
+            let tail = [tail & 1, tail >> 1 & 1, tail >> 2 & 1, tail >> 3];
+            let mut b = [0u8; RASTER];
+            b[..3].copy_from_slice(&[fill, cull, ccw]);
+            b[12..].copy_from_slice(&tail);
+            if !check(b) {
+                return;
+            }
+            for &bias in &biases {
+                for slope in SLOPES {
+                    if bias == 0 && slope == 0.0 {
+                        continue;
+                    }
+                    b[3] = bias as u8;
+                    b[8..12].copy_from_slice(&slope.to_le_bytes());
+                    if !check(b) {
+                        return;
                     }
                 }
             }
         }
-    }
+    })
 }
 
 /// Stencil masks tried.
@@ -181,37 +255,66 @@ const MASKS: [u8; 19] = [
     0x00, 0x7F, 0xFE,
 ];
 
-fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
-    for enable in [0, 1] {
-        for write in [0, 1] {
-            for func in 1..=8 {
-                for tail in [[1, 1], [0, 0], [1, 0], [0, 1]] {
+fn visit_depth_slice(
+    (enable, write, func): (u8, u8, u8),
+    mut check: impl FnMut([u8; DEPTH]) -> bool,
+) {
+    for tail in [[1u8, 1], [0, 0], [1, 0], [0, 1]] {
+        let mut b = [0u8; DEPTH];
+        b[..14].copy_from_slice(&[enable, write, func, 0, 0xFF, 0xFF, 1, 1, 1, 8, 1, 1, 1, 8]);
+        b[22..].copy_from_slice(&tail);
+        if !check(b) {
+            return;
+        }
+    }
+    // Stencil on, the same ops on both faces.
+    for read in MASKS {
+        for written in MASKS {
+            for ops in 0..27u8 {
+                for sfunc in 1..=8 {
+                    let face = [ops % 3 + 1, ops / 3 % 3 + 1, ops / 9 + 1, sfunc];
                     let mut b = [0u8; DEPTH];
-                    b[..14].copy_from_slice(&[
-                        enable, write, func, 0, 0xFF, 0xFF, 1, 1, 1, 8, 1, 1, 1, 8,
-                    ]);
-                    b[22..].copy_from_slice(&tail);
-                    f(b);
-                }
-                // Stencil on, the same ops on both faces.
-                for read in MASKS {
-                    for written in MASKS {
-                        for ops in 0..27u8 {
-                            for sfunc in 1..=8 {
-                                let face = [ops % 3 + 1, ops / 3 % 3 + 1, ops / 9 + 1, sfunc];
-                                let mut b = [0u8; DEPTH];
-                                b[..6].copy_from_slice(&[enable, write, func, 1, read, written]);
-                                b[6..10].copy_from_slice(&face);
-                                b[10..14].copy_from_slice(&face);
-                                b[22..].copy_from_slice(&[1, 1]);
-                                f(b);
-                            }
-                        }
+                    b[..6].copy_from_slice(&[enable, write, func, 1, read, written]);
+                    b[6..10].copy_from_slice(&face);
+                    b[10..14].copy_from_slice(&face);
+                    b[22..].copy_from_slice(&[1, 1]);
+                    if !check(b) {
+                        return;
                     }
                 }
             }
         }
     }
+}
+
+#[cfg(test)]
+fn depth_space(mut f: impl FnMut([u8; DEPTH])) {
+    for enable in [0u8, 1] {
+        for write in [0u8, 1] {
+            for func in 1..=8u8 {
+                visit_depth_slice((enable, write, func), |b| {
+                    f(b);
+                    true
+                });
+            }
+        }
+    }
+}
+
+/// Resolves compact depth-stencil descriptions matching `want` in parallel across CPU cores,
+/// stopping early once all requested hashes are recovered.
+pub fn resolve_depth_hashes(want: &HashSet<u64>) -> HashMap<u64, [u8; DEPTH]> {
+    let mut slices = Vec::with_capacity(32);
+    for enable in [0u8, 1] {
+        for write in [0u8, 1] {
+            for func in 1..=8u8 {
+                slices.push((enable, write, func));
+            }
+        }
+    }
+    resolve_hash_space(want, &slices, |&slice, check| {
+        visit_depth_slice(slice, check);
+    })
 }
 
 /// The depth, stencil and blend registers of a pack record's register
@@ -874,5 +977,30 @@ mod tests {
         let mut found = false;
         blend_from_registers(&regs, &[28, 0, 0, 0, 0, 0, 0, 0], |b| found |= b == want);
         assert!(found);
+    }
+
+    #[test]
+    fn parallel_enumeration_names_depth_and_raster_states() {
+        assert!(resolve_raster_hashes(&HashSet::new()).is_empty());
+        assert!(resolve_depth_hashes(&HashSet::new()).is_empty());
+
+        let mut r1 = [0u8; RASTER];
+        r1[..3].copy_from_slice(&[3, 2, 1]);
+        r1[3] = (-4i8) as u8;
+        r1[8..12].copy_from_slice(&1.5f32.to_le_bytes());
+        r1[12..].copy_from_slice(&[1, 0, 1, 2]);
+        let r1_hash = city64(&r1);
+        let r_res = resolve_raster_hashes(&HashSet::from([r1_hash]));
+        assert_eq!(r_res.get(&r1_hash), Some(&r1));
+
+        let mut d1 = [0u8; DEPTH];
+        d1[..6].copy_from_slice(&[1, 1, 4, 1, 0xFF, 0x0F]);
+        let face = [2, 3, 1, 6];
+        d1[6..10].copy_from_slice(&face);
+        d1[10..14].copy_from_slice(&face);
+        d1[22..].copy_from_slice(&[1, 1]);
+        let d1_hash = city64(&d1);
+        let d_res = resolve_depth_hashes(&HashSet::from([d1_hash]));
+        assert_eq!(d_res.get(&d1_hash), Some(&d1));
     }
 }

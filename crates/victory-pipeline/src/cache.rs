@@ -12,13 +12,20 @@ use crate::Converter;
 pub struct CacheKey(blake3::Hash);
 
 impl CacheKey {
-    pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
+    /// Builds a key from multiple input slices without allocating a concatenated buffer.
+    pub fn from_parts(converter: &dyn Converter, parts: &[&[u8]]) -> Self {
         let mut h = blake3::Hasher::new();
         h.update(converter.id().as_bytes());
         h.update(&[0]);
         h.update(&converter.version().to_le_bytes());
-        h.update(input);
+        for part in parts {
+            h.update(part);
+        }
         CacheKey(h.finalize())
+    }
+
+    pub fn new(converter: &dyn Converter, input: &[u8]) -> Self {
+        Self::from_parts(converter, &[input])
     }
 
     pub fn to_hex(&self) -> String {
@@ -122,20 +129,24 @@ impl Cache {
         Ok((removed, freed))
     }
 
-    /// Returns the cached output for `input`, converting it first if needed.
-    pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
-        let key = CacheKey::new(converter, input);
+    /// Returns `(bytes, path, cache_hit)` for the multipart key without concatenating inputs
+    /// or re-reading freshly converted output from disk.
+    pub fn read_or_convert_parts(
+        &self,
+        converter: &dyn Converter,
+        parts: &[&[u8]],
+        convert: impl FnOnce() -> Result<Vec<u8>>,
+    ) -> Result<(Vec<u8>, PathBuf, bool)> {
+        let key = CacheKey::from_parts(converter, parts);
         let path = self.path_for(&key);
-        if path.is_file() {
+        if let Ok(bytes) = std::fs::read(&path) {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
-            return Ok(path);
+            return Ok((bytes, path, true));
         }
-        let output = converter
-            .convert(input)
+        let output = convert()
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
         std::fs::create_dir_all(dir)?;
-        // Write-then-rename so readers never see partial output.
         let (tmp, mut file) = tempfile_in(dir)?;
         let written = file.write_all(&output);
         drop(file);
@@ -144,6 +155,13 @@ impl Cache {
             let _ = std::fs::remove_file(&tmp);
         }
         published?;
+        Ok((output, path, false))
+    }
+
+    /// Returns the cached output for `input`, converting it first if needed.
+    pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
+        let (_, path, _) =
+            self.read_or_convert_parts(converter, &[input], || converter.convert(input))?;
         Ok(path)
     }
 }
@@ -339,5 +357,41 @@ mod tests {
         assert_eq!(after.stale_temps, 0);
         assert_eq!(after.stale_temp_bytes, 0);
         assert_eq!(std::fs::read(entry).unwrap(), b"ABC");
+    }
+
+    #[test]
+    fn read_or_convert_parts_matches_key_and_avoids_concat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        assert_eq!(
+            CacheKey::from_parts(&conv, &[b"hello ", b"world"]),
+            CacheKey::new(&conv, b"hello world")
+        );
+
+        let calls = AtomicUsize::new(0);
+        let (first, path1, hit1) = cache
+            .read_or_convert_parts(&conv, &[b"hello ", b"world"], || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(b"HELLO WORLD".to_vec())
+            })
+            .unwrap();
+        assert!(!hit1);
+        assert_eq!(first, b"HELLO WORLD");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        let (second, path2, hit2) = cache
+            .read_or_convert_parts(&conv, &[b"hello ", b"world"], || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(b"UNUSED".to_vec())
+            })
+            .unwrap();
+        assert!(hit2);
+        assert_eq!(path1, path2);
+        assert_eq!(second, b"HELLO WORLD");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }

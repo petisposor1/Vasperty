@@ -3,10 +3,10 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 
-use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
+use crate::object::{self, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 pub(crate) const FENCE_IIDS: [Iid; 5] = [
@@ -37,6 +37,8 @@ struct Fence {
     flags: u32,
     /// Events to set once the value reaches theirs (handles as integers).
     waiters: Mutex<Vec<(u64, usize)>>,
+    /// Signals blocking `SetEventOnCompletion(value, NULL)` waiters.
+    reached: Condvar,
 }
 
 fn fence<'a>(this: This) -> &'a Fence {
@@ -57,6 +59,7 @@ pub(crate) extern "system" fn create(
         value: AtomicU64::new(initial),
         flags,
         waiters: Mutex::new(Vec::new()),
+        reached: Condvar::new(),
     });
     object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
 }
@@ -88,17 +91,16 @@ extern "system" fn completed(this: This) -> u64 {
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
-    if fence.value.load(Ordering::Acquire) >= value {
-        if !event.is_null() {
-            set_event(event as usize);
+    if event.is_null() {
+        // Blocking fence wait until `signal` advances `value` to `value`.
+        while fence.value.load(Ordering::Acquire) < value {
+            waiters = fence.reached.wait(waiters).unwrap_or_else(|e| e.into_inner());
         }
         return S_OK;
     }
-    if event.is_null() {
-        // shortcut: a null event means "block until reached"; nothing can
-        // reach it while no GPU work runs, so fail instead of hanging.
-        tracing::warn!(value, "blocking fence wait not implemented");
-        return E_NOTIMPL;
+    if fence.value.load(Ordering::Acquire) >= value {
+        set_event(event as usize);
+        return S_OK;
     }
     waiters.push((value, event as usize));
     S_OK
@@ -114,6 +116,7 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
         }
         !reached
     });
+    fence.reached.notify_all();
     S_OK
 }
 
@@ -168,7 +171,7 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        assert_eq!(wait(f, 5, std::ptr::null_mut()), S_OK, "null wait returns immediately when reached");
         // Grand Theft Auto VI reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
@@ -209,5 +212,37 @@ mod tests {
         assert_eq!(slot::<Flags>(queried, 0x58)(queried), 0x2);
         assert_eq!(slot::<Release>(queried, 0x10)(queried), 1);
         assert_eq!(slot::<Release>(f, 0x10)(f), 0);
+    }
+
+    #[test]
+    fn null_event_blocks_until_fence_is_signaled() {
+        use std::sync::atomic::AtomicBool;
+        type WaitFn = extern "system" fn(This, u64, *mut c_void) -> HRESULT;
+        type SignalFn = extern "system" fn(This, u64) -> HRESULT;
+        type ReleaseFn = extern "system" fn(This) -> u32;
+
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 2, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let wait = slot::<WaitFn>(f, 0x48);
+        let sig = slot::<SignalFn>(f, 0x50);
+        let rel = slot::<ReleaseFn>(f, 0x10);
+        let addr = f as usize;
+        let done = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let res = wait(addr as This, 9, std::ptr::null_mut());
+                assert_eq!(res, S_OK);
+                done.store(true, Ordering::Release);
+            });
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            assert!(!done.load(Ordering::Acquire), "must stay blocked below target");
+            assert_eq!(sig(f, 7), S_OK);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            assert!(!done.load(Ordering::Acquire), "must stay blocked at 7 < 9");
+            assert_eq!(sig(f, 9), S_OK);
+        });
+        assert!(done.load(Ordering::Acquire));
+        assert_eq!(rel(f), 0);
     }
 }
