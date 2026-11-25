@@ -2384,11 +2384,31 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
+        let items = std::mem::take(&mut self.refreshes);
+        if items.is_empty() {
+            return 0;
+        }
+        let total_span: usize = items.iter().map(|(_, from, to)| to.saturating_sub(*from)).sum();
+        let mut results = vec![(0usize, 0u64); items.len()];
+        if items.len() >= 2 && total_span >= (512 << 10) {
+            std::thread::scope(|s| {
+                for ((shadow, from, to), slot) in items.iter().zip(results.iter_mut()) {
+                    s.spawn(move || {
+                        let started = std::time::Instant::now();
+                        let copied = shadow.update(*from, to - from);
+                        *slot = (copied, started.elapsed().as_micros() as u64);
+                    });
+                }
+            });
+        } else {
+            for ((shadow, from, to), slot) in items.iter().zip(results.iter_mut()) {
+                let started = std::time::Instant::now();
+                let copied = shadow.update(*from, to - from);
+                *slot = (copied, started.elapsed().as_micros() as u64);
+            }
+        }
         let mut total = 0;
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
+        for ((shadow, from, to), (copied, us)) in items.into_iter().zip(results) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::range(from, to - from, us, 0);
             PREPARING[0].fetch_add(us, Ordering::Relaxed);
@@ -3606,5 +3626,55 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn batch_parallel_flush_updates_distinct_shadows() {
+        use crate::watch::PAGE;
+        let p1 = crate::watch::tests::pool(8);
+        let p2 = crate::watch::tests::pool(8);
+        let len = 8 * PAGE;
+        crate::shadow::register(p1, p1 as u64, len as u64);
+        crate::shadow::register(p2, p2 as u64, len as u64);
+        let Some(copy1) = crate::shadow::find(p1 as u64, len as u64) else {
+            crate::shadow::unregister(p2, p2 as u64);
+            crate::shadow::unregister(p1, p1 as u64);
+            crate::watch::tests::free(p2);
+            crate::watch::tests::free(p1);
+            return; // no host GPU here
+        };
+        let Some(copy2) = crate::shadow::find(p2 as u64, len as u64) else {
+            crate::shadow::unregister(p2, p2 as u64);
+            crate::shadow::unregister(p1, p1 as u64);
+            drop(copy1);
+            crate::watch::tests::free(p2);
+            crate::watch::tests::free(p1);
+            return;
+        };
+
+        let mut batch = Batch::default();
+        batch.add(&copy1, p1, len);
+        batch.add(&copy2, p2, len);
+        assert_eq!(batch.flush(), 2 * len, "initial parallel flush copies both spans");
+
+        // SAFETY: both pools belong to this test and are guarded after flush.
+        unsafe {
+            ((p1 + 2 * PAGE + 16) as *mut u8).write_volatile(0xA5);
+            ((p2 + 5 * PAGE + 32) as *mut u8).write_volatile(0x5A);
+        }
+
+        let mut batch = Batch::default();
+        batch.add(&copy1, p1, len);
+        batch.add(&copy2, p2, len);
+        assert_eq!(batch.flush(), 2 * PAGE, "subsequent parallel flush refreshes dirty pages");
+        assert_eq!(copy1.read_host((p1 + 2 * PAGE + 16) as u64, 1)[0], 0xA5);
+        assert_eq!(copy2.read_host((p2 + 5 * PAGE + 32) as u64, 1)[0], 0x5A);
+
+        crate::shadow::unregister(p2, p2 as u64);
+        crate::shadow::unregister(p1, p1 as u64);
+        drop(copy2);
+        drop(copy1);
+        crate::watch::tests::free(p2);
+        crate::watch::tests::free(p1);
     }
 }

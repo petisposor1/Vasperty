@@ -71,11 +71,22 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+fn decrement_refs(refs: &std::sync::atomic::AtomicU32, set: Ordering, fetch: Ordering) -> Option<u32> {
+    let mut cur = refs.load(Ordering::Relaxed);
+    loop {
+        let next = cur.checked_sub(1)?;
+        match refs.compare_exchange_weak(cur, next, set, fetch) {
+            Ok(prev) => return Some(prev),
+            Err(observed) => cur = observed,
+        }
+    }
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
-    let _ = refs.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
-    refs.load(Ordering::Relaxed)
+    decrement_refs(refs, Ordering::Relaxed, Ordering::Relaxed)
+        .map_or(0, |prev| prev - 1)
 }
 
 /// Answers an interface query (or any call handing out an object): a new
@@ -134,8 +145,8 @@ pub(crate) fn hand_out<T>(
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
     let refs = &unsafe { &*this }.refs;
-    match refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1)) {
-        Ok(1) => {
+    match decrement_refs(refs, Ordering::AcqRel, Ordering::Acquire) {
+        Some(1) => {
             let address = this as usize;
             let keys = (address, [u8::MIN; 16])..=(address, [u8::MAX; 16]);
             {
@@ -150,8 +161,8 @@ pub(crate) fn release_boxed<T>(this: This) -> u32 {
             drop(unsafe { Box::from_raw(this.cast_mut().cast::<T>()) });
             0
         }
-        Ok(n) => n - 1,
-        Err(_) => 0,
+        Some(n) => n - 1,
+        None => 0,
     }
 }
 

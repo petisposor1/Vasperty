@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use victory_formats::bcpack::Tables;
 use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+use victory_formats::xma::{Decoder as XmaDecoder, FRAME_SAMPLES as XMA_FRAME_SAMPLES};
 use victory_shader::native::{ComputeIo, StageIo};
 use victory_shader::{Container, HwStage, NativeProgram, emit, io, ir, resource, structure};
 
@@ -25,7 +26,10 @@ pub fn run(iters: usize) -> Result<()> {
     // 3. BCPack built-in table parse (`bcpack-tables.bin`)
     bench_bcpack_tables(iters)?;
 
-    // 4. GFX10 -> IR -> Structure -> Resource -> I/O -> DXIL SM 6.6 pipeline
+    // 4. XMA2 stereo frame decode throughput (`victory-formats::xma`)
+    bench_xma2_decode(iters)?;
+
+    // 5. GFX10 -> IR -> Structure -> Resource -> I/O -> DXIL SM 6.6 pipeline
     bench_shader_translate(iters)?;
 
     Ok(())
@@ -137,6 +141,29 @@ fn bench_bcpack_tables(iters: usize) -> Result<()> {
     let per_us = elapsed.as_secs_f64() * 1e6 / rounds as f64;
     let ops_sec = rounds as f64 / elapsed.as_secs_f64().max(1e-9);
     println!("{:<28}: {per_us:8.1} us/parse  ({ops_sec:8.1} parses/s)", "BCPack tables parse");
+    Ok(())
+}
+
+fn bench_xma2_decode(iters: usize) -> Result<()> {
+    let mut decoder = XmaDecoder::new(2, 48_000);
+    let mut pcm = Vec::with_capacity(XMA_FRAME_SAMPLES * 2);
+    // Synthetic bit-padded silence XMA2 frame (fixed 512-sample subframes).
+    let frame = [0u8; 64];
+    let rounds = iters.saturating_mul(200);
+    let _ = decoder.decode(&frame, frame.len() * 8, &mut pcm);
+    let started = Instant::now();
+    for _ in 0..rounds {
+        pcm.clear();
+        let _ = decoder.decode(black_box(&frame), frame.len() * 8, &mut pcm);
+    }
+    let elapsed = started.elapsed();
+    let per_us = elapsed.as_secs_f64() * 1e6 / rounds as f64;
+    let frame_rt_us = (XMA_FRAME_SAMPLES as f64 / 48_000.0) * 1e6;
+    let realtime = frame_rt_us / per_us.max(1e-6);
+    println!(
+        "{:<28}: {per_us:8.1} us/frame  ({realtime:7.1}x 48kHz realtime)",
+        "XMA2 stereo 512-samp frame"
+    );
     Ok(())
 }
 

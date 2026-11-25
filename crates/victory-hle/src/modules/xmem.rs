@@ -996,12 +996,18 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
         return 0;
     };
     let standard = victory_gpu::console::current().title_memory().1;
-    let moved = kind == TITLE_TO_SYSTEM
-        && TRANSFERRED
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
-                t.checked_add(size).filter(|&t| t <= standard)
-            })
-            .is_ok();
+    let moved = kind == TITLE_TO_SYSTEM && {
+        let mut cur = TRANSFERRED.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = cur.checked_add(size).filter(|&t| t <= standard) else {
+                break false;
+            };
+            match TRANSFERRED.compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break true,
+                Err(observed) => cur = observed,
+            }
+        }
+    };
     moved.into()
 }
 

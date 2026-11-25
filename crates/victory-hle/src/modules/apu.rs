@@ -132,6 +132,7 @@ pub struct Connection {
 
 struct State {
     streams: Vec<Option<OpusDecoder>>,
+    pitch: Vec<f32>,
     /// Results not yet dequeued, per stream.
     queued: Vec<u32>,
     results: VecDeque<ApuResult>,
@@ -206,6 +207,7 @@ pub extern "system" fn XApuConnect(
         per_stream: input.commands_per_stream,
         state: Mutex::new(State {
             streams: (0..streams).map(|_| None).collect(),
+            pitch: vec![1.0; streams],
             queued: vec![0; streams],
             results: VecDeque::new(),
             commands: 0,
@@ -269,12 +271,19 @@ pub extern "system" fn XApuEnqueueCommand(
         input_length: 0,
         input: std::ptr::null(),
     };
+    let state = &mut *state;
     let decoder = &mut state.streams[stream];
     match id.kind {
         ACTIVATE => {
             // SAFETY: an activate command is this struct.
-            let channels = unsafe { command.cast::<Activate>().read_unaligned() }.channels;
-            tracing::debug!(stream, channels, "Opus stream activated");
+            let act = unsafe { command.cast::<Activate>().read_unaligned() };
+            let channels = act.channels;
+            let start_pitch = if act.start_pitch.is_finite() && act.start_pitch > 0.0 {
+                act.start_pitch.clamp(0.25, 4.0)
+            } else {
+                1.0
+            };
+            tracing::debug!(stream, channels, start_pitch, "Opus stream activated");
             result.error = if decoder.is_some() {
                 ALREADY_ACTIVE
             } else if !(1..=2).contains(&channels) {
@@ -283,24 +292,31 @@ pub extern "system" fn XApuEnqueueCommand(
                 match OpusDecoder::new(48_000, channels as usize) {
                     Ok(d) => {
                         *decoder = Some(d);
+                        state.pitch[stream] = start_pitch;
+                        result.pitch = start_pitch;
                         S_OK
                     }
                     Err(_) => E_INVALIDARG,
                 }
             };
         }
-        DEACTIVATE => *decoder = None,
+        DEACTIVATE => {
+            *decoder = None;
+            state.pitch[stream] = 1.0;
+        }
         RESET => {
             if let Some(d) = decoder {
                 let _ = d.reset_state();
             }
+            state.pitch[stream] = 1.0;
         }
         NOTIFY => {}
         PROCESS => {
             // SAFETY: a process command is this struct.
             let command = unsafe { command.cast::<Process>().read_unaligned() };
+            let cur_pitch = &mut state.pitch[stream];
             match decoder {
-                Some(d) => process(d, connection.options, &command, &mut result),
+                Some(d) => process(d, cur_pitch, connection.options, &command, &mut result),
                 None => result.error = INVALID_STREAM,
             }
         }
@@ -320,9 +336,16 @@ pub extern "system" fn XApuEnqueueCommand(
     S_OK
 }
 
-/// Decodes one packet into the command's output buffer, keeping the frames
-/// from `first_frame` on, at most `frame_count` of them.
-fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
+/// Decodes one packet into the command's output buffer using zero-allocation
+/// thread-local scratch, keeping frames from `first_frame` on (with linear
+/// pitch/rate resampling when pitch differs from 1.0).
+fn process(
+    decoder: &mut OpusDecoder,
+    current_pitch: &mut f32,
+    options: u32,
+    command: &Process,
+    result: &mut ApuResult,
+) {
     let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
     let (output, output_length) = (command.output, command.output_length);
@@ -335,40 +358,113 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     }
     // SAFETY: the title's packet in its connection memory.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
-    let mut pcm = vec![0f32; MAX_FRAMES * channels];
-    let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm) {
-        Ok(n) => n,
-        Err(_) => {
-            result.error = BAD_PACKET;
+    let start_pitch = (*current_pitch).clamp(0.25, 4.0);
+    let end_pitch = if command.target_pitch.is_finite() && command.target_pitch > 0.0 {
+        command.target_pitch.clamp(0.25, 4.0)
+    } else {
+        start_pitch
+    };
+    let (avg_pitch, next_pitch) = if command.pitch_ramp.is_finite() && command.pitch_ramp > 0.0 {
+        let max_delta = command.pitch_ramp * (MAX_FRAMES as f32 / 48_000.0).max(0.02);
+        let diff = (end_pitch - start_pitch).clamp(-max_delta, max_delta);
+        let next = (start_pitch + diff).clamp(0.25, 4.0);
+        (0.5 * (start_pitch + next), next)
+    } else {
+        // Zero ramp selects the target pitch immediately for the whole frame.
+        (end_pitch, end_pitch)
+    };
+
+    thread_local! {
+        static PCM_SCRATCH: std::cell::RefCell<Vec<f32>> =
+            std::cell::RefCell::new(vec![0f32; MAX_FRAMES * 2]);
+        static RESAMPLED_SCRATCH: std::cell::RefCell<Vec<f32>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    PCM_SCRATCH.with(|cell| {
+        let mut pcm = cell.borrow_mut();
+        let needed = MAX_FRAMES * channels;
+        if pcm.len() < needed {
+            pcm.resize(needed, 0.0);
+        }
+        let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm[..needed]) {
+            Ok(n) => n,
+            Err(_) => {
+                result.error = BAD_PACKET;
+                return;
+            }
+        };
+        let first = (command.first_frame as usize).min(decoded);
+        let max_out_frames = (command.frame_count as usize).min(output_length as usize / (4 * channels));
+        let src_avail = decoded - first;
+        let unity = (avg_pitch - 1.0).abs() <= 1e-4 && (next_pitch - 1.0).abs() <= 1e-4;
+        *current_pitch = next_pitch;
+        result.pitch = next_pitch;
+
+        if unity || src_avail == 0 || max_out_frames == 0 {
+            let frames = src_avail.min(max_out_frames);
+            let kept = &pcm[first * channels..(first + frames) * channels];
+            write_pcm_output(output, kept, frames, channels, options);
+            result.frames = frames as u32;
+            result.output_length = (frames * channels * 4) as u32;
             return;
         }
-    };
-    let first = (command.first_frame as usize).min(decoded);
-    let frames = (decoded - first)
-        .min(command.frame_count as usize)
-        .min(output_length as usize / (4 * channels));
-    let kept = &pcm[first * channels..(first + frames) * channels];
+
+        let src_frames = src_avail.min(MAX_FRAMES);
+        let target_frames = ((src_frames as f64) / f64::from(avg_pitch))
+            .round()
+            .clamp(1.0, max_out_frames as f64) as usize;
+        RESAMPLED_SCRATCH.with(|rcell| {
+            let mut resampled = rcell.borrow_mut();
+            let out_len = target_frames * channels;
+            if resampled.len() < out_len {
+                resampled.resize(out_len, 0.0);
+            }
+            let src_slice = &pcm[first * channels..(first + src_frames) * channels];
+            let step = if target_frames > 1 && src_frames > 1 {
+                (src_frames - 1) as f64 / (target_frames - 1) as f64
+            } else {
+                0.0
+            };
+            for i in 0..target_frames {
+                let pos = (i as f64 * step).min((src_frames - 1) as f64);
+                let idx0 = pos as usize;
+                let frac = (pos - idx0 as f64) as f32;
+                let idx1 = (idx0 + 1).min(src_frames - 1);
+                for ch in 0..channels {
+                    let s0 = src_slice[idx0 * channels + ch];
+                    let s1 = src_slice[idx1 * channels + ch];
+                    resampled[i * channels + ch] = s0 + (s1 - s0) * frac;
+                }
+            }
+            write_pcm_output(output, &resampled[..out_len], target_frames, channels, options);
+            result.frames = target_frames as u32;
+            result.output_length = (out_len * 4) as u32;
+        });
+    });
+}
+
+fn write_pcm_output(output: *mut u8, samples: &[f32], frames: usize, channels: usize, options: u32) {
     let bytes = frames * channels * 4;
-    if bytes > 0 {
-        // SAFETY: `output` is non-null and holds at least `bytes <= output_length` bytes;
-        // writing raw bytes avoids requiring 4-byte alignment on the title's `*mut u8`.
-        let out = unsafe { std::slice::from_raw_parts_mut(output, bytes) };
-        if options & DEINTERLEAVED_OUTPUT != 0 && channels == 2 {
-            let (left, right) = out.split_at_mut(frames * 4);
-            let (left, _) = left.as_chunks_mut::<4>();
-            let (right, _) = right.as_chunks_mut::<4>();
-            for (i, frame) in kept.as_chunks::<2>().0.iter().enumerate() {
-                left[i] = frame[0].to_le_bytes();
-                right[i] = frame[1].to_le_bytes();
-            }
-        } else {
-            for (dst, &sample) in out.as_chunks_mut::<4>().0.iter_mut().zip(kept) {
-                *dst = sample.to_le_bytes();
-            }
+    if bytes == 0 {
+        return;
+    }
+    // SAFETY: `output` is non-null and holds at least `bytes <= output_length` bytes;
+    // writing raw bytes avoids requiring 4-byte alignment on the title's `*mut u8`.
+    let out = unsafe { std::slice::from_raw_parts_mut(output, bytes) };
+    if options & DEINTERLEAVED_OUTPUT != 0 && channels == 2 {
+        let (left, right) = out.split_at_mut(frames * 4);
+        let (left, _) = left.as_chunks_mut::<4>();
+        let (right, _) = right.as_chunks_mut::<4>();
+        for (i, frame) in samples.as_chunks::<2>().0.iter().enumerate() {
+            left[i] = frame[0].to_le_bytes();
+            right[i] = frame[1].to_le_bytes();
+        }
+    } else {
+        for (dst, &sample) in out.as_chunks_mut::<4>().0.iter_mut().zip(samples) {
+            *dst = sample.to_le_bytes();
         }
     }
-    result.frames = frames as u32;
-    result.output_length = bytes as u32;
 }
 
 pub extern "system" fn XApuDequeueResult(handle: *mut Connection, out: *mut ApuResult) -> HRESULT {
@@ -674,5 +770,85 @@ mod tests {
             );
             assert_eq!(XApuDisconnect(handle), S_OK);
         }
+    }
+
+    #[test]
+    fn pitch_resampling_compresses_duration_and_updates_pitch() {
+        let input = ConnectInput {
+            process: DECODE_OPUS,
+            streams: 2,
+            commands_per_stream: 4,
+            memory: 0x4_0000,
+            frames_per_output: 0,
+            options: 0,
+        };
+        let mut output = ConnectOutput {
+            memory: std::ptr::null_mut(),
+            result_event: std::ptr::null_mut(),
+        };
+        let mut handle = std::ptr::null_mut();
+        assert_eq!(XApuConnect(&input, &mut output, &mut handle), S_OK);
+        let base = output.memory.cast::<u8>();
+
+        let activate = Activate {
+            id: id(ACTIVATE, 0),
+            channels: 2,
+            init_length: 0,
+            init: std::ptr::null(),
+            start_pitch: 1.0,
+            processing_length: 0,
+            processing: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const activate).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+
+        let tone: Vec<f32> = (0..960 * 2)
+            .map(|i| ((i / 2) as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.5)
+            .collect();
+        let mut encoder = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+        let mut packet = [0u8; 1500];
+        let n = encoder.encode(&tone, 960, &mut packet).unwrap();
+        // SAFETY: inside connection memory.
+        unsafe { std::ptr::copy_nonoverlapping(packet.as_ptr(), base, n) };
+
+        let out_ptr = base.wrapping_add(0x10000);
+        let proc_cmd = Process {
+            id: id(PROCESS, 0),
+            pitch_ramp: 0.0,
+            target_pitch: 2.0,
+            first_frame: 0,
+            frame_count: 960,
+            input_length: n as u32,
+            input: base,
+            output_length: 960 * 8,
+            output: out_ptr,
+        };
+        assert_eq!(
+            XApuEnqueueCommand(handle, (&raw const proc_cmd).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+
+        let mut res = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        assert_eq!(XApuDequeueResult(handle, res.as_mut_ptr()), S_OK);
+        assert_eq!(XApuDequeueResult(handle, res.as_mut_ptr()), S_OK);
+        // SAFETY: written above by XApuDequeueResult.
+        let decoded = unsafe { res.assume_init() };
+        let (err, frames, pitch, len) = (
+            decoded.error,
+            decoded.frames,
+            decoded.pitch,
+            decoded.output_length,
+        );
+        assert_eq!(err, S_OK);
+        assert_eq!(pitch, 2.0);
+        assert!((470..=490).contains(&frames), "expected ~480 resampled frames at 2x pitch, got {frames}");
+        assert_eq!(len, frames * 8);
+        // SAFETY: output region holds `frames * 8` bytes.
+        let samples = unsafe { std::slice::from_raw_parts(out_ptr.cast::<f32>(), frames as usize * 2) };
+        let energy: f32 = samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32;
+        assert!(energy > 0.01, "resampled pitched tone energy={energy}");
+        assert_eq!(XApuDisconnect(handle), S_OK);
     }
 }

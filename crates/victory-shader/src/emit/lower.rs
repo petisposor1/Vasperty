@@ -3389,8 +3389,11 @@ impl<'a> Lower<'a> {
             self.set(scc, Val::Bit(r));
             return Ok(());
         }
-        if let Some(op) = name.strip_prefix("s_cmp_").filter(|o| o.ends_with("_u64")) {
-            // eq and lg only: both dwords.
+        if let Some(op) = name
+            .strip_prefix("s_cmp_")
+            .filter(|o| o.ends_with("_u64") || o.ends_with("_i64"))
+        {
+            // eq and lg only: both dwords (identical for signed and unsigned).
             let mut r = None;
             for h in 0..2 {
                 let (a, b) = (half(self, 0, h)?, half(self, 1, h)?);
@@ -3463,7 +3466,7 @@ impl<'a> Lower<'a> {
                     self.set(scc, Val::Bit(nonzero));
                     Ok(())
                 }
-                "s_bcnt1_i32_b64" => {
+                "s_bcnt1_i32_b64" | "s_bcnt0_i32_b64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     let i32t = self.s.t.i32;
                     let na = self
@@ -3472,16 +3475,27 @@ impl<'a> Lower<'a> {
                     let nb = self
                         .s
                         .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
-                    let r = self.s.m.bin(c, Bin::Add, na, nb);
+                    let ones_cnt = self.s.m.bin(c, Bin::Add, na, nb);
+                    let r = if name == "s_bcnt0_i32_b64" {
+                        let k64 = self.s.m.i32(64);
+                        self.s.m.bin(c, Bin::Sub, k64, ones_cnt)
+                    } else {
+                        ones_cnt
+                    };
                     self.set(lo, Val::I32(r));
                     let z = self.s.m.i32(0);
                     let s = self.s.m.cmp(c, pred::NE, r, z);
                     self.set(scc, Val::Bit(s));
                     Ok(())
                 }
-                "s_ff1_i32_b64" => {
-                    // The lowest set bit; -1 for none (as DXIL's first bit low).
-                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                "s_ff1_i32_b64" | "s_ff0_i32_b64" => {
+                    // The lowest set (or clear) bit; -1 for none (as DXIL's first bit low).
+                    let (mut a, mut b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    if name == "s_ff0_i32_b64" {
+                        let ones = self.s.m.i32(u32::MAX);
+                        a = self.s.m.bin(c, Bin::Xor, a, ones);
+                        b = self.s.m.bin(c, Bin::Xor, b, ones);
+                    }
                     let i32t = self.s.t.i32;
                     let fa = self
                         .s
@@ -3676,6 +3690,36 @@ impl<'a> Lower<'a> {
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
                 (r, None)
             }
+            "s_bcnt0_i32_b32" => {
+                let a = src32(self, 0)?;
+                let ones = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 31, &[a]);
+                let k32 = self.s.m.i32(32);
+                (self.s.m.bin(c, Bin::Sub, k32, ones), None)
+            }
+            "s_ff0_i32_b32" => {
+                let a = src32(self, 0)?;
+                let ones = self.s.m.i32(u32::MAX);
+                let inv = self.s.m.bin(c, Bin::Xor, a, ones);
+                let r = self
+                    .s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 32, &[inv]);
+                (r, None)
+            }
+            "s_sext_i32_i8" | "s_sext_i32_i16" => {
+                let a = src32(self, 0)?;
+                let sh = self.s.m.i32(if name.ends_with("i8") { 24 } else { 16 });
+                let t = self.s.m.bin(c, Bin::Shl, a, sh);
+                (self.s.m.bin(c, Bin::AShr, t, sh), None)
+            }
+            "s_absdiff_i32" => {
+                let (a, b) = (src32(self, 0)?, src32(self, 1)?);
+                let gt = self.s.m.cmp(c, pred::SGT, a, b);
+                let d1 = self.s.m.bin(c, Bin::Sub, a, b);
+                let d2 = self.s.m.bin(c, Bin::Sub, b, a);
+                (self.s.m.select(c, gt, d1, d2), None)
+            }
             "s_bfe_u32" | "s_bfe_i32" => {
                 // src1: offset in bits 0-4, width in bits 16-22.
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -3777,6 +3821,9 @@ impl<'a> Lower<'a> {
                         | "s_brev_b32"
                         | "s_mul_i32"
                         | "s_mulk_i32"
+                        | "s_sext_i32_i8"
+                        | "s_sext_i32_i16"
+                        | "s_ff0_i32_b32"
                 ) =>
                 {
                     return Ok(());
@@ -7162,6 +7209,61 @@ impl<'a> Lower<'a> {
                 let a = s(self, 0)?;
                 self.s
                     .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 32, &[a])
+            }
+            "v_ffbh_u32" | "v_ffbh_i32" => {
+                // First differing/set bit from the top (-1 if none): DXIL FirstbitHi / FirstbitSHi.
+                let a = s(self, 0)?;
+                let op = if name == "v_ffbh_u32" { 33 } else { 34 };
+                self.s
+                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a])
+            }
+            "v_lerp_u8" => {
+                // Packed 4x8-bit unsigned average: ((a_i + b_i + (d_i & 1)) >> 1) in byte i.
+                let (a, b, d) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let (one, ff) = (k(self, 1), k(self, 0xFF));
+                let mut out = k(self, 0);
+                for byte in 0..4u32 {
+                    let sh = k(self, byte * 8);
+                    let a_sh = self.s.m.bin(c, Bin::LShr, a, sh);
+                    let b_sh = self.s.m.bin(c, Bin::LShr, b, sh);
+                    let d_sh = self.s.m.bin(c, Bin::LShr, d, sh);
+                    let ax = self.s.m.bin(c, Bin::And, a_sh, ff);
+                    let bx = self.s.m.bin(c, Bin::And, b_sh, ff);
+                    let round = self.s.m.bin(c, Bin::And, d_sh, one);
+                    let ab = self.s.m.bin(c, Bin::Add, ax, bx);
+                    let sum = self.s.m.bin(c, Bin::Add, ab, round);
+                    let avg = self.s.m.bin(c, Bin::LShr, sum, one);
+                    let shifted = self.s.m.bin(c, Bin::Shl, avg, sh);
+                    out = self.s.m.bin(c, Bin::Or, out, shifted);
+                }
+                out
+            }
+            "v_cvt_pk_u16_u32" | "v_cvt_pk_i16_i32" => {
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let signed = name == "v_cvt_pk_i16_i32";
+                let (lo_sat, hi_sat) = if signed {
+                    let lo_bound = k(self, (-32768i32) as u32);
+                    let hi_bound = k(self, 32767);
+                    let mask = k(self, 0xFFFF);
+                    let clamp_i16 = |l: &mut Self, x: V| {
+                        let too_lo = l.s.m.cmp(c, pred::SLT, x, lo_bound);
+                        let x = l.s.m.select(c, too_lo, lo_bound, x);
+                        let too_hi = l.s.m.cmp(c, pred::SGT, x, hi_bound);
+                        let x = l.s.m.select(c, too_hi, hi_bound, x);
+                        l.s.m.bin(c, Bin::And, x, mask)
+                    };
+                    (clamp_i16(self, a), clamp_i16(self, b))
+                } else {
+                    let hi_bound = k(self, 0xFFFF);
+                    let clamp_u16 = |l: &mut Self, x: V| {
+                        let too_hi = l.s.m.cmp(c, pred::IUGT, x, hi_bound);
+                        l.s.m.select(c, too_hi, hi_bound, x)
+                    };
+                    (clamp_u16(self, a), clamp_u16(self, b))
+                };
+                let k16 = k(self, 16);
+                let hi = self.s.m.bin(c, Bin::Shl, hi_sat, k16);
+                self.s.m.bin(c, Bin::Or, lo_sat, hi)
             }
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
                 // Bits of the mask's low (high) half below this lane, plus src1:
@@ -10809,5 +10911,49 @@ mod tests {
             let flags = u64::from_le_bytes(features.data.try_into().unwrap());
             assert_ne!(flags & 0x4000, 0, "SFI0 {flags:#x}: missing WAVE_OPS");
         }
+    }
+
+    #[test]
+    fn extended_scalar_and_vector_bit_pack_ops_lower() {
+        let sop1 = |sdst: u8, op: u8, ssrc0: u8| -> u32 {
+            0xBE80_0000 | (u32::from(sdst) << 16) | (u32::from(op) << 8) | u32::from(ssrc0)
+        };
+        let sop2 = |sdst: u8, op: u8, src0: u8, src1: u8| -> u32 {
+            0x8000_0000
+                | (u32::from(op) << 23)
+                | (u32::from(sdst) << 16)
+                | (u32::from(src1) << 8)
+                | u32::from(src0)
+        };
+        let vop1 = |vdst: u8, op: u8, src0: u16| -> u32 {
+            0x7E00_0000 | (u32::from(vdst) << 17) | (u32::from(op) << 9) | u32::from(src0)
+        };
+        let vop3 = |vdst: u8, op: u16, src0: u16, src1: u16, src2: u16| -> [u32; 2] {
+            [
+                0xD400_0000 | (u32::from(op) << 16) | u32::from(vdst),
+                u32::from(src0 & 0x1FF)
+                    | (u32::from(src1 & 0x1FF) << 9)
+                    | (u32::from(src2 & 0x1FF) << 18),
+            ]
+        };
+
+        // Test all newly added SOP1/SOP2 and VALU/VOP3 instructions inside a compute shader
+        // whose inputs are root constants (s0..s3) and result goes to a UAV buffer.
+        let mut body = vec![
+            sop2(6, 0x2C, 0, 1),          // s_absdiff_i32 s6, s0, s1
+            sop1(7, 0x19, 6),             // s_sext_i32_i8 s7, s6
+            sop1(6, 0x1A, 7),             // s_sext_i32_i16 s6, s7
+            sop1(7, 0x0D, 6),             // s_bcnt0_i32_b32 s7, s6
+            sop1(6, 0x11, 7),             // s_ff0_i32_b32 s6, s7
+            sop1(7, 0x0E, 0),             // s_bcnt0_i32_b64 s7, s[0:1]
+            sop1(6, 0x12, 2),             // s_ff0_i32_b64 s6, s[2:3]
+            0x7E00_0206,                  // v_mov_b32 v0, s6
+            vop1(0, 0x39, 256),           // v_ffbh_u32 v0, v0
+            vop1(1, 0x3B, 256),           // v_ffbh_i32 v1, v0
+        ];
+        body.extend(vop3(2, 0x14D, 257, 258, 259)); // v_lerp_u8 v2, v1, v2, v3
+        body.extend(vop3(3, 0x36A, 258, 259, 0));   // v_cvt_pk_u16_u32 v3, v2, v3
+        body.extend(vop3(0, 0x36B, 259, 256, 0));   // v_cvt_pk_i16_i32 v0, v3, v0
+        lowers_valu(&body).unwrap();
     }
 }

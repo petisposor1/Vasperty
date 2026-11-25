@@ -99,7 +99,38 @@ impl Cursor<'_> {
         Some(bit as u32)
     }
 
+    #[inline]
     fn bits(&mut self, n: u32) -> Option<u32> {
+        if n == 0 {
+            return Some(0);
+        }
+        // Fast path: when all `n <= 24` bits lie inside the current packet's
+        // payload (no packet header or skip jump crosses the read), extract
+        // them from up to 4 contiguous bytes at once.
+        let in_packet = self.pos % PACKET_BITS;
+        if n <= 24 && in_packet >= HEADER_BITS && PACKET_BITS - in_packet >= n as usize {
+            let at = self.pos / 8;
+            let shift = (self.pos & 7) as u32;
+            let need_bytes = (shift + n).div_ceil(8) as usize;
+            let bytes = self.data.get(at..)?;
+            if bytes.len() < need_bytes {
+                return None;
+            }
+            let mut raw = u32::from(bytes[0]) << 24;
+            if bytes.len() > 1 {
+                raw |= u32::from(bytes[1]) << 16;
+            }
+            if bytes.len() > 2 {
+                raw |= u32::from(bytes[2]) << 8;
+            }
+            if bytes.len() > 3 {
+                raw |= u32::from(bytes[3]);
+            }
+            if shift + n <= 32 {
+                self.pos += n as usize;
+                return Some((raw << shift) >> (32 - n));
+            }
+        }
         (0..n).try_fold(0, |v, _| Some(v << 1 | self.bit()?))
     }
 
@@ -660,9 +691,9 @@ impl Decoder {
                 self.ch[c].out = [0.0; FRAME_SAMPLES + FRAME_SAMPLES / 2];
             }
         }
-        for i in 0..FRAME_SAMPLES {
-            for c in 0..self.channels {
-                out.push(to_i16(self.ch[c].out[i]));
+        for sample_idx in 0..FRAME_SAMPLES {
+            for ch in self.ch.iter().take(self.channels) {
+                out.push(to_i16(ch.out[sample_idx]));
             }
         }
         for c in 0..self.channels {
@@ -674,9 +705,9 @@ impl Decoder {
     /// The overlap left after the last frame, then silence: half a frame of
     /// samples per channel.
     pub fn flush(&mut self, out: &mut Vec<i16>) {
-        for i in 0..FRAME_SAMPLES / 2 {
-            for c in 0..self.channels {
-                out.push(to_i16(self.ch[c].out[i]));
+        for sample_idx in 0..FRAME_SAMPLES / 2 {
+            for ch in self.ch.iter().take(self.channels) {
+                out.push(to_i16(ch.out[sample_idx]));
             }
         }
         self.reset();
@@ -922,9 +953,9 @@ impl Decoder {
                 if !ch.reuse_sf {
                     ch.scale_factor_step = b.read(2) as i32 + 1;
                     let mut val = 45 / ch.scale_factor_step;
-                    for band in 0..self.num_bands {
+                    for slot in ch.saved_scale_factors[target].iter_mut().take(self.num_bands) {
                         val += codes.scale.read(b);
-                        ch.saved_scale_factors[target][band] = val;
+                        *slot = val;
                     }
                 } else {
                     let mut band = 0;
@@ -964,8 +995,7 @@ impl Decoder {
         let mut offset = FRAME_SAMPLES;
         let mut subframe_len = FRAME_SAMPLES;
         let mut total_samples = FRAME_SAMPLES * self.channels;
-        for c in 0..self.channels {
-            let ch = &self.ch[c];
+        for ch in self.ch.iter().take(self.channels) {
             if offset > ch.decoded_samples {
                 offset = ch.decoded_samples;
                 subframe_len = ch.subframe_len[ch.cur_subframe.min(MAX_SUBFRAMES - 1)];
@@ -1091,7 +1121,7 @@ impl Decoder {
                 for band in 0..self.num_bands {
                     let end = sfb[band + 1].min(subframe_len);
                     let exp = ch.quant_step - (ch.max_scale_factor - sf[band]) * ch.scale_factor_step;
-                    let quant = 10f32.powf(exp as f32 / 20.0);
+                    let quant = quant_scale(exp);
                     for (t, &c) in tmp[sfb[band]..end].iter_mut().zip(&ch.coeffs[sfb[band]..end]) {
                         *t = c * quant;
                     }
@@ -1169,6 +1199,28 @@ fn window_overlap(block: &mut [f32], window: &[f32]) {
         let (wi, wj) = (window[i], window[j]);
         block[i] = s0 * wj - s1 * wi;
         block[j] = s0 * wi + s1 * wj;
+    }
+}
+
+/// Precomputed `10^(exp / 20)` scale table covering `exp in -128..=192`,
+/// matching `10f32.powf(exp as f32 / 20.0)` bit-for-bit on hot subframes.
+#[inline]
+fn quant_scale(exp: i32) -> f32 {
+    const MIN_EXP: i32 = -128;
+    const LEN: usize = 321;
+    static LUT: OnceLock<[f32; LEN]> = OnceLock::new();
+    let table = LUT.get_or_init(|| {
+        let mut arr = [0f32; LEN];
+        for (i, slot) in arr.iter_mut().enumerate() {
+            *slot = 10f32.powf((i as i32 + MIN_EXP) as f32 / 20.0);
+        }
+        arr
+    });
+    let idx = exp.wrapping_sub(MIN_EXP);
+    if idx >= 0 && (idx as usize) < LEN {
+        table[idx as usize]
+    } else {
+        10f32.powf(exp as f32 / 20.0)
     }
 }
 
@@ -1823,5 +1875,52 @@ mod tests {
             );
             assert!(errors == 0 && snr > 40.0);
         }
+    }
+
+    #[test]
+    fn quant_scale_lut_matches_powf_bit_for_bit() {
+        for exp in -160..=220 {
+            let got = quant_scale(exp);
+            let want = 10f32.powf(exp as f32 / 20.0);
+            assert_eq!(got.to_bits(), want.to_bits(), "exp={exp}");
+        }
+    }
+
+    #[test]
+    fn cursor_bits_fast_path_matches_bit_by_bit_across_packets() {
+        let mut data = vec![0u8; PACKET_BYTES * 3];
+        // Packet 0 header: skip 1 packet to packet 2.
+        put_bits(&mut data, 0, 32, (1 << 26) | 1);
+        put_bits(&mut data, PACKET_BITS * 2, 32, 1 << 26);
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        for b in &mut data[4..PACKET_BYTES] {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *b = s as u8;
+        }
+        for b in &mut data[PACKET_BITS * 2 / 8 + 4..] {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            *b = s as u8;
+        }
+        for width in [1u32, 3, 7, 8, 12, 15, 19, 24] {
+            let mut fast = Cursor { data: &data, pos: HEADER_BITS };
+            let mut slow = Cursor { data: &data, pos: HEADER_BITS };
+            for step in 0..300 {
+                let got = fast.bits(width);
+                let want = (0..width).try_fold(0u32, |v, _| Some(v << 1 | slow.bit()?));
+                assert_eq!(got, want, "width={width} step={step}");
+                assert_eq!(fast.pos, slow.pos, "pos mismatch width={width} step={step}");
+                if got.is_none() {
+                    break;
+                }
+            }
+        }
+        // Truncated short slice inside fast-path payload must return None cleanly.
+        let tiny = vec![0xAAu8; 6];
+        let mut c = Cursor { data: &tiny, pos: HEADER_BITS + 4 };
+        assert_eq!(c.bits(20), None);
     }
 }
