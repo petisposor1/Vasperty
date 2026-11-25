@@ -117,6 +117,7 @@ function Run-Check {
     Invoke-OdinCheck (Join-Path $OdinRoot "game") "vasperty:game" -NoEntry
     Invoke-OdinCheck (Join-Path $OdinRoot "formats") "vasperty:formats" -NoEntry
     Invoke-OdinCheck (Join-Path $OdinRoot "pipeline") "vasperty:pipeline" -NoEntry
+    Invoke-OdinCheck (Join-Path $OdinRoot "loader") "vasperty:loader" -NoEntry
     Invoke-OdinCheck (Join-Path $OdinRoot "cli") "vasperty:cli"
     Invoke-OdinCheck (Join-Path $OdinRoot "tests") "vasperty:tests"
 }

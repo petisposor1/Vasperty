@@ -8,11 +8,12 @@ import "core:time"
 import vasperty_core "vasperty:core"
 import vasperty_formats "vasperty:formats"
 import vasperty_game "vasperty:game"
+import vasperty_loader "vasperty:loader"
 import vasperty_pe "vasperty:pe"
 import vasperty_pipeline "vasperty:pipeline"
 
 usage :: proc() {
-	fmt.println("Vasperty Native Odin CLI (Phase 2)")
+	fmt.println("Vasperty Native Odin CLI (Phase 3)")
 	fmt.println("Usage:")
 	fmt.println("  vasperty.exe status")
 	fmt.println("  vasperty.exe doctor")
@@ -22,8 +23,8 @@ usage :: proc() {
 
 cmd_status :: proc() -> int {
 	cores := os.get_processor_core_count()
-	fmt.printf("vasperty-odin: Phase 2 packages online (cores=%d)\n", cores)
-	fmt.println("  packages: vasperty:core, vasperty:pe, vasperty:game (100%), vasperty:formats (100%), vasperty:pipeline")
+	fmt.printf("vasperty-odin: Phase 3 packages online (cores=%d)\n", cores)
+	fmt.println("  packages: vasperty:core, vasperty:pe, vasperty:game (100%), vasperty:formats (100%), vasperty:pipeline, vasperty:loader")
 	fmt.println("  baseline: Marvisak/VIctory upstream 13f91ca (GTA VI prologue)")
 	return 0
 }
@@ -95,6 +96,12 @@ cmd_inspect :: proc(path: string) -> int {
 	fmt.printf("Imports         : %d modules, %d symbols\n", len(info.imports), vasperty_pe.import_count(&info))
 	fmt.printf("TLS callbacks   : %d\n", len(info.tls.callback_rvas) if info.has_tls else 0)
 	fmt.printf("Reloc/Exc/LCfg  : %v / %v / %v\n", info.has_relocations, info.has_exception_table, info.has_load_config)
+	if prep, p_err := vasperty_loader.prepare_image(raw); p_err == .None {
+		defer vasperty_loader.destroy_prepared_image(&prep)
+		fname := vasperty_loader.prepared_file_name(&prep)
+		defer delete(fname)
+		fmt.printf("Prepared DLL    : %s (%d bytes)\n", fname, len(prep.bytes))
+	}
 	return 0
 }
 

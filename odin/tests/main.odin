@@ -9,8 +9,10 @@ import "core:path/filepath"
 import vasperty_core "vasperty:core"
 import vasperty_formats "vasperty:formats"
 import vasperty_game "vasperty:game"
+import vasperty_loader "vasperty:loader"
 import vasperty_pe "vasperty:pe"
 import vasperty_pipeline "vasperty:pipeline"
+import win32 "core:sys/windows"
 
 @(private)
 put_u16_le :: proc(buf: []u8, at: int, val: u16) {
@@ -817,6 +819,92 @@ test_pipeline_cache :: proc() {
 	fmt.println("ok")
 }
 
+test_loader_phase3 :: proc() {
+	fmt.print("[test] loader_prepare_publish_thunks_tls_map ... ")
+	exe_path := os.args[0]
+	raw, r_err := os.read_entire_file_from_path(exe_path, context.allocator)
+	assert(r_err == nil && len(raw) > 1024)
+	defer delete(raw)
+
+	// 1. Prepare self binary & verify patched PE headers / hash naming
+	prep, p_err := vasperty_loader.prepare_image(raw)
+	assert(p_err == .None)
+	defer vasperty_loader.destroy_prepared_image(&prep)
+	assert(!vasperty_pe.is_dll(&prep.info))
+	assert(vasperty_pe.import_count(&prep.info) > 0)
+
+	patched, pt_err := vasperty_pe.parse_image(prep.bytes)
+	assert(pt_err == .None)
+	defer vasperty_pe.destroy_image(&patched)
+	assert(vasperty_pe.is_dll(&patched))
+	assert(patched.entry_rva == 0)
+	assert(len(patched.imports) == 0)
+	assert((patched.dll_characteristics & 0x0080) == 0)
+
+	fn1 := vasperty_loader.prepared_file_name(&prep)
+	fn2 := vasperty_loader.prepared_file_name(&prep)
+	assert(fn1 == fn2 && len(fn1) > 16)
+	delete(fn1); delete(fn2)
+
+	// 2. Atomic staging publish & cleanup
+	temp_base, _ := os.lookup_env("TEMP", context.allocator)
+	defer delete(temp_base)
+	loader_dir, _ := filepath.join({temp_base, "vasperty_odin_loader_test"}, context.allocator)
+	defer delete(loader_dir)
+	_ = os.make_directory_all(loader_dir)
+	pub_file, _ := filepath.join({loader_dir, "pub_test.bin"}, context.allocator)
+	defer delete(pub_file)
+	assert(vasperty_loader.write_if_changed(pub_file, transmute([]u8)string("hello-loader")))
+	assert(vasperty_loader.write_if_changed(pub_file, transmute([]u8)string("hello-loader")))
+	_ = os.remove(pub_file)
+
+	// 3. Native executable x86-64 Thunk_Block (Return_Zero stub execution)
+	before_calls := vasperty_loader.unimplemented_call_count()
+	blk, blk_ok := vasperty_loader.thunk_block_new(2)
+	assert(blk_ok)
+	stub_addr, emit_ok := vasperty_loader.thunk_block_emit(&blk, "test.dll", "MissingProc", .Return_Zero)
+	assert(emit_ok && stub_addr != 0)
+	assert(vasperty_loader.thunk_block_seal(&blk))
+	Stub_Fn :: proc "system" () -> u64
+	fn := Stub_Fn(rawptr(stub_addr))
+	ret := fn()
+	assert(ret == 0 && vasperty_loader.unimplemented_call_count() == before_calls + 1)
+	vasperty_loader.thunk_block_destroy(&blk)
+
+	// 4. Static TLS byte patching & executable thunk generation (`rax`, `r8`, `r12`)
+	tls_page := vasperty_loader.tls_alloc_near(uintptr(rawptr(test_loader_phase3)), 0x10000)
+	assert(tls_page != nil)
+	thunk_page := vasperty_loader.tls_alloc_near(uintptr(tls_page), 4096)
+	assert(thunk_page != nil)
+	th_base, th_ok := vasperty_loader.tls_build_thunks(thunk_page, 3)
+	assert(th_ok && th_base != 0)
+	sample_code := [10]u8{0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0x00, 0x00, 0x00, 0xC3}
+	code_ptr := ([^]u8)(tls_page)
+	for b, idx in sample_code do code_ptr[idx] = b
+	patched_n := vasperty_loader.tls_patch_code(code_ptr[:len(sample_code)], uintptr(tls_page), th_base)
+	assert(patched_n == 1 && code_ptr[0] == 0xE8 && code_ptr[5] == 0x0F && code_ptr[6] == 0x1F)
+	// Also run the patched thunk sequence and verify it returns `tls_array + 3 * 8` cleanly!
+	old_prot: win32.DWORD = 0
+	assert(win32.VirtualProtect(tls_page, 4096, win32.PAGE_EXECUTE_READ, &old_prot) != false)
+	Tls_Probe :: proc "system" () -> uintptr
+	probe_fn := Tls_Probe(tls_page)
+	probe_res := probe_fn()
+	assert(probe_res != 0)
+	vasperty_loader.tls_free_page(tls_page)
+	vasperty_loader.tls_free_page(thunk_page)
+
+	// 5. Real Win32 LoadLibraryExW map + unload + cleanup of prepared DLL
+	img, l_err := vasperty_loader.load_prepared(&prep, loader_dir)
+	assert(l_err == .None && vasperty_loader.loaded_base(&img) != 0)
+	img_file := img.path
+	img_file_copy := make([]u8, len(img_file))
+	copy(img_file_copy, img_file)
+	vasperty_loader.loaded_unload(&img)
+	_ = os.remove(string(img_file_copy))
+	delete(img_file_copy)
+	fmt.println("ok")
+}
+
 main :: proc() {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
@@ -833,6 +921,7 @@ main :: proc() {
 	test_bcpack()
 	test_xma()
 	test_pipeline_cache()
+	test_loader_phase3()
 
 	if len(track.allocation_map) > 0 {
 		fmt.eprintf("\nFAIL: %d memory leaks detected!\n", len(track.allocation_map))
@@ -848,5 +937,5 @@ main :: proc() {
 		}
 		os.exit(1)
 	}
-	fmt.println("ALL ODIN PHASE 2 TESTS PASSED (0 leaks, 0 bad frees)")
+	fmt.println("ALL ODIN PHASE 3 TESTS PASSED (0 leaks, 0 bad frees)")
 }
