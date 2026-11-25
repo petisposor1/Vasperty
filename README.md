@@ -1,12 +1,32 @@
-# VIctory
+# Vasperty
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
+> **About this fork.** **Vasperty** is an independent, precision-focused,
+> high-performance fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory).
+> We continuously track and pull upstream improvements from VIctory while
+> refining hardware accuracy, frame pacing, GPU/CPU throughput, and platform
+> completeness with tighter engineering focus and automated verification.
+> Upstream credit and the `GPL-3.0-or-later` license are fully preserved.
+
+The title's x86-64 code runs unchanged inside our process; Vasperty supplies
 the platform underneath it and converts the title's data, ahead of time where
 it can (shaders and pipelines too, see Getting started) and on first use
 otherwise. See [docs/architecture.md](docs/architecture.md).
+
+## Key Enhancements in Vasperty
+
+| Area | Improvement |
+|------|-------------|
+| Depth Bounds Testing | Preserves `D3D12_DEPTH_STENCIL_DESC1` (`DepthBoundsTestEnable`) in graphics & mesh PSO streams and routes `OMSetDepthBounds` with host capability probing |
+| Hardware GPU Queries & Predication | Backs query heaps with real host `ID3D12QueryHeap` objects (`OCCLUSION`, `BINARY_OCCLUSION`, `TIMESTAMP`, `PIPELINE_STATISTICS`, `SO_STATISTICS`), resolves readbacks into title + shadow buffers, and implements `SetPredication` |
+| HDR Swap Chains, Tearing & 120 Hz | Negotiates `IDXGISwapChain3` color spaces (`HDR10` PQ/Rec.2020 and `scRGB` linear HDR; disable with `VICTORY_HDR=0`), `DXGI_FEATURE_PRESENT_ALLOW_TEARING` (toggle vsync with `VICTORY_VSYNC=1`), and enumerates 60 Hz, 120 Hz, and host-native display modes |
+| Indirect Mesh & Console Topologies | Unlocks `DispatchMeshX` indirect execution via GPU-clamped `ExecuteIndirect`, and expands `QUADS`, `QUAD_STRIP`, `TRIANGLE_FAN`, and `LINE_LOOP` (non-indexed and 16/32-bit indexed with primitive-restart cut handling) |
+| High-Resolution Frame Pacing | Uses Windows high-resolution waitable timers with sub-millisecond spin-wait precision and honors per-event `schedule` phase offsets |
+| Shadow Copy-Back & Pipeline Workers | Accelerates GPU-to-title copy-back with thread-local scratch reuse, 8-byte word-wide diff/merge, and scoped multi-threaded copy-back across independent buffers; adds `VICTORY_PIPELINE_WORKERS` and `VICTORY_PIPELINE_BUDGET_MS` tuning |
+| GameInput Triggers & Battery | Advertises 4-motor rumble, blends left/right impulse trigger vibration proportionally into high-frequency rumble (`VICTORY_TRIGGER_RUMBLE_BLEND=0` to disable), and implements `GetBatteryState` via `XInputGetBatteryInformation` |
+| Real-Time Audio DSP Reverb | Replaces silent convolution output in `chad.dll` with a zero-allocation 4-line Hadamard Feedback Delay Network (FDN) stereo reverb with low-pass damping (`VICTORY_DSP_REVERB=0` to disable) |
 
 ## Status (2026-11-24)
 
