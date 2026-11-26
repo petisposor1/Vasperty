@@ -308,13 +308,186 @@ app_census :: proc(paths: []string, strict := false, show_missing := false) -> i
 }
 
 Translate_Tally :: struct {
-	xdat:       int,
-	accc:       int,
-	dxil:       int,
-	containers: int,
-	translated: int,
-	validated:  int,
-	failed:     int,
+	xdat:            int,
+	accc:            int,
+	dxil:            int,
+	sgd5_records:    int,
+	containers:      int,
+	translated:      int,
+	validated:       int,
+	failed:          int,
+	stage_vs:        int,
+	stage_ps:        int,
+	stage_cs:        int,
+	stage_ms:        int,
+	stage_other:     int,
+	err_unpack:      int,
+	err_not_dxbc:    int,
+	err_malformed:   int,
+	err_isa:         int,
+	err_unsupported: int,
+}
+
+@(private)
+tally_record_stage :: proc(t: ^Translate_Tally, st: vasperty_shader.Hw_Stage) {
+	#partial switch st {
+	case .Vs: t.stage_vs += 1
+	case .Ps: t.stage_ps += 1
+	case .Cs: t.stage_cs += 1
+	case .Ms: t.stage_ms += 1
+	case:     t.stage_other += 1
+	}
+}
+
+@(private)
+tally_record_err :: proc(t: ^Translate_Tally, err: vasperty_shader.Shader_Error) {
+	#partial switch err {
+	case .Not_Dxbc:    t.err_not_dxbc += 1
+	case .Malformed:   t.err_malformed += 1
+	case .Isa_Error:   t.err_isa += 1
+	case .Unsupported: t.err_unsupported += 1
+	}
+}
+
+@(private)
+tally_merge :: proc(dst: ^Translate_Tally, src: ^Translate_Tally) {
+	dst.xdat += src.xdat
+	dst.accc += src.accc
+	dst.dxil += src.dxil
+	dst.sgd5_records += src.sgd5_records
+	dst.containers += src.containers
+	dst.translated += src.translated
+	dst.validated += src.validated
+	dst.failed += src.failed
+	dst.stage_vs += src.stage_vs
+	dst.stage_ps += src.stage_ps
+	dst.stage_cs += src.stage_cs
+	dst.stage_ms += src.stage_ms
+	dst.stage_other += src.stage_other
+	dst.err_unpack += src.err_unpack
+	dst.err_not_dxbc += src.err_not_dxbc
+	dst.err_malformed += src.err_malformed
+	dst.err_isa += src.err_isa
+	dst.err_unsupported += src.err_unsupported
+}
+
+@(private)
+Sgd5_Stream_State :: struct {
+	recs:      []vasperty_game.Sgd5_Record,
+	validate:  bool,
+	wave_mode: vasperty_shader.Target_Wave_Mode,
+	next_idx:  int,
+	mu:        sync.Mutex,
+	tally:     Translate_Tally,
+}
+
+@(private)
+sgd5_stream_worker_proc :: proc(t: ^thread.Thread) {
+	st := cast(^Sgd5_Stream_State)t.data
+	local: Translate_Tally
+	for {
+		idx := sync.atomic_add(&st.next_idx, 1)
+		if idx >= len(st.recs) {
+			break
+		}
+		rec := st.recs[idx]
+		local.sgd5_records += 1
+		unpacked, ok := vasperty_game.sgd5_record_unpack(&rec, context.allocator)
+		if !ok || len(unpacked) == 0 {
+			if len(unpacked) > 0 { delete(unpacked) }
+			local.failed += 1
+			local.err_unpack += 1
+			continue
+		}
+		local.containers += 1
+		hs, terr := vasperty_shader.translate_with(
+			unpacked,
+			vasperty_shader.Shader_Options{wave_mode = st.wave_mode},
+		)
+		delete(unpacked)
+		if terr != .None {
+			local.failed += 1
+			tally_record_err(&local, terr)
+			continue
+		}
+		local.translated += 1
+		tally_record_stage(&local, hs.stage)
+		if st.validate {
+			vok, vmsg, _ := vasperty_shader.validate_dxil(hs.dxil[:])
+			if vmsg != "" { delete(vmsg) }
+			if vok { local.validated += 1 }
+		}
+		vasperty_shader.destroy_host_shader(&hs)
+	}
+	sync.mutex_lock(&st.mu)
+	tally_merge(&st.tally, &local)
+	sync.mutex_unlock(&st.mu)
+}
+
+@(private)
+app_translate_sgd5_stream :: proc(data: []u8, validate: bool, tally: ^Translate_Tally, wave_mode: vasperty_shader.Target_Wave_Mode, jobs: int, limit: int) {
+	recs := vasperty_game.sgd5_records(data)
+	defer delete(recs)
+	if len(recs) == 0 {
+		return
+	}
+	slice_len := len(recs)
+	if limit > 0 && limit < slice_len {
+		slice_len = limit
+	}
+	work := recs[:slice_len]
+	n_workers := min(max(jobs, 1), len(work))
+	st := Sgd5_Stream_State{
+		recs      = work,
+		validate  = validate,
+		wave_mode = wave_mode,
+	}
+	if n_workers <= 1 {
+		for i := 0; i < len(work); i += 1 {
+			rec := work[i]
+			st.tally.sgd5_records += 1
+			unpacked, ok := vasperty_game.sgd5_record_unpack(&rec, context.allocator)
+			if !ok || len(unpacked) == 0 {
+				if len(unpacked) > 0 { delete(unpacked) }
+				st.tally.failed += 1
+				st.tally.err_unpack += 1
+				continue
+			}
+			st.tally.containers += 1
+			hs, terr := vasperty_shader.translate_with(unpacked, vasperty_shader.Shader_Options{wave_mode = wave_mode})
+			delete(unpacked)
+			if terr != .None {
+				st.tally.failed += 1
+				tally_record_err(&st.tally, terr)
+				continue
+			}
+			st.tally.translated += 1
+			tally_record_stage(&st.tally, hs.stage)
+			if validate {
+				vok, vmsg, _ := vasperty_shader.validate_dxil(hs.dxil[:])
+				if vmsg != "" { delete(vmsg) }
+				if vok { st.tally.validated += 1 }
+			}
+			vasperty_shader.destroy_host_shader(&hs)
+		}
+		tally_merge(tally, &st.tally)
+		return
+	}
+	threads := make([dynamic]^thread.Thread, 0, n_workers)
+	defer delete(threads)
+	for _ in 0 ..< n_workers {
+		th := thread.create(sgd5_stream_worker_proc)
+		if th != nil {
+			th.data = &st
+			thread.start(th)
+			append(&threads, th)
+		}
+	}
+	for th in threads {
+		thread.join(th)
+		thread.destroy(th)
+	}
+	tally_merge(tally, &st.tally)
 }
 
 @(private)
@@ -348,9 +521,11 @@ translate_worker_proc :: proc(t: ^thread.Thread) {
 		)
 		if terr != .None {
 			local.failed += 1
+			tally_record_err(&local, terr)
 			continue
 		}
 		local.translated += 1
+		tally_record_stage(&local, hs.stage)
 		if st.validate {
 			vok, vmsg, _ := vasperty_shader.validate_dxil(hs.dxil[:])
 			if vmsg != "" { delete(vmsg) }
@@ -359,13 +534,7 @@ translate_worker_proc :: proc(t: ^thread.Thread) {
 		vasperty_shader.destroy_host_shader(&hs)
 	}
 	sync.mutex_lock(&st.mu)
-	st.tally.xdat += local.xdat
-	st.tally.accc += local.accc
-	st.tally.dxil += local.dxil
-	st.tally.containers += local.containers
-	st.tally.translated += local.translated
-	st.tally.validated += local.validated
-	st.tally.failed += local.failed
+	tally_merge(&st.tally, &local)
 	sync.mutex_unlock(&st.mu)
 }
 
@@ -442,16 +611,16 @@ app_translate_blob :: proc(blob: []u8, validate: bool, tally: ^Translate_Tally, 
 		thread.join(t)
 		thread.destroy(t)
 	}
-	tally.xdat += st.tally.xdat
-	tally.accc += st.tally.accc
-	tally.dxil += st.tally.dxil
-	tally.containers += st.tally.containers
-	tally.translated += st.tally.translated
-	tally.validated += st.tally.validated
-	tally.failed += st.tally.failed
+	tally_merge(tally, &st.tally)
 }
 
-app_translate :: proc(paths: []string, validate := false, wave_mode := vasperty_shader.Target_Wave_Mode.Auto, jobs := 0) -> (Translate_Tally, int) {
+app_translate :: proc(
+	paths: []string,
+	validate := false,
+	wave_mode := vasperty_shader.Target_Wave_Mode.Auto,
+	jobs := 0,
+	limit := 0,
+) -> (Translate_Tally, int) {
 	workers := jobs
 	if workers <= 0 {
 		workers = min(max(os.get_processor_core_count(), 1), 8)
@@ -459,24 +628,34 @@ app_translate :: proc(paths: []string, validate := false, wave_mode := vasperty_
 	t0 := time.tick_now()
 	tally: Translate_Tally
 	for p in paths {
-		if os.is_file(p) {
-			raw, rerr := os.read_entire_file_from_path(p, context.allocator)
-			if rerr == nil {
-				app_translate_blob(raw, validate, &tally, wave_mode, workers)
-				delete(raw)
+		if mf, mok := vasperty_game.map_file_readonly(p); mok {
+			defer vasperty_game.unmap_file_readonly(&mf)
+			if vasperty_game.is_rpf9(mf.data) || vasperty_game.is_sgd5(mf.data) {
+				app_translate_sgd5_stream(mf.data, validate, &tally, wave_mode, workers, limit)
+			} else {
+				app_translate_blob(mf.data, validate, &tally, wave_mode, workers)
 			}
+		} else {
+			fmt.eprintf("translate: cannot map '%s'\n", p)
 		}
 	}
 	el_ms := time.duration_milliseconds(time.tick_since(t0))
 	rate := f64(tally.translated) / max(el_ms / 1000.0, 0.0001)
 	fmt.printf(
-		"translate: wave=%v workers=%d embedded(xdat=%d accc=%d dxil=%d) time=%.1fms (%.0f shaders/s)\n",
-		wave_mode, workers, tally.xdat, tally.accc, tally.dxil, el_ms, rate,
+		"translate: wave=%v workers=%d sgd5=%d embedded(xdat=%d accc=%d dxil=%d) time=%.1fms (%.0f shaders/s)\n",
+		wave_mode, workers, tally.sgd5_records, tally.xdat, tally.accc, tally.dxil, el_ms, rate,
 	)
 	fmt.printf(
-		"translate: %d containers -> %d translated, %d validated, %d failed/unsupported\n",
-		tally.containers, tally.translated, tally.validated, tally.failed,
+		"translate: %d containers -> %d translated (VS=%d PS=%d CS=%d MS=%d), %d validated, %d failed\n",
+		tally.containers, tally.translated, tally.stage_vs, tally.stage_ps, tally.stage_cs, tally.stage_ms,
+		tally.validated, tally.failed,
 	)
+	if tally.failed > 0 {
+		fmt.printf(
+			"  failures: unpack=%d not_dxbc=%d malformed=%d isa=%d unsupported=%d\n",
+			tally.err_unpack, tally.err_not_dxbc, tally.err_malformed, tally.err_isa, tally.err_unsupported,
+		)
+	}
 	return tally, 0
 }
 

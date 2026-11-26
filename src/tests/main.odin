@@ -1483,6 +1483,11 @@ test_vendor_and_ring :: proc() {
 		vasperty_gpu.host_executor_drain(&ex)
 		assert(ex.frames_submitted == 6)
 	}
+
+	// Zero-copy shared-read MapViewOfFile roundtrip on self executable
+	mf, mf_ok := vasperty_game.map_file_readonly(os.args[0])
+	assert(mf_ok && len(mf.data) > 1024 && mf.data[0] == 'M' && mf.data[1] == 'Z')
+	vasperty_game.unmap_file_readonly(&mf)
 	fmt.println("ok")
 }
 

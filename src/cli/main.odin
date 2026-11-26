@@ -15,7 +15,7 @@ usage :: proc() {
 	fmt.println("  vasperty.exe doctor [--prune-cache]")
 	fmt.println("  vasperty.exe inspect <pe-path> [--imports] [--exports]")
 	fmt.println("  vasperty.exe census <paths...> [--strict] [--missing]")
-	fmt.println("  vasperty.exe translate <paths...> [--validate] [--wave16|--wave32|--wave64] [--jobs N]")
+	fmt.println("  vasperty.exe translate <paths...> [--validate] [--wave16|--wave32|--wave64] [--jobs N] [--limit N]")
 	fmt.println("  vasperty.exe probe <archives...> [--scan]")
 	fmt.println("  vasperty.exe run <exe> [--strict] [--zero] [--execute] [--series-s]")
 	fmt.println("  vasperty.exe bench [seconds]")
@@ -75,6 +75,7 @@ main :: proc() {
 		validate := false
 		wave := vasperty_shader.Target_Wave_Mode.Auto
 		jobs := 0
+		limit := 0
 		paths := make([dynamic]string, 0, len(rest), context.temp_allocator)
 		for i := 0; i < len(rest); i += 1 {
 			a := rest[i]
@@ -94,13 +95,25 @@ main :: proc() {
 					os.exit(2)
 				}
 				jobs = v
+			} else if a == "--limit" {
+				if i + 1 >= len(rest) {
+					fmt.eprintln("translate: --limit requires a positive integer")
+					os.exit(2)
+				}
+				i += 1
+				v, ok := strconv.parse_int(rest[i])
+				if !ok || v <= 0 {
+					fmt.eprintln("translate: --limit must be >= 1")
+					os.exit(2)
+				}
+				limit = v
 			} else { append(&paths, a) }
 		}
 		if len(paths) == 0 {
 			fmt.eprintln("translate requires at least one path")
 			os.exit(2)
 		}
-		_, code := vasperty_app.app_translate(paths[:], validate, wave, jobs)
+		_, code := vasperty_app.app_translate(paths[:], validate, wave, jobs, limit)
 		os.exit(code)
 
 	case "probe":

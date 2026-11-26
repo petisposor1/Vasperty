@@ -1,10 +1,64 @@
 package vasperty_game
 
+import "core:slice"
 import win32 "core:sys/windows"
 
-// RPF9 (`9FPR`) streaming archive header reader and low-RAM windowed chunk scanner.
-// Scans multi-GB RPF9 archives in 4 MiB shared-read slices (Intel UMA friendly) to
-// locate embedded SGD5 shader databases and DXBC containers without extracting to disk.
+// RPF9 (`9FPR`) streaming archive header reader, zero-copy shared-read memory mapper,
+// and low-RAM windowed chunk scanner (Intel UMA friendly).
+
+Mapped_File :: struct {
+	file_handle: win32.HANDLE,
+	map_handle:  win32.HANDLE,
+	view:        rawptr,
+	data:        []u8,
+}
+
+map_file_readonly :: proc(path: string) -> (mf: Mapped_File, ok: bool) {
+	wpath := win32.utf8_to_wstring(path, context.temp_allocator)
+	share := win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE | win32.FILE_SHARE_DELETE
+	h := win32.CreateFileW(wpath, win32.GENERIC_READ, share, nil, win32.OPEN_EXISTING, win32.FILE_ATTRIBUTE_NORMAL, nil)
+	if h == win32.INVALID_HANDLE_VALUE {
+		return {}, false
+	}
+	fsize: win32.LARGE_INTEGER
+	if !win32.GetFileSizeEx(h, &fsize) || fsize <= 0 {
+		win32.CloseHandle(h)
+		return {}, false
+	}
+	mh := win32.CreateFileMappingW(h, nil, win32.PAGE_READONLY, 0, 0, nil)
+	if mh == nil {
+		win32.CloseHandle(h)
+		return {}, false
+	}
+	view := win32.MapViewOfFile(mh, win32.FILE_MAP_READ, 0, 0, 0)
+	if view == nil {
+		win32.CloseHandle(mh)
+		win32.CloseHandle(h)
+		return {}, false
+	}
+	return Mapped_File{
+		file_handle = h,
+		map_handle  = mh,
+		view        = view,
+		data        = slice.bytes_from_ptr(view, int(fsize)),
+	}, true
+}
+
+unmap_file_readonly :: proc(mf: ^Mapped_File) {
+	if mf == nil {
+		return
+	}
+	if mf.view != nil {
+		_ = win32.UnmapViewOfFile(mf.view)
+	}
+	if mf.map_handle != nil {
+		_ = win32.CloseHandle(mf.map_handle)
+	}
+	if mf.file_handle != nil && mf.file_handle != win32.INVALID_HANDLE_VALUE {
+		_ = win32.CloseHandle(mf.file_handle)
+	}
+	mf^ = {}
+}
 
 RPF9_MAGIC :: [4]u8{'9', 'F', 'P', 'R'}
 
