@@ -1488,6 +1488,34 @@ test_vendor_and_ring :: proc() {
 	mf, mf_ok := vasperty_game.map_file_readonly(os.args[0])
 	assert(mf_ok && len(mf.data) > 1024 && mf.data[0] == 'M' && mf.data[1] == 'Z')
 	vasperty_game.unmap_file_readonly(&mf)
+
+	// Mesh Shader -> Compute + Pass-Through VS Fallback for Intel Integrated / GTX GPUs
+	mio := vasperty_shader.Mesh_Io{
+		max_vertices   = 64,
+		max_primitives = 126,
+		topology       = 3, // triangles
+		threads        = 32,
+		lds_bytes      = 4096,
+	}
+	mplan := vasperty_shader.mesh_fallback_plan(&mio, .Wave16)
+	assert(mplan.target_wave_size == 16 && mplan.indices_per_prim == 3 && mplan.total_scratch_bytes > 0)
+	msr := vasperty_gpu.mesh_scratch_ring_init(2, true)
+	defer vasperty_gpu.mesh_scratch_ring_destroy(&msr)
+	ma0, mok0 := vasperty_gpu.mesh_scratch_alloc(&msr, 0, &mplan)
+	ma1, mok1 := vasperty_gpu.mesh_scratch_alloc(&msr, 0, &mplan)
+	assert(mok0 && mok1 && ma1.vertex_offset == ma0.vertex_offset + ma0.total_bytes)
+	vasperty_gpu.mesh_scratch_reset_slot(&msr, 0)
+	ma2, mok2 := vasperty_gpu.mesh_scratch_alloc(&msr, 0, &mplan)
+	assert(mok2 && ma2.vertex_offset == ma0.vertex_offset)
+
+	pt_vs := vasperty_shader.emit_mesh_passthrough_vs(2, .Wave16)
+	defer vasperty_shader.destroy_host_shader(&pt_vs)
+	assert(pt_vs.stage == .Vs && pt_vs.target_wave_size == 16 && len(pt_vs.dxil) > 64)
+	pt_c, pt_err := vasperty_shader.dxbc_parse(pt_vs.dxil[:])
+	assert(pt_err == .None)
+	_, has_pt_dxil := vasperty_shader.dxbc_part(&pt_c, vasperty_shader.FOURCC_DXIL)
+	assert(has_pt_dxil && vasperty_shader.dxbc_hash(pt_vs.dxil[20:]) == pt_c.hash)
+	vasperty_shader.destroy_container(&pt_c)
 	fmt.println("ok")
 }
 

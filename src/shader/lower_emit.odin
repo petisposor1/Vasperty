@@ -2,8 +2,10 @@ package vasperty_shader
 
 import "core:fmt"
 import "core:math"
+import "core:os"
 import "core:slice"
 import "core:strings"
+import "core:sync"
 import win32 "core:sys/windows"
 
 USER_DATA_SPACE :: u32(0)
@@ -170,18 +172,48 @@ G_BLOB_VTBL := [5]rawptr{
 	rawptr(blob_get_size),
 }
 
+@(private)
+g_dxil_mu: sync.Mutex
+@(private)
+g_dxil_probed: bool
+@(private)
+g_dxil_create: Dxc_Create_Instance_Proc
+
+@(private)
+resolve_dxil_create :: proc() -> Dxc_Create_Instance_Proc {
+	sync.mutex_lock(&g_dxil_mu)
+	defer sync.mutex_unlock(&g_dxil_mu)
+	if g_dxil_probed {
+		return g_dxil_create
+	}
+	g_dxil_probed = true
+
+	candidates := make([dynamic]string, 0, 4, context.temp_allocator)
+	if env_p, ok := os.lookup_env("VASPERTY_DXIL_DLL", context.temp_allocator); ok && len(env_p) > 0 {
+		append(&candidates, env_p)
+	}
+	append(&candidates, "dxil.dll")
+	append(&candidates, "C:\\Windows\\System32\\Microsoft-Edge-WebView\\dxil.dll")
+
+	for path in candidates {
+		w := win32.utf8_to_wstring(path, context.temp_allocator)
+		mod := win32.LoadLibraryW(w)
+		if mod != nil {
+			if sym := win32.GetProcAddress(mod, "DxcCreateInstance"); sym != nil {
+				g_dxil_create = cast(Dxc_Create_Instance_Proc)sym
+				return g_dxil_create
+			}
+			win32.FreeLibrary(mod)
+		}
+	}
+	return nil
+}
+
 validate_dxil :: proc(container: []u8) -> (valid: bool, message: string, err: Shader_Error) {
-	dll_name := win32.utf8_to_wstring("dxil.dll", context.temp_allocator)
-	mod := win32.LoadLibraryW(dll_name)
-	if mod == nil {
+	create_fn := resolve_dxil_create()
+	if create_fn == nil {
 		return false, "", .Unsupported
 	}
-	defer win32.FreeLibrary(mod)
-	sym := win32.GetProcAddress(mod, "DxcCreateInstance")
-	if sym == nil {
-		return false, "", .Unsupported
-	}
-	create_fn := cast(Dxc_Create_Instance_Proc)sym
 	validator: rawptr
 	hr := create_fn(&CLSID_DxcValidator, &IID_IDxcValidator, &validator)
 	if hr < 0 || validator == nil {

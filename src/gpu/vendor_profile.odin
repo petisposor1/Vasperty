@@ -384,3 +384,62 @@ gpu_runtime_wave_mode :: proc() -> vasperty_shader.Target_Wave_Mode {
 	}
 	return .Auto
 }
+
+// =========================================================================
+// Mesh Shader Fallback Scratch Ring (Intel Integrated / Non-Mesh GPUs)
+// =========================================================================
+
+Mesh_Scratch_Alloc :: struct {
+	vertex_offset:   u64,
+	index_offset:    u64,
+	indirect_offset: u64,
+	total_bytes:     u64,
+}
+
+Mesh_Scratch_Ring :: struct {
+	slot_capacity: u64,
+	slot_cursors:  [dynamic]u64,
+}
+
+mesh_scratch_ring_init :: proc(in_flight: int, is_uma: bool, allocator := context.allocator) -> Mesh_Scratch_Ring {
+	n := max(in_flight, 1)
+	cap := u64(16 << 20) if is_uma else u64(64 << 20)
+	return Mesh_Scratch_Ring{
+		slot_capacity = cap,
+		slot_cursors  = make([dynamic]u64, n, allocator),
+	}
+}
+
+mesh_scratch_ring_destroy :: proc(r: ^Mesh_Scratch_Ring) {
+	if r == nil {
+		return
+	}
+	delete(r.slot_cursors)
+	r^ = {}
+}
+
+mesh_scratch_reset_slot :: proc(r: ^Mesh_Scratch_Ring, slot_idx: int) {
+	if r == nil || slot_idx < 0 || slot_idx >= len(r.slot_cursors) {
+		return
+	}
+	r.slot_cursors[slot_idx] = 0
+}
+
+mesh_scratch_alloc :: proc(r: ^Mesh_Scratch_Ring, slot_idx: int, plan: ^vasperty_shader.Mesh_Fallback_Plan) -> (Mesh_Scratch_Alloc, bool) {
+	if r == nil || plan == nil || slot_idx < 0 || slot_idx >= len(r.slot_cursors) {
+		return {}, false
+	}
+	need := u64(plan.total_scratch_bytes)
+	cur := r.slot_cursors[slot_idx]
+	if cur + need > r.slot_capacity {
+		return {}, false
+	}
+	base := u64(slot_idx) * r.slot_capacity + cur
+	r.slot_cursors[slot_idx] = cur + need
+	return Mesh_Scratch_Alloc{
+		vertex_offset   = base,
+		index_offset    = base + u64(plan.vertex_buffer_bytes),
+		indirect_offset = base + u64(plan.vertex_buffer_bytes) + u64(plan.index_buffer_bytes),
+		total_bytes     = need,
+	}, true
+}
