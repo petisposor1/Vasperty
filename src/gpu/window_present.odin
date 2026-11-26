@@ -13,6 +13,8 @@ import win32 "core:sys/windows"
 
 WIN_PRESENT_WIDTH  :: u32(1280)
 WIN_PRESENT_HEIGHT :: u32(720)
+SWAPCHAIN_WIDTH    :: u32(3840)
+SWAPCHAIN_HEIGHT   :: u32(2160)
 WIN_BUFFER_COUNT   :: u32(2)
 
 @(private)
@@ -358,8 +360,8 @@ init_window_presenter :: proc(wp: ^Window_Presenter, host_queue: rawptr) -> bool
 	_ = fvt.MakeWindowAssociation(fac, wp.hwnd, DXGI_MWA_NO_ALT_ENTER)
 
 	sc_desc := DXGI_SWAP_CHAIN_DESC1{
-		Width       = WIN_PRESENT_WIDTH,
-		Height      = WIN_PRESENT_HEIGHT,
+		Width       = SWAPCHAIN_WIDTH,
+		Height      = SWAPCHAIN_HEIGHT,
 		Format      = DXGI_FORMAT_R8G8B8A8_UNORM,
 		Stereo      = 0,
 		SampleDesc  = {Count = 1, Quality = 0},
@@ -695,8 +697,8 @@ present_window_frame :: proc(host_queue: rawptr, frame_num: u64, plane_res: rawp
 		if pdesc.Dimension == 3 && pdesc.SampleCount == 1 && is_copy_compatible_rgba8(pdesc.Format) && w > 0 && h > 0 {
 			src_full_w = w
 			src_full_h = h
-			copy_w = min(w, WIN_PRESENT_WIDTH)
-			copy_h = min(h, WIN_PRESENT_HEIGHT)
+			copy_w = min(w, SWAPCHAIN_WIDTH)
+			copy_h = min(h, SWAPCHAIN_HEIGHT)
 			can_copy = true
 		}
 	}
@@ -705,8 +707,8 @@ present_window_frame :: proc(host_queue: rawptr, frame_num: u64, plane_res: rawp
 	defer if shot_alloc { delete(shot_path) }
 	shot_from_plane := false
 	if want_shot {
-		rb_w := src_full_w if can_copy else WIN_PRESENT_WIDTH
-		rb_h := src_full_h if can_copy else WIN_PRESENT_HEIGHT
+		rb_w := src_full_w if can_copy else SWAPCHAIN_WIDTH
+		rb_h := src_full_h if can_copy else SWAPCHAIN_HEIGHT
 		want_shot = ensure_readback_buffer(&g_win, rb_w, rb_h)
 		shot_from_plane = want_shot && can_copy
 	}
