@@ -173,6 +173,7 @@ DEFAULT_HOST_ALLOW := [?]string {
 	"api-ms-win-shcore-*",
 	"msvcp_win.dll",
 	"ole32.dll",
+	"oleaut32.dll",
 	"advapi32.dll",
 	"iphlpapi.dll",
 	"dbghelp.dll",

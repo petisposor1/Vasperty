@@ -1,7 +1,14 @@
 package vasperty_gpu
 
+import "core:fmt"
+import "core:os"
+import "core:path/filepath"
+import "core:sync"
+import vasperty_pipeline "vasperty:pipeline"
+import vasperty_shader "vasperty:shader"
+
 // Hardware vendor tuning profiles (NVIDIA Wave32, Intel Integrated Wave16/UMA, Intel Arc,
-// AMD RDNA, WARP) and asynchronous multi-frame Ring Scheduler with 64 KiB dirty-page tracking.
+// AMD RDNA, WARP), asynchronous multi-frame Ring Scheduler, and disk-backed PSO Library Cache.
 
 VENDOR_INTEL  :: u32(0x8086)
 VENDOR_NVIDIA :: u32(0x10DE)
@@ -245,4 +252,133 @@ frame_ring_complete :: proc(ring: ^Frame_Ring, fence: u64) {
 			clear(&s.dirty_pages)
 		}
 	}
+}
+
+// =========================================================================
+// Disk-Backed Pipeline Library Cache (PSO blobs keyed by adapter + wave)
+// =========================================================================
+
+PSO_LIBRARY_FORMAT_VERSION :: u32(1)
+
+Pipeline_Library_Cache :: struct {
+	open:      bool,
+	vendor_id: u32,
+	device_id: u32,
+	wave_size: u8,
+	cache:     vasperty_pipeline.Cache,
+}
+
+pso_library_open :: proc(dir: string, vendor_id, device_id: u32, wave_size: u8) -> (lib: Pipeline_Library_Cache, ok: bool) {
+	c, err := vasperty_pipeline.cache_open(dir)
+	if err != .None {
+		return {}, false
+	}
+	return Pipeline_Library_Cache{
+		open      = true,
+		vendor_id = vendor_id,
+		device_id = device_id,
+		wave_size = wave_size,
+		cache     = c,
+	}, true
+}
+
+pso_library_close :: proc(lib: ^Pipeline_Library_Cache) {
+	if lib == nil || !lib.open {
+		return
+	}
+	vasperty_pipeline.cache_destroy(&lib.cache)
+	lib^ = {}
+}
+
+pso_library_key :: proc(lib: ^Pipeline_Library_Cache, pso_desc_bytes: []u8) -> vasperty_pipeline.Cache_Key {
+	tag := fmt.tprintf("pso-%04X-%04X-w%d", lib.vendor_id, lib.device_id, lib.wave_size)
+	parts := [1][]u8{pso_desc_bytes}
+	return vasperty_pipeline.cache_key_from_parts(tag, PSO_LIBRARY_FORMAT_VERSION, parts[:])
+}
+
+pso_library_store :: proc(lib: ^Pipeline_Library_Cache, pso_desc_bytes: []u8, blob: []u8) -> bool {
+	if lib == nil || !lib.open || len(blob) == 0 {
+		return false
+	}
+	key := pso_library_key(lib, pso_desc_bytes)
+	path, ok := vasperty_pipeline.cache_path_for(&lib.cache, key, context.temp_allocator)
+	if !ok {
+		return false
+	}
+	_ = os.make_directory_all(filepath.dir(path))
+	return os.write_entire_file_from_bytes(path, blob) == nil
+}
+
+pso_library_load :: proc(lib: ^Pipeline_Library_Cache, pso_desc_bytes: []u8, allocator := context.allocator) -> ([]u8, bool) {
+	if lib == nil || !lib.open {
+		return nil, false
+	}
+	key := pso_library_key(lib, pso_desc_bytes)
+	path, ok := vasperty_pipeline.cache_path_for(&lib.cache, key, context.temp_allocator)
+	if !ok {
+		return nil, false
+	}
+	data, rerr := os.read_entire_file_from_path(path, allocator)
+	if rerr != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+// =========================================================================
+// Active GPU Runtime State (binds Vendor_Tuning + Buffer_Pool + Frame_Ring)
+// =========================================================================
+
+Gpu_Runtime_State :: struct {
+	mu:          sync.Mutex,
+	initialized: bool,
+	tuning:      Vendor_Tuning,
+	pool:        Buffer_Pool,
+	ring:        Frame_Ring,
+}
+
+@(private)
+g_gpu_rt: Gpu_Runtime_State
+
+gpu_runtime_init :: proc() {
+	sync.mutex_lock(&g_gpu_rt.mu)
+	defer sync.mutex_unlock(&g_gpu_rt.mu)
+	if g_gpu_rt.initialized {
+		return
+	}
+	caps := probe_capabilities(true)
+	defer destroy_host_capabilities(&caps)
+	g_gpu_rt.tuning = classify_vendor(&caps)
+	g_gpu_rt.pool = buffer_pool_init(g_gpu_rt.tuning.buffer_pool_budget_bytes)
+	g_gpu_rt.ring = frame_ring_init(int(g_gpu_rt.tuning.max_frames_in_flight))
+	g_gpu_rt.initialized = true
+}
+
+gpu_runtime_fini :: proc() {
+	sync.mutex_lock(&g_gpu_rt.mu)
+	defer sync.mutex_unlock(&g_gpu_rt.mu)
+	if !g_gpu_rt.initialized {
+		return
+	}
+	frame_ring_destroy(&g_gpu_rt.ring)
+	buffer_pool_destroy(&g_gpu_rt.pool)
+	g_gpu_rt.tuning = {}
+	g_gpu_rt.initialized = false
+}
+
+gpu_runtime_tuning :: proc() -> Vendor_Tuning {
+	sync.mutex_lock(&g_gpu_rt.mu)
+	defer sync.mutex_unlock(&g_gpu_rt.mu)
+	return g_gpu_rt.tuning
+}
+
+gpu_runtime_wave_mode :: proc() -> vasperty_shader.Target_Wave_Mode {
+	sync.mutex_lock(&g_gpu_rt.mu)
+	defer sync.mutex_unlock(&g_gpu_rt.mu)
+	switch g_gpu_rt.tuning.target_wave_size {
+	case 16: return .Wave16
+	case 32: return .Wave32
+	case 64: return .Wave64
+	}
+	return .Auto
 }

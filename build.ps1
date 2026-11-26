@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Build, verify, benchmark, and diagnose the Vasperty Odin subsystem.
+  Build, verify, audit policy, benchmark, and diagnose Vasperty.
 
 .PARAMETER Action
   One of: check, test, policy, build, bench, doctor, all (default: all)
@@ -13,9 +13,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$OdinRoot = $PSScriptRoot
-$RepoRoot = Split-Path -Parent $OdinRoot
-$BuildDir = Join-Path $OdinRoot "build"
+$RepoRoot = $PSScriptRoot
+$SrcRoot = Join-Path $RepoRoot "src"
+$BuildDir = Join-Path $RepoRoot "build"
 
 function Resolve-OdinExe {
     $cmd = Get-Command odin.exe -ErrorAction SilentlyContinue
@@ -68,7 +68,7 @@ __asm__(".globl __chkstk\n__chkstk: jmp ___chkstk_ms\n");
 
 $Odin = Resolve-OdinExe
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
-$Collection = "-collection:vasperty=$OdinRoot"
+$Collection = "-collection:vasperty=$SrcRoot"
 $HasSdk = Test-HasWindowsSdk
 
 function Invoke-OdinCheck([string]$PkgDir, [string]$Label, [switch]$NoEntry) {
@@ -112,23 +112,23 @@ function Build-OdinBinary([string]$PkgDir, [string]$OutName, [switch]$Opt) {
 }
 
 function Run-Check {
-    Invoke-OdinCheck (Join-Path $OdinRoot "core") "vasperty:core" -NoEntry
-    Invoke-OdinCheck (Join-Path $OdinRoot "pe") "vasperty:pe" -NoEntry
-    Invoke-OdinCheck (Join-Path $OdinRoot "game") "vasperty:game" -NoEntry
-    Invoke-OdinCheck (Join-Path $OdinRoot "formats") "vasperty:formats" -NoEntry
-    Invoke-OdinCheck (Join-Path $OdinRoot "pipeline") "vasperty:pipeline" -NoEntry
-    Invoke-OdinCheck (Join-Path $OdinRoot "loader") "vasperty:loader" -NoEntry
-    Invoke-OdinCheck (Join-Path $OdinRoot "hle") "vasperty:hle" -NoEntry
-    Invoke-OdinCheck (Join-Path $OdinRoot "shader") "vasperty:shader" -NoEntry
-    Invoke-OdinCheck (Join-Path $OdinRoot "gpu") "vasperty:gpu" -NoEntry
-    Invoke-OdinCheck (Join-Path $OdinRoot "app") "vasperty:app" -NoEntry
-    Invoke-OdinCheck (Join-Path $OdinRoot "cli") "vasperty:cli"
-    Invoke-OdinCheck (Join-Path $OdinRoot "tests") "vasperty:tests"
+    Invoke-OdinCheck (Join-Path $SrcRoot "core") "vasperty:core" -NoEntry
+    Invoke-OdinCheck (Join-Path $SrcRoot "pe") "vasperty:pe" -NoEntry
+    Invoke-OdinCheck (Join-Path $SrcRoot "game") "vasperty:game" -NoEntry
+    Invoke-OdinCheck (Join-Path $SrcRoot "formats") "vasperty:formats" -NoEntry
+    Invoke-OdinCheck (Join-Path $SrcRoot "pipeline") "vasperty:pipeline" -NoEntry
+    Invoke-OdinCheck (Join-Path $SrcRoot "loader") "vasperty:loader" -NoEntry
+    Invoke-OdinCheck (Join-Path $SrcRoot "hle") "vasperty:hle" -NoEntry
+    Invoke-OdinCheck (Join-Path $SrcRoot "shader") "vasperty:shader" -NoEntry
+    Invoke-OdinCheck (Join-Path $SrcRoot "gpu") "vasperty:gpu" -NoEntry
+    Invoke-OdinCheck (Join-Path $SrcRoot "app") "vasperty:app" -NoEntry
+    Invoke-OdinCheck (Join-Path $SrcRoot "cli") "vasperty:cli"
+    Invoke-OdinCheck (Join-Path $SrcRoot "tests") "vasperty:tests"
 }
 
 function Run-Tests {
-    $testExe = Build-OdinBinary (Join-Path $OdinRoot "tests") "vasperty_tests"
-    Write-Host "[test] Running Odin suite with Tracking_Allocator leak verification..."
+    $testExe = Build-OdinBinary (Join-Path $SrcRoot "tests") "vasperty_tests"
+    Write-Host "[test] Running Vasperty test suite with leak verification..."
     & $testExe
     if ($LASTEXITCODE -ne 0) {
         throw "vasperty_tests.exe failed (exit $LASTEXITCODE)"
@@ -136,7 +136,7 @@ function Run-Tests {
 }
 
 function Run-CliBuild {
-    return (Build-OdinBinary (Join-Path $OdinRoot "cli") "vasperty" -Opt)
+    return (Build-OdinBinary (Join-Path $SrcRoot "cli") "vasperty" -Opt)
 }
 
 function Run-Policy {
@@ -144,7 +144,7 @@ function Run-Policy {
     $forbiddenExts = @(
         ".exe", ".dll", ".pdb", ".lib", ".sys", ".obj", ".exp", ".ilk",
         ".xvd", ".xvc", ".msixvc", ".xsp", ".cab", ".msi",
-        ".rpf", ".dds", ".ktx", ".ktx2", ".dxbc", ".dxil", ".cso", ".spv",
+        ".rpf", ".ttpf", ".dds", ".ktx", ".ktx2", ".dxbc", ".dxil", ".cso", ".spv",
         ".wav", ".xma", ".ogg", ".opus", ".mp3", ".mp4", ".bik", ".bk2", ".awc",
         ".pak", ".dat", ".zip", ".7z", ".rar", ".bin"
     )
@@ -158,7 +158,7 @@ function Run-Policy {
         if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
         $checked++
         $norm = $rel.Replace('\', '/')
-        if ($norm -eq "odin/formats/bcpack-tables.bin" -or $norm -eq "LICENSE") {
+        if ($norm -eq "src/formats/bcpack-tables.bin" -or $norm -eq "LICENSE") {
             continue
         }
         $ext = [System.IO.Path]::GetExtension($norm).ToLowerInvariant()

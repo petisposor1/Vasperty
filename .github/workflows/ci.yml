@@ -18,12 +18,12 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - name: Install Odin compiler
+      - name: Install toolchain
         run: |
           winget install --id OdinLang.Odin --silent --accept-package-agreements --accept-source-agreements
-      - name: Check, test, and asset policy
+      - name: Check, asset policy, and test suite
         shell: pwsh
         run: |
-          ./odin/build.ps1 check
-          ./odin/build.ps1 policy
-          ./odin/build.ps1 test
+          ./build.ps1 check
+          ./build.ps1 policy
+          ./build.ps1 test

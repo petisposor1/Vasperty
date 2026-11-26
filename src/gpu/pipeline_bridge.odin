@@ -241,7 +241,10 @@ host_shader_from_container :: proc(container: []u8, view_marks := true) -> (res:
 	g_sc_misses += 1
 	sync.mutex_unlock(&g_sc_mu)
 
-	opts := vasperty_shader.Shader_Options{view_marks = view_marks}
+	opts := vasperty_shader.Shader_Options{
+		view_marks = view_marks,
+		wave_mode  = gpu_runtime_wave_mode(),
+	}
 	hs, terr := vasperty_shader.translate_with(container, opts)
 
 	sync.mutex_lock(&g_sc_mu)
@@ -288,10 +291,12 @@ host_shader_from_container :: proc(container: []u8, view_marks := true) -> (res:
 gpu_init :: proc() {
 	init_gpu_objects()
 	init_watch()
+	gpu_runtime_init()
 }
 
 gpu_fini :: proc() {
 	unregister_gpu_hooks()
+	gpu_runtime_fini()
 	fini_shader_cache()
 	fini_watch()
 	fini_gpu_objects()

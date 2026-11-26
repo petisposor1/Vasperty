@@ -4,7 +4,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 
-ROOT_MARKER_WIN :: "odin\\build.ps1"
+ROOT_MARKER_WIN :: "build.ps1"
 ROOT_MARKER_LEGACY :: ".victory-root"
 
 Policy_Error :: enum {

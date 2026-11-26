@@ -63,8 +63,8 @@ app_fini :: proc(rt: ^Host_Runtime) {
 
 app_status :: proc() -> int {
 	cores := os.get_processor_core_count()
-	fmt.printf("vasperty: native Odin runtime online (cores=%d)\n", cores)
-	fmt.println("  packages: core, pe, game, formats, pipeline, loader, hle, shader, gpu, app, cli")
+	fmt.printf("vasperty: runtime online (cores=%d)\n", cores)
+	fmt.println("  modules : core, pe, game, formats, pipeline, loader, hle, shader, gpu, app, cli")
 	fmt.println("  targets : NVIDIA (Wave32 async) + Intel Integrated (Wave16 UMA)")
 	return 0
 }
@@ -101,7 +101,7 @@ app_doctor :: proc(prune_cache := false) -> int {
 	defer vasperty_core.destroy_config(&cfg)
 
 	cores := os.get_processor_core_count()
-	fmt.println("=== Vasperty Odin Doctor ===")
+	fmt.println("=== Vasperty Doctor ===")
 	fmt.printf("CPU cores       : %d\n", cores)
 	fmt.printf("Config source   : %s\n", cfg.source if cfg.has_source else "<defaults/env>")
 	fmt.printf("Game dir        : %s\n", cfg.game_dir if cfg.has_game_dir else "<unset>")
@@ -464,7 +464,7 @@ app_run :: proc(
 
 app_bench :: proc(secs: f64) -> int {
 	dur_s := secs if secs > 0.2 else 1.0
-	fmt.printf("=== Vasperty Native Odin Benchmarks (target %.2fs each) ===\n", dur_s)
+	fmt.printf("=== Vasperty Benchmarks (target %.2fs each) ===\n", dur_s)
 
 	city_buf: [128]u8
 	for i := 0; i < len(city_buf); i += 1 {

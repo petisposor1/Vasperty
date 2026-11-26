@@ -1,13 +1,13 @@
 # ---------------------------------------------------------------------------
 # RULE #1: nothing from any proprietary title source is ever committed.
 # Everything is built from files the user supplies at runtime.
-# Run `.\odin\build.ps1 policy` to verify the repository before committing.
+# Run `.\build.ps1 policy` to verify the repository before committing.
 # See docs/asset-policy.md.
 # ---------------------------------------------------------------------------
 
 # Build output
-/odin/build/
-/.odin_cache/
+/build/
+/.cache/
 
 # Local configuration (contains paths to YOUR files)
 /vasperty.toml
@@ -45,10 +45,11 @@
 # Typical game data (non-exhaustive on purpose; the policy check is an allowlist)
 *.bin
 # The one exception (docs/asset-policy.md): the BCPack format's constant tables.
-!/odin/formats/bcpack-tables.bin
+!/src/formats/bcpack-tables.bin
 *.dat
 *.pak
 *.rpf
+*.ttpf
 *.dds
 *.ktx
 *.ktx2

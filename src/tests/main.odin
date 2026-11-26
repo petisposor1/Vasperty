@@ -81,7 +81,7 @@ make_sgd5_record_bytes :: proc(name: string, kind: u8, payload: []u8, out: ^[dyn
 test_core_policy_and_config :: proc() {
 	fmt.print("[test] core_policy_and_config ... ")
 	assert(vasperty_core.ensure_outside_repo("cache\\textures") == .Inside_Repo)
-	assert(vasperty_core.ensure_outside_repo("odin\\..\\not-created\\out") == .Inside_Repo)
+	assert(vasperty_core.ensure_outside_repo("src\\..\\not-created\\out") == .Inside_Repo)
 	assert(vasperty_core.ensure_outside_repo("") == .Empty_Path)
 
 	temp_base, found_tmp := os.lookup_env("TEMP", context.allocator)
@@ -1374,6 +1374,48 @@ test_vendor_and_ring :: proc() {
 	assert(!vasperty_game.is_rpf9(buf))
 	copy(buf, []u8{'9', 'F', 'P', 'R'})
 	assert(vasperty_game.is_rpf9(buf))
+	assert(vasperty_game.probe_archive_bytes(buf).kind == .Rpf9)
+	copy(buf, []u8{'T', 'T', 'P', 'F'})
+	assert(vasperty_game.is_ttpf(buf))
+	assert(vasperty_game.probe_archive_bytes(buf).kind == .Ttpf)
+
+	// Wave masks
+	assert(vasperty_shader.wave_lane_mask(.Wave16) == 0xFFFF)
+	assert(vasperty_shader.wave_lane_mask(.Wave32) == 0xFFFF_FFFF)
+	assert(vasperty_shader.wave_lane_mask(.Wave64) == 0xFFFF_FFFF_FFFF_FFFF)
+
+	// 64 KiB incremental dirty-page shadow copy-back
+	page_title := make([]u8, 128 << 10)
+	defer delete(page_title)
+	sc := vasperty_gpu.shadow_create(0x1_0000_0000, 128 << 10, 1)
+	defer vasperty_gpu.shadow_destroy(sc)
+	vasperty_gpu.shadow_refresh_from(sc, page_title)
+	sc.backing[10] = 0xAA
+	sc.backing[(64 << 10) + 5] = 0xBB
+	dirty_only_page0 := [1]u64{0x1_0000_0000}
+	copied_p0 := vasperty_gpu.shadow_copy_back_pages(sc, page_title, dirty_only_page0[:])
+	assert(copied_p0 == 1 && page_title[10] == 0xAA && page_title[(64 << 10) + 5] == 0)
+
+	// oleaut32.dll allowed by default host policy
+	def_pol := vasperty_hle.default_host_policy()
+	defer vasperty_hle.destroy_host_policy(&def_pol)
+	assert(vasperty_hle.host_policy_allows(&def_pol, "OLEAUT32.dll"))
+
+	// Disk-backed PSO Pipeline Library roundtrip
+	tmp_dir, has_tmp := os.lookup_env("TEMP", context.allocator)
+	assert(has_tmp)
+	defer delete(tmp_dir)
+	pso_dir, _ := filepath.join({tmp_dir, "vasperty_pso_lib_test"}, context.allocator)
+	defer delete(pso_dir)
+	lib, lib_ok := vasperty_gpu.pso_library_open(pso_dir, 0x10DE, 0x2684, 32)
+	assert(lib_ok)
+	defer vasperty_gpu.pso_library_close(&lib)
+	pso_desc := [4]u8{1, 2, 3, 4}
+	pso_blob := [8]u8{0xDE, 0xAD, 0xBE, 0xEF, 5, 6, 7, 8}
+	assert(vasperty_gpu.pso_library_store(&lib, pso_desc[:], pso_blob[:]))
+	got_blob, got_ok := vasperty_gpu.pso_library_load(&lib, pso_desc[:])
+	assert(got_ok && len(got_blob) == len(pso_blob) && got_blob[0] == 0xDE)
+	delete(got_blob)
 	fmt.println("ok")
 }
 
@@ -1414,5 +1456,5 @@ main :: proc() {
 		}
 		os.exit(1)
 	}
-	fmt.println("ALL ODIN PHASE 7 TESTS PASSED (0 leaks, 0 bad frees)")
+	fmt.println("ALL VASPERTY TESTS PASSED (0 leaks, 0 bad frees)")
 }

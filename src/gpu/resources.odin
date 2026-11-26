@@ -432,3 +432,31 @@ shadow_copy_back :: proc(sc: ^Shadow_Copy, dst_title: []u8) -> u64 {
 	}
 	return written
 }
+
+// Incremental 64 KiB page copy-back: inspects only pages recorded as dirty by Frame_Ring.
+shadow_copy_back_pages :: proc(sc: ^Shadow_Copy, dst_title: []u8, dirty_pages: []u64) -> u64 {
+	if sc == nil || len(dirty_pages) == 0 {
+		return 0
+	}
+	n := u64(min(len(sc.backing), min(len(sc.snapshot), len(dst_title))))
+	if n == 0 {
+		return 0
+	}
+	written := u64(0)
+	for page in dirty_pages {
+		page_end := page + DIRTY_PAGE_GRANULARITY
+		if page_end <= sc.title_start || page >= sc.title_start + n {
+			continue
+		}
+		lo := max(page, sc.title_start) - sc.title_start
+		hi := min(page_end, sc.title_start + n) - sc.title_start
+		for i := int(lo); i < int(hi); i += 1 {
+			if sc.backing[i] != sc.snapshot[i] {
+				dst_title[i] = sc.backing[i]
+				sc.snapshot[i] = sc.backing[i]
+				written += 1
+			}
+		}
+	}
+	return written
+}

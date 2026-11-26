@@ -1092,6 +1092,16 @@ target_wave_lanes :: proc "contextless" (mode: Target_Wave_Mode) -> u8 {
 	return 32
 }
 
+wave_lane_mask :: proc "contextless" (mode: Target_Wave_Mode) -> u64 {
+	switch mode {
+	case .Wave16: return 0x0000_0000_0000_FFFF
+	case .Wave32: return 0x0000_0000_FFFF_FFFF
+	case .Wave64: return 0xFFFF_FFFF_FFFF_FFFF
+	case .Auto:   return 0x0000_0000_FFFF_FFFF
+	}
+	return 0x0000_0000_FFFF_FFFF
+}
+
 Shader_Options :: struct {
 	view_marks: bool,
 	loop_limit: u32,
@@ -1921,6 +1931,10 @@ lower_program :: proc(
 	l: Lower_Ctx
 	pixel := native.stage == .Ps
 	l.s = shader_create(pixel)
+	if options.wave_mode != .Auto {
+		l.s.has_wave = true
+		l.s.wave_size = u32(target_wave_lanes(options.wave_mode))
+	}
 	l.native = native
 	l.p = p
 	l.st = st

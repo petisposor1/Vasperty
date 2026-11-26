@@ -7,7 +7,7 @@ import vasperty_hle "vasperty:hle"
 import vasperty_shader "vasperty:shader"
 
 usage :: proc() {
-	fmt.println("Vasperty Native Odin CLI")
+	fmt.println("Vasperty CLI")
 	fmt.println("Usage:")
 	fmt.println("  vasperty.exe status")
 	fmt.println("  vasperty.exe config")
