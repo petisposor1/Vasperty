@@ -743,6 +743,12 @@ app_probe :: proc(paths: []string, scan := false) -> int {
 	return 0 if ok_count > 0 else 1
 }
 
+foreign import kernel32_veh "system:kernel32.lib"
+@(default_calling_convention = "system")
+foreign kernel32_veh {
+	GetModuleHandleExW :: proc(dwFlags: win32.DWORD, lpModuleName: win32.LPCWSTR, phModule: ^win32.HMODULE) -> win32.BOOL ---
+}
+
 @(private)
 VEH_EXCEPTION_RECORD :: struct {
 	ExceptionCode:        u32,
@@ -797,6 +803,43 @@ boot_veh_handler :: proc "system" (info: ^VEH_EXCEPTION_POINTERS) -> i32 {
 		return 0
 	}
 	code := info.ExceptionRecord.ExceptionCode
+	// Emulate AMD Zen 2 `clzero` (0F 01 FC), `monitorx` (0F 01 FA), `mwaitx` (0F 01 FB) on Intel CPUs.
+	if code == 0xC000001D && info.ContextRecord != nil {
+		ctx := info.ContextRecord
+		ip := cast([^]u8)uintptr(ctx.Rip)
+		if ip != nil && ip[0] == 0x0F && ip[1] == 0x01 {
+			if ip[2] == 0xFA { // monitorx
+				ctx.Rip += 3
+				return -1 // EXCEPTION_CONTINUE_EXECUTION
+			}
+			if ip[2] == 0xFB { // mwaitx
+				win32.SwitchToThread()
+				ctx.Rip += 3
+				return -1 // EXCEPTION_CONTINUE_EXECUTION
+			}
+			if ip[2] == 0xFC { // clzero
+				line := uintptr(ctx.Rax & ~u64(63))
+				if line != 0 {
+					// Fast-path: `clzero; add rax, 0x40; cmp rax, r10; jb -12`
+					if ip[3] == 0x48 && ip[4] == 0x83 && ip[5] == 0xC0 && ip[6] == 0x40 &&
+					   ip[7] == 0x4C && ip[8] == 0x39 && ip[9] == 0xD0 && ip[10] == 0x72 && ip[11] == 0xF4 &&
+					   ctx.R10 > ctx.Rax {
+						end_line := uintptr((ctx.R10 + 63) & ~u64(63))
+						span := end_line - line
+						if span > 0 && span <= (256 << 20) {
+							mem.zero(rawptr(line), int(span))
+							ctx.Rax = u64(end_line)
+							ctx.Rip += 12
+							return -1 // EXCEPTION_CONTINUE_EXECUTION
+						}
+					}
+					mem.zero(rawptr(line), 64)
+				}
+				ctx.Rip += 3
+				return -1 // EXCEPTION_CONTINUE_EXECUTION
+			}
+		}
+	}
 	if code != 0xC0000005 && code != 0xC000001D && code != 0xC0000096 && code != 0xC00000FD && code != 0x80000003 {
 		return 0
 	}
@@ -814,8 +857,21 @@ boot_veh_handler :: proc "system" (info: ^VEH_EXCEPTION_POINTERS) -> i32 {
 		fmt.eprintf("[crash] stage=%s code=0x%08X rip=0x%X (vasperty+0x%X) %s va=0x%X\n",
 			g_boot_stage, code, addr, addr - g_boot_self_base, op_str, fault_va)
 	} else {
-		fmt.eprintf("[crash] stage=%s code=0x%08X rip=0x%X %s va=0x%X\n",
-			g_boot_stage, code, addr, op_str, fault_va)
+		hmod: win32.HMODULE
+		mod_name := "unknown"
+		mod_off := uintptr(0)
+		if GetModuleHandleExW(6, transmute(win32.LPCWSTR)addr, &hmod) && hmod != nil {
+			mod_off = addr - uintptr(hmod)
+			wbuf: [260]u16
+			n := win32.GetModuleFileNameW(hmod, &wbuf[0], 260)
+			if n > 0 {
+				if s, err := win32.utf16_to_utf8(wbuf[:n], context.temp_allocator); err == nil {
+					mod_name = s
+				}
+			}
+		}
+		fmt.eprintf("[crash] stage=%s code=0x%08X rip=0x%X (%s+0x%X) %s va=0x%X\n",
+			g_boot_stage, code, addr, mod_name, mod_off, op_str, fault_va)
 	}
 	if info.ContextRecord != nil {
 		ctx := info.ContextRecord
@@ -823,12 +879,24 @@ boot_veh_handler :: proc "system" (info: ^VEH_EXCEPTION_POINTERS) -> i32 {
 			ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9, ctx.Rsp)
 		if ctx.Rsp != 0 {
 			sp := cast([^]uintptr)uintptr(ctx.Rsp)
-			for i in 0 ..< 8 {
+			for i in 0 ..< 48 {
 				v := sp[i]
+				if v < 0x10000 { continue }
 				if g_boot_main_base != 0 && v >= g_boot_main_base && v < g_boot_main_base + g_boot_main_size {
 					fmt.eprintf("  stack[%d]=0x%X (main+0x%X)\n", i, v, v - g_boot_main_base)
-				} else if g_boot_self_base != 0 && v >= g_boot_self_base && v < g_boot_self_base + 0x2000000 {
+				} else if g_boot_self_base != 0 && v >= g_boot_self_base && v < g_boot_self_base + 0x200000 {
 					fmt.eprintf("  stack[%d]=0x%X (vasperty+0x%X)\n", i, v, v - g_boot_self_base)
+				} else {
+					hm: win32.HMODULE
+					if GetModuleHandleExW(6, transmute(win32.LPCWSTR)v, &hm) && hm != nil {
+						wbuf: [260]u16
+						n := win32.GetModuleFileNameW(hm, &wbuf[0], 260)
+						if n > 0 {
+							if s, err := win32.utf16_to_utf8(wbuf[:n], context.temp_allocator); err == nil {
+								fmt.eprintf("  stack[%d]=0x%X (%s+0x%X)\n", i, v, s, v - uintptr(hm))
+							}
+						}
+					}
 				}
 			}
 		}
@@ -915,6 +983,8 @@ app_run :: proc(
 	// libHttpClient.GDK, amd_fidelityfx_loader_xbox) so all title imports resolve cleanly.
 	Sibling_Loaded :: struct {
 		img:       vasperty_loader.Loaded_Image,
+		base:      uintptr,
+		entry_rva: u32,
 		dll_name:  string,
 		exp_names: [dynamic]string,
 	}
@@ -964,6 +1034,8 @@ app_run :: proc(
 
 		sib_rec := Sibling_Loaded{
 			img       = s_img,
+			base      = s_base,
+			entry_rva = s_prep.info.entry_rva,
 			dll_name  = strings.clone(imp.dll),
 			exp_names = make([dynamic]string, 0, len(s_prep.info.exports)),
 		}
@@ -1004,6 +1076,16 @@ app_run :: proc(
 		defer if veh != nil { _ = RemoveVectoredExceptionHandler(veh) }
 
 		vasperty_hle.use_console_timers()
+		g_boot_stage = "sibling_dllmain"
+		Dll_Main_Proc :: #type proc "system" (hinst: rawptr, reason: u32, reserved: rawptr) -> i32
+		for &sib in siblings {
+			vasperty_loader.loaded_run_tls_callbacks(&sib.img, 1)
+			if sib.entry_rva != 0 {
+				dll_main := cast(Dll_Main_Proc)rawptr(sib.base + uintptr(sib.entry_rva))
+				ok_dm := dll_main(rawptr(sib.base), 1, nil)
+				fmt.printf("[boot] DllMain(%s, ATTACH) -> %d\n", sib.dll_name, ok_dm)
+			}
+		}
 		g_boot_stage = "tls_callbacks"
 		fmt.printf("[boot] running %d TLS callbacks...\n", len(prep.info.tls.callback_rvas))
 		vasperty_loader.loaded_run_tls_callbacks(&img, 1)

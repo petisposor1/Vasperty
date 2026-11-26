@@ -42,6 +42,9 @@ ensure_host_device :: proc() -> rawptr {
 	sync.mutex_lock(&g_host_dev_mu)
 	defer sync.mutex_unlock(&g_host_dev_mu)
 	if g_host_dev != nil {
+		if g_rtv_ring.heap == nil || g_dsv_ring.heap == nil {
+			init_host_desc_rings(g_host_dev)
+		}
 		return g_host_dev
 	}
 	dlls := ensure_d3d12_dlls()
@@ -49,8 +52,19 @@ ensure_host_device :: proc() -> rawptr {
 		return nil
 	}
 	D3D_FEATURE_LEVEL_12_0 :: u32(0xC000)
+	// Enable D3D12ExperimentalShaderModels so translated DXIL shaders work even if dxil.dll is unavailable.
+	if dlls.d3d12_mod != nil {
+		if exp_sym := win32.GetProcAddress(dlls.d3d12_mod, "D3D12EnableExperimentalFeatures"); exp_sym != nil {
+			exp_fn := cast(proc "system" (u32, ^Iid, rawptr, ^u32) -> HRESULT)exp_sym
+			D3D12_EXP_SHADER_MODELS := guid(0x76f5573e, 0xf13a, 0x40f5, {0xb2, 0x97, 0x81, 0xce, 0x9e, 0x18, 0x93, 0x3f})
+			_ = exp_fn(1, &D3D12_EXP_SHADER_MODELS, nil, nil)
+		}
+	}
 	dev_iid := guid(0x189819f1, 0x1db6, 0x4b57, {0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7})
 	_ = dlls.create_device(nil, D3D_FEATURE_LEVEL_12_0, &dev_iid, &g_host_dev)
+	if g_host_dev != nil {
+		init_host_desc_rings(g_host_dev)
+	}
 	return g_host_dev
 }
 
@@ -105,33 +119,46 @@ device_stub_slot :: proc "system" (this: This, a1, a2, a3: uintptr) -> HRESULT {
 @(private)
 device_create_command_queue :: proc "system" (this: This, desc: rawptr, iid: ^Iid, out: ^rawptr) -> HRESULT {
 	context = gpu_context()
-	_ = this
+	_ = this; _ = iid
 	hdev := ensure_host_device()
-	if hdev == nil { return E_NOTIMPL }
+	if hdev == nil || desc == nil || out == nil { return E_INVALIDARG }
+	raw_q := (cast(^D3D12_COMMAND_QUEUE_DESC)desc)^
+	pc_q := D3D12_COMMAND_QUEUE_DESC{
+		Type     = raw_q.Type if (raw_q.Type == 0 || raw_q.Type == 2 || raw_q.Type == 3) else 0,
+		Priority = 0,
+		Flags    = raw_q.Flags & 1,
+		NodeMask = 0,
+	}
+	q_iid := IID_ID3D12CommandQueue_G
 	vt := (cast(^^Full_Dev_Vtbl)hdev)^
-	hr := vt.CreateCommandQueue(hdev, desc, iid, out)
-	fmt.printf("[d3d12x] CreateCommandQueue -> hr=0x%08X\n", u32(hr))
+	host_q: rawptr
+	hr := vt.CreateCommandQueue(hdev, &pc_q, &q_iid, &host_q)
+	if hr >= 0 {
+		hr = create_console_queue(raw_q, host_q, out)
+	}
+	fmt.printf("[d3d12x] CreateCommandQueue(type=%d) -> hr=0x%08X\n", raw_q.Type, u32(hr))
 	return hr
 }
 
 @(private)
 device_create_command_allocator :: proc "system" (this: This, kind: u32, iid: ^Iid, out: ^rawptr) -> HRESULT {
 	context = gpu_context()
-	_ = this
-	hdev := ensure_host_device()
-	if hdev == nil { return E_NOTIMPL }
-	vt := (cast(^^Full_Dev_Vtbl)hdev)^
-	return vt.CreateCommandAllocator(hdev, kind, iid, out)
+	_ = this; _ = iid
+	if out == nil { return E_INVALIDARG }
+	return create_console_allocator(kind, nil, out)
 }
 
 @(private)
 device_create_command_list :: proc "system" (this: This, node_mask: u32, kind: u32, alloc: rawptr, pso: rawptr, iid: ^Iid, out: ^rawptr) -> HRESULT {
 	context = gpu_context()
-	_ = this
-	hdev := ensure_host_device()
-	if hdev == nil { return E_NOTIMPL }
-	vt := (cast(^^Full_Dev_Vtbl)hdev)^
-	return vt.CreateCommandList(hdev, node_mask, kind, alloc, pso, iid, out)
+	_ = this; _ = node_mask; _ = iid
+	if alloc == nil || out == nil { return E_INVALIDARG }
+	cl_raw := wrap_console_cmd_list(nil, kind, false)
+	if cl_raw != nil && pso != nil {
+		(cast(^Console_Cmd_List)cl_raw).cur_pso = pso
+	}
+	out^ = cl_raw
+	return S_OK
 }
 
 @(private)
@@ -141,7 +168,9 @@ device_create_descriptor_heap :: proc "system" (this: This, desc: rawptr, iid: ^
 	hdev := ensure_host_device()
 	if hdev == nil { return E_NOTIMPL }
 	vt := (cast(^^Full_Dev_Vtbl)hdev)^
-	return vt.CreateDescriptorHeap(hdev, desc, iid, out)
+	hr := vt.CreateDescriptorHeap(hdev, desc, iid, out)
+	fmt.printf("[d3d12x] CreateDescriptorHeap -> hr=0x%08X\n", u32(hr))
+	return hr
 }
 
 @(private)
@@ -151,17 +180,18 @@ device_create_root_signature :: proc "system" (this: This, node_mask: u32, blob:
 	hdev := ensure_host_device()
 	if hdev == nil { return E_NOTIMPL }
 	vt := (cast(^^Full_Dev_Vtbl)hdev)^
-	return vt.CreateRootSignature(hdev, node_mask, blob, blob_len, iid, out)
+	hr := vt.CreateRootSignature(hdev, node_mask, blob, blob_len, iid, out)
+	fmt.printf("[d3d12x] CreateRootSignature(len=%d) -> hr=0x%08X\n", blob_len, u32(hr))
+	return hr
 }
 
 @(private)
 device_create_fence :: proc "system" (this: This, initial: u64, flags: u32, iid: ^Iid, out: ^rawptr) -> HRESULT {
 	context = gpu_context()
-	_ = this
-	hdev := ensure_host_device()
-	if hdev == nil { return E_NOTIMPL }
-	vt := (cast(^^Full_Dev_Vtbl)hdev)^
-	return vt.CreateFence(hdev, initial, flags, iid, out)
+	_ = this; _ = iid
+	hr := create_console_fence(initial, flags, out)
+	fmt.printf("[d3d12x] CreateFence(init=%d flags=0x%X) -> hr=0x%08X\n", initial, flags, u32(hr))
+	return hr
 }
 
 @(private)
@@ -183,6 +213,85 @@ device_check_feature_support :: proc "system" (this: This, feature: u32, data: r
 	_ = this
 	if data == nil || size == 0 {
 		return E_INVALIDARG
+	}
+	switch feature {
+	case 0: // D3D12_FEATURE_D3D12_OPTIONS (64 bytes on Xbox Scarlett, [16]u32)
+		if size >= 64 {
+			o := cast(^[16]u32)data
+			o^ = {1, 1, 3, 2, 1, 2, 0, 2, 1, 1, 2, 1, 1, 1, 1, 1}
+			return S_OK
+		}
+	case 1: // D3D12_FEATURE_ARCHITECTURE (16 bytes)
+		if size >= 16 {
+			a := cast(^[4]u32)data
+			a[1] = 0 // TileBasedRenderer = FALSE
+			a[2] = 1 // UMA = TRUE
+			a[3] = 1 // CacheCoherentUMA = TRUE
+			return S_OK
+		}
+	case 2: // D3D12_FEATURE_FEATURE_LEVELS
+		if size >= 20 {
+			fl_cnt := (cast(^u32)data)^
+			fl_ptr := (cast(^[^]u32)rawptr(uintptr(data) + 8))^
+			out_fl := cast(^u32)rawptr(uintptr(data) + 16)
+			best: u32 = 0
+			if fl_ptr != nil {
+				for i in 0 ..< fl_cnt {
+					lvl := fl_ptr[i]
+					if lvl <= HIGHEST_FEATURE_LEVEL && lvl > best {
+						best = lvl
+					}
+				}
+			}
+			out_fl^ = best if best != 0 else HIGHEST_FEATURE_LEVEL
+			return S_OK
+		}
+	case 3: // D3D12_FEATURE_FORMAT_SUPPORT (12 bytes)
+		if size >= 12 {
+			q := cast(^[3]u32)data
+			q[1] = 0x7FFF_FFFF
+			q[2] = 0xFFFF
+			return S_OK
+		}
+	case 4: // D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS (16 bytes)
+		if size >= 16 {
+			q := cast(^[4]u32)data
+			samples := q[1]
+			q[3] = 1 if (samples == 1 || samples == 2 || samples == 4 || samples == 8) else 0
+			return S_OK
+		}
+	case 7: // D3D12_FEATURE_SHADER_MODEL (4 bytes)
+		if size >= 4 {
+			sm := cast(^u32)data
+			if sm^ > 0x66 { sm^ = 0x66 }
+			return S_OK
+		}
+	case 8: // D3D12_FEATURE_D3D12_OPTIONS1 (24 bytes) - Xbox Scarlett RDNA 2 Wave32/64
+		if size >= 24 {
+			o := cast(^[6]u32)data
+			o[0] = 1  // WaveOps = TRUE
+			o[1] = 32 // WaveLaneCountMin
+			o[2] = 64 // WaveLaneCountMax
+			o[3] = 64 // TotalLaneCount
+			o[4] = 1  // ExpandedComputeResourceStates
+			o[5] = 1  // Int64ShaderOps
+			return S_OK
+		}
+	case 23: // D3D12_FEATURE_D3D12_OPTIONS4 (12 bytes)
+		if size >= 12 {
+			o := cast(^[3]u32)data
+			o[0] = 0
+			o[1] = 0
+			o[2] = 1 // Native16BitShaderOpsSupported
+			return S_OK
+		}
+	case 32: // D3D12_FEATURE_D3D12_OPTIONS7 (8 bytes) - Mesh Shaders Tier 1
+		if size >= 8 {
+			o := cast(^[2]u32)data
+			o[0] = 10  // D3D12_MESH_SHADER_TIER_1
+			o[1] = 100 // D3D12_SAMPLER_FEEDBACK_TIER_1_0
+			return S_OK
+		}
 	}
 	hdev := ensure_host_device()
 	if hdev != nil {
@@ -226,20 +335,23 @@ device_get_custom_heap_props :: proc "system" (out: ^D3D12_HEAP_PROPERTIES, this
 @(private)
 device_create_command_queue_x :: proc "system" (this: This, desc: rawptr, iid: ^Iid, out: ^rawptr) -> HRESULT {
 	context = gpu_context()
-	_ = this
+	_ = this; _ = iid
 	hdev := ensure_host_device()
-	if hdev == nil || desc == nil { return E_NOTIMPL }
-	// Xbox D3D12X_COMMAND_QUEUE_DESC starts with Type(u32), Priority(i32), Flags(u32), NodeMask(u32).
-	// Sanitize console-only flags/types for PC D3D12.
+	if hdev == nil || desc == nil || out == nil { return E_INVALIDARG }
 	raw_q := (cast(^D3D12_COMMAND_QUEUE_DESC)desc)^
 	pc_q := D3D12_COMMAND_QUEUE_DESC{
 		Type     = raw_q.Type if (raw_q.Type == 0 || raw_q.Type == 2 || raw_q.Type == 3) else 0,
 		Priority = 0,
-		Flags    = raw_q.Flags & 1, // only DISABLE_GPU_TIMEOUT
+		Flags    = raw_q.Flags & 1,
 		NodeMask = 0,
 	}
+	q_iid := IID_ID3D12CommandQueue_G
 	vt := (cast(^^Full_Dev_Vtbl)hdev)^
-	hr := vt.CreateCommandQueue(hdev, &pc_q, iid, out)
+	host_q: rawptr
+	hr := vt.CreateCommandQueue(hdev, &pc_q, &q_iid, &host_q)
+	if hr >= 0 {
+		hr = create_console_queue(raw_q, host_q, out)
+	}
 	fmt.printf("[d3d12x] CreateCommandQueueX(type=%d -> %d) -> hr=0x%08X\n", raw_q.Type, pc_q.Type, u32(hr))
 	return hr
 }
@@ -253,73 +365,92 @@ device_ignore_ok :: proc "system" (this: This) -> HRESULT {
 @(private)
 device_create_command_list_x :: proc "system" (this: This, desc: rawptr, allocator: rawptr, pipeline: rawptr, iid: ^Iid, out: ^rawptr) -> HRESULT {
 	context = gpu_context()
-	_ = this
-	hdev := ensure_host_device()
-	if hdev == nil || desc == nil || out == nil { return E_INVALIDARG }
+	_ = this; _ = iid
+	if desc == nil || allocator == nil || out == nil { return E_INVALIDARG }
 	raw_kind := (cast(^u32)desc)^
-	pc_kind := raw_kind if (raw_kind == 0 || raw_kind == 2 || raw_kind == 3) else u32(0)
-	// Use standard ID3D12GraphicsCommandList IID if console passed a newer console IID
-	list_iid := IID_ID3D12GraphicsCommandList_G
-	use_iid := iid if iid != nil else &list_iid
-	vt := (cast(^^Full_Dev_Vtbl)hdev)^
-	hr := vt.CreateCommandList(hdev, 0, pc_kind, allocator, pipeline, use_iid, out)
-	if hr < 0 {
-		hr = vt.CreateCommandList(hdev, 0, pc_kind, allocator, pipeline, &list_iid, out)
+	cl_raw := wrap_console_cmd_list(nil, raw_kind, false)
+	if cl_raw != nil && pipeline != nil {
+		(cast(^Console_Cmd_List)cl_raw).cur_pso = pipeline
 	}
-	if hr >= 0 && out^ != nil {
-		// Console CreateCommandListX returns a closed list ready for Reset(); PC D3D12 returns it open.
-		lvt := (cast(^^Exec_List_Vtbl)out^)^
-		_ = lvt.Close(out^)
-	}
-	fmt.printf("[d3d12x] CreateCommandListX(kind=%d -> %d) -> hr=0x%08X\n", raw_kind, pc_kind, u32(hr))
-	return hr
+	out^ = cl_raw
+	return S_OK
 }
 
 @(private)
 g_frame_token_seq: u64 = 1
 
 @(private)
-device_wait_frame_event_x :: proc "system" (this: This, kind: u32, timeout_ms: u32, extra: rawptr, out_token: ^u64) -> HRESULT {
-	_ = this; _ = kind; _ = timeout_ms; _ = extra
-	if out_token != nil {
+device_wait_frame_event_x :: proc "system" (this: This, kind: u32, timeout_ms: u32, extra: rawptr, flags: u32, out_token: ^u64) -> HRESULT {
+	_ = this; _ = kind; _ = timeout_ms; _ = extra; _ = flags
+	if uintptr(out_token) > 0x10000 {
 		out_token^ = intrinsics.atomic_add(&g_frame_token_seq, 1)
 	}
 	return S_OK
 }
 
 @(private)
-g_device_vtable: [128]rawptr
+g_device_vtable: [160]rawptr
+
+device_not_impl :: proc "system" (this: This) -> HRESULT {
+	_ = this
+	return E_NOTIMPL
+}
 
 @(init)
 init_device_vtable :: proc "contextless" () {
 	for i in 0 ..< len(g_device_vtable) {
 		g_device_vtable[i] = rawptr(device_stub_slot)
 	}
-	g_device_vtable[0] = rawptr(device_qi)
-	g_device_vtable[1] = rawptr(object_add_ref)
-	g_device_vtable[2] = rawptr(object_release_static)
-	g_device_vtable[3] = rawptr(object_get_private_data)
-	g_device_vtable[4] = rawptr(object_set_private_data)
+	fill_d3d12_object_slots(g_device_vtable[:], rawptr(device_qi), rawptr(object_release_static))
 	g_device_vtable[7] = rawptr(device_get_node_count)
 	g_device_vtable[8] = rawptr(device_create_command_queue)
 	g_device_vtable[9] = rawptr(device_create_command_allocator)
+	g_device_vtable[10] = rawptr(device_create_graphics_pso)
+	g_device_vtable[11] = rawptr(device_create_compute_pso)
 	g_device_vtable[12] = rawptr(device_create_command_list)
 	g_device_vtable[13] = rawptr(device_check_feature_support)
-	g_device_vtable[14] = rawptr(device_create_descriptor_heap)
+	g_device_vtable[14] = rawptr(device_create_console_desc_heap)
 	g_device_vtable[15] = rawptr(device_get_desc_inc)
-	g_device_vtable[16] = rawptr(device_create_root_signature)
+	g_device_vtable[16] = rawptr(device_create_console_root_sig)
+	g_device_vtable[17] = rawptr(device_create_cbv)
+	g_device_vtable[18] = rawptr(device_create_srv)
+	g_device_vtable[19] = rawptr(device_create_uav)
+	g_device_vtable[20] = rawptr(device_create_rtv)
+	g_device_vtable[21] = rawptr(device_create_dsv)
+	g_device_vtable[22] = rawptr(device_create_sampler)
+	g_device_vtable[23] = rawptr(device_copy_descriptors)
+	g_device_vtable[24] = rawptr(device_copy_descriptors_simple)
+	g_device_vtable[25] = rawptr(device_get_alloc_info)
 	g_device_vtable[26] = rawptr(device_get_custom_heap_props)
+	g_device_vtable[27] = rawptr(device_create_committed)
+	g_device_vtable[28] = rawptr(device_create_heap)
+	g_device_vtable[29] = rawptr(device_create_placed)
 	g_device_vtable[36] = rawptr(device_create_fence)
 	g_device_vtable[37] = rawptr(device_get_removed_reason)
+	g_device_vtable[38] = rawptr(device_copyable_footprints)
+	g_device_vtable[39] = rawptr(device_create_query_heap)
+	g_device_vtable[41] = rawptr(device_create_cmd_sig)
 	g_device_vtable[48] = rawptr(device_create_command_queue_x)
+	g_device_vtable[55] = rawptr(device_ignore_ok)
+	g_device_vtable[57] = rawptr(device_not_impl)
+	g_device_vtable[61] = rawptr(device_create_sampler_x)
+	g_device_vtable[62] = rawptr(device_create_compute_pso_x)
+	g_device_vtable[67] = rawptr(device_not_impl)
 	g_device_vtable[69] = rawptr(device_ignore_ok)
+	g_device_vtable[70] = rawptr(device_create_placed_view)
+	g_device_vtable[71] = rawptr(device_create_placed_view)
 	g_device_vtable[73] = rawptr(device_create_command_list_x)
-	g_device_vtable[74] = rawptr(device_ignore_ok)
-	g_device_vtable[75] = rawptr(device_ignore_ok)
+	g_device_vtable[74] = rawptr(device_register_page_pool)
+	g_device_vtable[75] = rawptr(device_unregister_page_pool)
+	g_device_vtable[76] = rawptr(device_create_committed)
 	g_device_vtable[78] = rawptr(device_ignore_ok)
 	g_device_vtable[79] = rawptr(device_ignore_ok)
 	g_device_vtable[80] = rawptr(device_wait_frame_event_x)
 	g_device_vtable[81] = rawptr(device_ignore_ok)
+	g_device_vtable[86] = rawptr(device_create_pso_stream)
+	g_device_vtable[108] = rawptr(device_get_alloc_info2)
+	g_device_vtable[127] = rawptr(device_create_committed3)
+	g_device_vtable[133] = rawptr(device_create_at_address)
 }
 
 g_device := Console_Device{

@@ -140,6 +140,19 @@ IID_IDXGIAdapter1 := guid(0x29038f61, 0x3839, 0x4626, {0x91, 0xfd, 0x08, 0x68, 0
 IID_IDXGIFactory4_G := guid(0x1bc6ea02, 0xef36, 0x464f, {0xbf, 0x0c, 0x21, 0xca, 0x39, 0xe5, 0x16, 0x8a})
 IID_IDXGIFactory5_G := guid(0x7632e1f5, 0xee65, 0x4dca, {0x87, 0xfd, 0x84, 0xcd, 0x75, 0xf8, 0x83, 0x8d})
 
+com_add_ref :: proc(obj: rawptr) -> u32 {
+	if obj == nil {
+		return 0
+	}
+	IUnk_Vtbl :: struct {
+		QueryInterface: rawptr,
+		AddRef:         proc "system" (rawptr) -> u32,
+		Release:        rawptr,
+	}
+	vt := (cast(^^IUnk_Vtbl)obj)^
+	return vt.AddRef(obj)
+}
+
 com_release :: proc(obj: rawptr) -> u32 {
 	if obj == nil {
 		return 0

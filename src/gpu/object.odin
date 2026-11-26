@@ -174,7 +174,7 @@ fini_gpu_objects :: proc() {
 
 object_set_private_data :: proc "system" (this: This, id: ^Iid, data_size: u32, data: rawptr) -> HRESULT {
 	context = gpu_context()
-	if id == nil {
+	if uintptr(id) < 0x10000 {
 		return E_INVALIDARG
 	}
 	key := Private_Key{obj = uintptr(this), id = id^}
@@ -195,6 +195,22 @@ object_set_private_data :: proc "system" (this: This, id: ^Iid, data_size: u32, 
 	copy(buf[:], src)
 	g_priv_data[key] = buf
 	return S_OK
+}
+
+object_set_private_data_interface :: proc "system" (this: This, id: ^Iid, iface: rawptr) -> HRESULT {
+	_ = this; _ = id; _ = iface
+	return S_OK
+}
+
+object_set_name :: proc "system" (this: This, name: rawptr) -> HRESULT {
+	_ = this; _ = name
+	return S_OK
+}
+
+object_parent_device :: proc "system" (this: This, iid: ^Iid, out: ^This) -> HRESULT {
+	context = gpu_context()
+	_ = this
+	return device_qi(cast(This)&g_device, iid, out)
 }
 
 object_get_private_data :: proc "system" (this: This, id: ^Iid, data_size: ^u32, data: rawptr) -> HRESULT {

@@ -1068,7 +1068,7 @@ test_hle_phase4 :: proc() {
 	assert(hle_vslot(xg_comp, 0x10, XG_Rel)(xg_comp) == 0)
 
 	dsp_inst: ^vasperty_hle.Dsp_Instance = nil
-	assert(vasperty_hle.XDspConnectWithMaximumStreamLimit(nil, 0, 4, &dsp_inst) == vasperty_hle.S_OK)
+	assert(vasperty_hle.XDspConnectWithMaximumStreamLimit(nil, 0, 1, 4, 4, &dsp_inst) == vasperty_hle.S_OK)
 	dsp_s: ^vasperty_hle.Dsp_Stream = nil
 	dsp_st: rawptr = nil
 	assert(vasperty_hle.XDspActivate(dsp_inst, 1, 0, 16384, 2, &dsp_s, &dsp_st) == vasperty_hle.S_OK)

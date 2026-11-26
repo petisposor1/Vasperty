@@ -173,18 +173,54 @@ XMemVirtualQuery :: proc "system" (hproc: win32.HANDLE, addr: rawptr, out: ^XMem
 }
 
 @(private)
+find_pe_export_in_memory :: proc(base: uintptr, target_name: string) -> uintptr {
+	if base == 0 { return 0 }
+	p := cast([^]u8)rawptr(base)
+	if p[0] != 'M' || p[1] != 'Z' { return 0 }
+	pe_off := (cast(^u32)&p[0x3C])^
+	if pe_off == 0 || pe_off > 0x1000 { return 0 }
+	if p[pe_off] != 'P' || p[pe_off + 1] != 'E' { return 0 }
+	// PE32+ optional header starts at pe_off + 24; export data directory is at +112
+	exp_rva := (cast(^u32)&p[pe_off + 24 + 112])^
+	exp_sz := (cast(^u32)&p[pe_off + 24 + 116])^
+	if exp_rva == 0 || exp_sz == 0 { return 0 }
+	dir := cast([^]u32)rawptr(base + uintptr(exp_rva))
+	num_names := dir[6]
+	addr_rva := dir[7]
+	name_rva := dir[8]
+	ord_rva := dir[9]
+	if num_names == 0 || addr_rva == 0 || name_rva == 0 || ord_rva == 0 { return 0 }
+	addrs := cast([^]u32)rawptr(base + uintptr(addr_rva))
+	names := cast([^]u32)rawptr(base + uintptr(name_rva))
+	ords := cast([^]u16)rawptr(base + uintptr(ord_rva))
+	for i in 0 ..< num_names {
+		cname := cast(cstring)rawptr(base + uintptr(names[i]))
+		if string(cname) == target_name {
+			ord := ords[i]
+			return base + uintptr(addrs[ord])
+		}
+	}
+	return 0
+}
+
+@(private)
 xmem_hook_pointers :: proc() -> [2]uintptr {
 	b, ok := main_image()
 	if !ok { return {0, 0} }
-	p := win32.GetProcAddress(win32.HMODULE(rawptr(b)), "__XMemAllocationHooks__")
-	if p == nil { return {0, 0} }
-	ptrs := cast(^[2]uintptr)p
+	at := find_pe_export_in_memory(b, "__XMemAllocationHooks__")
+	if at == 0 {
+		p := win32.GetProcAddress(win32.HMODULE(rawptr(b)), "__XMemAllocationHooks__")
+		if p == nil { return {0, 0} }
+		at = uintptr(p)
+	}
+	ptrs := cast(^[2]uintptr)rawptr(at)
 	return ptrs^
 }
 
 XMemAllocDefault :: proc "system" (size: uint, attrs: u64) -> rawptr {
 	context = hle_context()
-	if attrs & (u64(1) << 33) != 0 {
+	is_gfx := (attrs & (u64(1) << 33) != 0) || (((attrs >> 16) & 0xFF) == 128)
+	if is_gfx {
 		return XMemVirtualAlloc(nil, size, win32.MEM_RESERVE | win32.MEM_COMMIT, XMEM_GRAPHICS | XMEM_ADDRESS_32BIT, win32.PAGE_READWRITE)
 	}
 	log2 := (attrs >> 24) & 0x1F
@@ -203,7 +239,8 @@ XMemAllocDefault :: proc "system" (size: uint, attrs: u64) -> rawptr {
 XMemFreeDefault :: proc "system" (addr: rawptr, attrs: u64) {
 	context = hle_context()
 	if addr == nil { return }
-	if attrs & (u64(1) << 33) != 0 {
+	is_gfx := (attrs & (u64(1) << 33) != 0) || (((attrs >> 16) & 0xFF) == 128)
+	if is_gfx {
 		_ = win32.VirtualFree(addr, 0, win32.MEM_RELEASE)
 		return
 	}
@@ -234,6 +271,10 @@ XMemFree :: proc "system" (addr: rawptr, attrs: u64) {
 
 XMemIsToolsMemAvailable :: proc "system" (_out: ^u8) -> bool { context = hle_context(); return false }
 
+XMEM_FRAMES :: uint(16) // 64 KiB / 4 KiB = 16 frame numbers per physical page
+
+@(private) xmem_next_page_num: uint = 0x100000
+
 XMemAllocatePhysicalPages :: proc "system" (flags: u64, count_ptr: ^uint, out_pages: [^]uint) -> win32.BOOL {
 	context = hle_context()
 	_ = flags
@@ -253,11 +294,12 @@ XMemAllocatePhysicalPages :: proc "system" (flags: u64, count_ptr: ^uint, out_pa
 	sync.mutex_lock(&xmem_state.mu)
 	if xmem_state.allocations == nil { xmem_state.allocations = make(map[uintptr]^Physical_Section) }
 	if xmem_state.views == nil { xmem_state.views = make(map[uintptr]Physical_View) }
-	base_num: uint = 0x100000 + len(xmem_state.allocations) * 0x10000
+	base_num := xmem_next_page_num
+	xmem_next_page_num += cnt * XMEM_FRAMES
 	xmem_state.allocations[uintptr(base_num)] = sec
 	sync.mutex_unlock(&xmem_state.mu)
 	for i in 0 ..< cnt {
-		out_pages[i] = base_num + i
+		out_pages[i] = base_num + i * XMEM_FRAMES
 	}
 	return true
 }
@@ -268,45 +310,97 @@ XMemFreePhysicalPages :: proc "system" (flags: u64, count: uint, pages: [^]uint)
 	return true
 }
 
-XMemMapPhysicalPages :: proc "system" (base: rawptr, page_count: uint, _kind, _protect: u32, pages: [^]uint) -> rawptr {
-	context = hle_context()
-	if base == nil || page_count == 0 || pages == nil { return nil }
-	sync.mutex_lock(&xmem_state.mu)
-	defer sync.mutex_unlock(&xmem_state.mu)
-	first := pages[0]
-	var_sec: ^Physical_Section = nil
-	var_idx: uint = 0
-	for pbase, sec in xmem_state.allocations {
-		if first >= uint(pbase) && first < uint(pbase) + sec.pages {
-			var_sec = sec
-			var_idx = first - uint(pbase)
-			break
+@(private)
+xmem_find_section_locked :: proc(pg: uint) -> (sec: ^Physical_Section, idx: uint) {
+	for pbase, s in xmem_state.allocations {
+		base := uint(pbase)
+		span := s.pages * XMEM_FRAMES
+		if pg >= base && pg < base + span && (pg - base) % XMEM_FRAMES == 0 {
+			return s, (pg - base) / XMEM_FRAMES
 		}
 	}
-	if var_sec == nil { return nil }
+	return nil, 0
+}
+
+XMemMapPhysicalPages :: proc "system" (base: rawptr, page_count: uint, pages: [^]uint) -> rawptr {
+	context = hle_context()
+	if base == nil { return nil }
+	if page_count == 0 { return base }
+	sync.mutex_lock(&xmem_state.mu)
+	defer sync.mutex_unlock(&xmem_state.mu)
+	umv2, has_umv := kb_fn("UnmapViewOfFile2", proc "system" (win32.HANDLE, rawptr, u32) -> win32.BOOL)
+	// pages == nil means unmap the range back to placeholders
+	if pages == nil {
+		for off := uint(0); off < page_count * XMEM_PAGE; off += XMEM_PAGE {
+			addr := uintptr(base) + uintptr(off)
+			if prev, ok := xmem_state.views[addr]; ok {
+				if has_umv {
+					_ = umv2(win32.GetCurrentProcess(), rawptr(addr), XMEM_MEM_PRESERVE_PLACEHOLDER)
+				}
+				delete_key(&xmem_state.views, addr)
+				_ = prev
+			}
+		}
+		return base
+	}
 	mv3, ok := kb_fn("MapViewOfFile3", proc "system" (win32.HANDLE, win32.HANDLE, rawptr, u64, uint, u32, u32, rawptr, u32) -> rawptr)
 	if !ok { return nil }
-	len_b := page_count * XMEM_PAGE
-	_ = win32.VirtualFree(base, len_b, win32.MEM_RELEASE | XMEM_MEM_PRESERVE_PLACEHOLDER)
-	view := mv3(var_sec.handle, win32.GetCurrentProcess(), base, u64(var_idx * XMEM_PAGE), len_b, XMEM_MEM_REPLACE_PLACEHOLDER, win32.PAGE_READWRITE, nil, 0)
-	if view != base { return nil }
-	_ = win32.VirtualAlloc(base, len_b, win32.MEM_COMMIT, win32.PAGE_READWRITE)
-	xmem_state.views[uintptr(base)] = Physical_View{size = len_b, slice = {section = var_sec, index = var_idx}}
+
+	// Map contiguous runs of physical pages so non-contiguous page lists map accurately.
+	i := uint(0)
+	for i < page_count {
+		sec, start_idx := xmem_find_section_locked(pages[i])
+		if sec == nil { return nil }
+		run := uint(1)
+		for i + run < page_count {
+			if pages[i + run] == pages[i + run - 1] + XMEM_FRAMES && start_idx + run < sec.pages {
+				run += 1
+			} else {
+				break
+			}
+		}
+		run_addr := uintptr(base) + uintptr(i * XMEM_PAGE)
+		run_bytes := run * XMEM_PAGE
+		// Unmap any previous view overlapping this run, else split surrounding placeholder
+		unmapped := false
+		for r := uint(0); r < run; r += 1 {
+			a := run_addr + uintptr(r * XMEM_PAGE)
+			if _, had := xmem_state.views[a]; had {
+				if has_umv {
+					_ = umv2(win32.GetCurrentProcess(), rawptr(a), XMEM_MEM_PRESERVE_PLACEHOLDER)
+				}
+				delete_key(&xmem_state.views, a)
+				unmapped = true
+			}
+		}
+		if !unmapped {
+			_ = win32.VirtualFree(rawptr(run_addr), run_bytes, win32.MEM_RELEASE | XMEM_MEM_PRESERVE_PLACEHOLDER)
+		}
+		view := mv3(sec.handle, win32.GetCurrentProcess(), rawptr(run_addr), u64(start_idx * XMEM_PAGE), run_bytes, XMEM_MEM_REPLACE_PLACEHOLDER, win32.PAGE_READWRITE, nil, 0)
+		if view != rawptr(run_addr) { return nil }
+		_ = win32.VirtualAlloc(rawptr(run_addr), run_bytes, win32.MEM_COMMIT, win32.PAGE_READWRITE)
+		xmem_state.views[run_addr] = Physical_View{size = run_bytes, slice = {section = sec, index = start_idx}}
+		i += run
+	}
 	hooks := get_gpu_hooks()
-	if hooks.title_memory_remapped != nil { hooks.title_memory_remapped(uintptr(base), len_b) }
+	if hooks.title_memory_remapped != nil { hooks.title_memory_remapped(uintptr(base), page_count * XMEM_PAGE) }
 	return base
 }
 
-XMemMapPhysicalPagesScatter :: proc "system" (addrs: [^]rawptr, flags: u32, count: uint, pages: [^]uint) -> rawptr {
+XMemMapPhysicalPagesScatter :: proc "system" (addrs: [^]rawptr, count: uint, pages: [^]uint) -> win32.BOOL {
 	context = hle_context()
-	_ = flags
-	if addrs == nil || count == 0 || pages == nil { return nil }
+	if addrs == nil { return false }
+	if count == 0 { return true }
 	for i in 0 ..< count {
-		if XMemMapPhysicalPages(addrs[i], 1, 0, win32.PAGE_READWRITE, &pages[i]) == nil {
-			return nil
+		p: [^]uint = nil
+		if pages != nil && pages[i] != 0 {
+			p = &pages[i]
+		}
+		if XMemMapPhysicalPages(addrs[i], 1, p) == nil {
+			return false
 		}
 	}
-	return addrs[0]
+	return true
 }
 
 XMemGetWorkingSetStatistics :: proc "system" (out: ^XMem_Working_Set_Stats) -> HRESULT {
@@ -337,15 +431,7 @@ xmem_write_physical :: proc(pages: []uint, offset: uint, data: []u8) -> bool {
 	cur_off := offset
 	for pi := 0; pi < len(pages) && rem > 0; pi += 1 {
 		pg := pages[pi]
-		var_sec: ^Physical_Section = nil
-		var_idx: uint = 0
-		for pbase, sec in xmem_state.allocations {
-			if pg >= uint(pbase) && pg < uint(pbase) + sec.pages {
-				var_sec = sec
-				var_idx = pg - uint(pbase)
-				break
-			}
-		}
+		var_sec, var_idx := xmem_find_section_locked(pg)
 		if var_sec == nil { return false }
 		chunk := min(rem, int(XMEM_PAGE - cur_off))
 		FILE_MAP_ALL_ACCESS :: u32(0xF001F)
@@ -392,6 +478,7 @@ DS_Instance :: struct($T: typeid) {
 }
 
 DS_File :: struct {
+	mu:     sync.Mutex,
 	handle: ^os.File,
 }
 
@@ -400,30 +487,43 @@ DS_Status_Array :: struct {
 }
 
 DS_Queue_Desc :: struct {
-	capacity: u16,
-	priority: i8,
-	_pad:     [5]u8,
-	name:     cstring,
+	source_type: u64,
+	capacity:    u16,
+	priority:    i8,
+	_pad:        [5]u8,
+	name:        cstring,
+	unknown:     u64,
 }
 
 DS_Request :: struct {
 	options:           u64,
+	destination:       rawptr,
+	page_offset:       u64,
+	destination_size:  u32,
 	source:            rawptr,
 	offset:            u64,
 	source_size:       u32,
-	destination:       rawptr,
-	destination_size:  u32,
-	page_offset:       u32,
 	intermediate_size: u32,
+	tag:               u64,
 	name:              cstring,
 }
 
+DS_Status_Entry :: struct {
+	arr:      ^DS_Instance(DS_Status_Array),
+	idx:      u32,
+	wait_seq: u64,
+}
+
 DS_Queue :: struct {
-	mu:       sync.Mutex,
-	pending:  [dynamic]DS_Request,
-	statuses: [dynamic]struct{ arr: ^DS_Instance(DS_Status_Array), idx: u32, wait_seq: u64 },
-	seq:      u64,
-	done_seq: u64,
+	mu:              sync.Mutex,
+	staged_reqs:     [dynamic]DS_Request,
+	staged_statuses: [dynamic]DS_Status_Entry,
+	pending:         [dynamic]DS_Request,
+	statuses:        [dynamic]DS_Status_Entry,
+	enqueued_seq:    u64,
+	seq:             u64,
+	done_seq:        u64,
+	batch_err:       HRESULT,
 }
 
 @(private) ds_state: struct {
@@ -462,10 +562,10 @@ ds_execute_request :: proc(req: ^DS_Request) -> HRESULT {
 	if req.destination == nil || req.destination_size == 0 {
 		return E_INVALIDARG
 	}
-	bc := u8((req.options >> 16) & 0xFF)
+	bc := u8((req.options >> 1) & 0xF)
 	is_zlib := (req.options & 1) != 0
-	is_mem_src := (req.options & 4) != 0
-	is_page_dst := (req.options & 8) != 0
+	is_page_dst := (req.options & (u64(1) << 21)) != 0
+	is_mem_src := (req.options & (u64(1) << 22)) != 0
 
 	src_bytes := make([]u8, int(req.source_size), context.temp_allocator)
 	if is_mem_src {
@@ -474,6 +574,8 @@ ds_execute_request :: proc(req: ^DS_Request) -> HRESULT {
 	} else {
 		finst := cast(^DS_Instance(DS_File))req.source
 		if finst == nil { return E_INVALIDARG }
+		sync.mutex_lock(&finst.state.mu)
+		defer sync.mutex_unlock(&finst.state.mu)
 		_, serr := os.seek(finst.state.handle, i64(req.offset), io.Seek_From.Start)
 		if serr != nil { return END_OF_FILE }
 		total := 0
@@ -505,10 +607,11 @@ ds_execute_request :: proc(req: ^DS_Request) -> HRESULT {
 
 	plain := src_bytes
 	if is_zlib {
-		out_dyn := make([dynamic]u8, 0, int(req.destination_size), context.temp_allocator)
+		inflate_cap := int(max(req.destination_size, req.intermediate_size)) + 65536
+		out_dyn := make([dynamic]u8, 0, inflate_cap, context.temp_allocator)
 		// Strip 2-byte zlib header / 4-byte adler32 when present.
 		raw_in := src_bytes[2 : len(src_bytes) - 4] if len(src_bytes) >= 6 else src_bytes
-		if err := deflate.inflate_raw(&out_dyn, raw_in, -1, int(req.destination_size) + 4096, context.temp_allocator); err != nil {
+		if err := deflate.inflate_raw(&out_dyn, raw_in, -1, inflate_cap, context.temp_allocator); err != nil {
 			return INVALID_DATA
 		}
 		plain = out_dyn[:]
@@ -560,12 +663,18 @@ ds_worker_proc :: proc(t: ^thread.Thread) {
 
 		hr := ds_execute_request(&var_job)
 		sync.mutex_lock(&var_q.state.mu)
+		if hr != S_OK && var_q.state.batch_err == S_OK {
+			var_q.state.batch_err = hr
+		}
 		var_q.state.done_seq = max(var_q.state.done_seq, var_seq)
 		for st_idx := len(var_q.state.statuses) - 1; st_idx >= 0; st_idx -= 1 {
 			st := var_q.state.statuses[st_idx]
 			if var_q.state.done_seq >= st.wait_seq {
-				intrinsics.atomic_store(&st.arr.state.entries[st.idx], i32(hr))
+				res := var_q.state.batch_err
+				intrinsics.atomic_store(&st.arr.state.entries[st.idx], i32(res))
+				ds_st_rel(st.arr)
 				ordered_remove(&var_q.state.statuses, st_idx)
+				var_q.state.batch_err = S_OK
 			}
 		}
 		sync.mutex_unlock(&var_q.state.mu)
@@ -578,12 +687,11 @@ ds_worker_proc :: proc(t: ^thread.Thread) {
 	defer sync.mutex_unlock(&ds_state.mu)
 	if ds_state.started { return }
 	ds_state.started = true
-	for _ in 0 ..< 2 {
-		w := thread.create(ds_worker_proc)
-		if w != nil {
-			append(&ds_state.workers, w)
-			thread.start(w)
-		}
+	// Single ordered worker guarantees FIFO completion before EnqueueStatus fires.
+	w := thread.create(ds_worker_proc)
+	if w != nil {
+		append(&ds_state.workers, w)
+		thread.start(w)
 	}
 }
 
@@ -611,6 +719,8 @@ ds_worker_proc :: proc(t: ^thread.Thread) {
 			if q == t { ordered_remove(&ds_state.queues, i); break }
 		}
 		sync.mutex_unlock(&ds_state.mu)
+		delete(t.state.staged_reqs)
+		delete(t.state.staged_statuses)
 		delete(t.state.pending)
 		delete(t.state.statuses)
 		free(t)
@@ -636,31 +746,53 @@ DS_STATUS_VTABLE := [5]rawptr{rawptr(rt_missing), rawptr(ds_st_addref), rawptr(d
 	context = hle_context()
 	if q == nil || req == nil { return }
 	sync.mutex_lock(&q.state.mu)
-	append(&q.state.pending, req^)
+	q.state.enqueued_seq += 1
+	append(&q.state.staged_reqs, req^)
 	sync.mutex_unlock(&q.state.mu)
 }
 @(private) ds_q_enqueue_status :: proc "system" (q: ^DS_Instance(DS_Queue), arr: ^DS_Instance(DS_Status_Array), idx: u32) {
 	context = hle_context()
 	if q == nil || arr == nil || int(idx) >= len(arr.state.entries) { return }
 	intrinsics.atomic_store(&arr.state.entries[idx], i32(E_PENDING))
+	_ = ds_st_addref(arr)
 	sync.mutex_lock(&q.state.mu)
-	wseq := q.state.seq + u64(len(q.state.pending))
-	append(&q.state.statuses, struct{ arr: ^DS_Instance(DS_Status_Array), idx: u32, wait_seq: u64 }{arr = arr, idx = idx, wait_seq = wseq})
+	append(&q.state.staged_statuses, DS_Status_Entry{arr = arr, idx = idx, wait_seq = q.state.enqueued_seq})
 	sync.mutex_unlock(&q.state.mu)
 }
-@(private) ds_q_submit :: proc "system" (_: ^DS_Instance(DS_Queue)) {
+@(private) ds_q_submit :: proc "system" (q: ^DS_Instance(DS_Queue)) {
 	context = hle_context()
+	if q != nil {
+		sync.mutex_lock(&q.state.mu)
+		for r in q.state.staged_reqs {
+			append(&q.state.pending, r)
+		}
+		clear(&q.state.staged_reqs)
+		for st in q.state.staged_statuses {
+			if len(q.state.pending) == 0 && q.state.done_seq >= st.wait_seq {
+				intrinsics.atomic_store(&st.arr.state.entries[st.idx], i32(q.state.batch_err))
+				ds_st_rel(st.arr)
+				q.state.batch_err = S_OK
+			} else {
+				append(&q.state.statuses, st)
+			}
+		}
+		clear(&q.state.staged_statuses)
+		sync.mutex_unlock(&q.state.mu)
+	}
 	ds_ensure_workers()
 	sync.mutex_lock(&ds_state.mu)
 	sync.cond_broadcast(&ds_state.cond)
 	sync.mutex_unlock(&ds_state.mu)
+}
+@(private) ds_q_close :: proc "system" (_: ^DS_Instance(DS_Queue)) {
+	context = hle_context()
 }
 
 DS_QUEUE_VTABLE := [12]rawptr{
 	rawptr(rt_missing), rawptr(ds_q_addref), rawptr(ds_q_rel),
 	rawptr(ds_q_enqueue_req), rawptr(ds_q_enqueue_status),
 	rawptr(rt_missing), rawptr(ds_q_submit),
-	rawptr(rt_missing), rawptr(rt_missing), rawptr(rt_missing), rawptr(rt_missing), rawptr(rt_missing),
+	rawptr(rt_missing), rawptr(ds_q_close), rawptr(rt_missing), rawptr(rt_missing), rawptr(rt_missing),
 }
 
 @(private) ds_open_file :: proc "system" (_: ^Runtime_Object, path_w: [^]u16, _iid: ^Guid, out: ^rawptr) -> HRESULT {
@@ -672,7 +804,9 @@ DS_QUEUE_VTABLE := [12]rawptr{
 	pstr, _ := win32.utf16_to_utf8(use_w, context.temp_allocator)
 	pstr = strings.trim_right(pstr, "\x00")
 	h, err := os.open(pstr)
-	if err != nil { return E_FAIL }
+	if err != nil {
+		return E_FAIL
+	}
 	inst := new(DS_Instance(DS_File))
 	inst.base = {vtable = raw_data(DS_FILE_VTABLE[:]), area = "dstorage file"}
 	inst.refs = 1
@@ -680,8 +814,9 @@ DS_QUEUE_VTABLE := [12]rawptr{
 	out^ = rawptr(inst)
 	return S_OK
 }
-@(private) ds_create_status :: proc "system" (_: ^Runtime_Object, count: u32, _iid: ^Guid, out: ^rawptr) -> HRESULT {
+@(private) ds_create_status :: proc "system" (_: ^Runtime_Object, count: u32, _name: cstring, _iid: ^Guid, out: ^rawptr) -> HRESULT {
 	context = hle_context()
+	_ = _name; _ = _iid
 	if out == nil { return E_INVALIDARG }
 	inst := new(DS_Instance(DS_Status_Array))
 	inst.base = {vtable = raw_data(DS_STATUS_VTABLE[:]), area = "dstorage status"}

@@ -116,7 +116,7 @@ static_sampler_filter_for_host :: proc(s: Static_Sampler, aniso_point_mip_suppor
 // IDxcValidator (dxil.dll)
 // =========================================================================
 
-CLSID_DxcValidator := win32.GUID{0x8CA3E215, 0xF728, 0x4CF3, {0x8C, 0xDD, 0x88, 0xAA, 0xA9, 0x17, 0x5B, 0xED}}
+CLSID_DxcValidator := win32.GUID{0x8CA3E215, 0xF728, 0x4CF3, {0x8C, 0xDD, 0x88, 0xAF, 0x91, 0x75, 0x87, 0xA1}}
 IID_IDxcValidator := win32.GUID{0xA6E82BD2, 0x1FD7, 0x4826, {0x98, 0x11, 0x28, 0x57, 0xE7, 0x97, 0xF4, 0x9A}}
 
 Dxc_Create_Instance_Proc :: #type proc "system" (
@@ -210,14 +210,23 @@ resolve_dxil_create :: proc() -> Dxc_Create_Instance_Proc {
 }
 
 validate_dxil :: proc(container: []u8) -> (valid: bool, message: string, err: Shader_Error) {
+	return validate_dxil_flags(container, 0)
+}
+
+sign_dxil_in_place :: proc(container: []u8) -> (valid: bool, message: string, err: Shader_Error) {
+	return validate_dxil_flags(container, 1) // DxcValidatorFlags_InPlaceEdit = 1
+}
+
+@(private)
+validate_dxil_flags :: proc(container: []u8, flags: u32) -> (valid: bool, message: string, err: Shader_Error) {
 	create_fn := resolve_dxil_create()
 	if create_fn == nil {
-		return false, "", .Unsupported
+		return false, fmt.aprintf("dxil.dll not found"), .Unsupported
 	}
 	validator: rawptr
 	hr := create_fn(&CLSID_DxcValidator, &IID_IDxcValidator, &validator)
 	if hr < 0 || validator == nil {
-		return false, "", .Unsupported
+		return false, fmt.aprintf("DxcCreateInstance hr=0x%08X", u32(hr)), .Unsupported
 	}
 	Vtbl_Validator :: struct {
 		QueryInterface: rawptr,
@@ -234,7 +243,7 @@ validate_dxil :: proc(container: []u8) -> (valid: bool, message: string, err: Sh
 		refs   = 1,
 	}
 	result_ptr: rawptr
-	vhr := vtbl.Validate(validator, &blob, 0, &result_ptr)
+	vhr := vtbl.Validate(validator, &blob, flags, &result_ptr)
 	if result_ptr != nil {
 		Vtbl_Result :: struct {
 			QueryInterface: rawptr,
@@ -269,6 +278,9 @@ validate_dxil :: proc(container: []u8) -> (valid: bool, message: string, err: Sh
 			}
 		}
 		return false, fmt.aprintf("validation failed: 0x%08x", u32(status)), .None
+	}
+	if result_ptr == nil {
+		return vhr >= 0, fmt.aprintf("Validate vhr=0x%08X (null result)", u32(vhr)), .None
 	}
 	return vhr >= 0, "", .None
 }
@@ -771,7 +783,7 @@ shader_finish :: proc(s: ^Dxil_Shader) -> [dynamic]u8 {
 		append(&props, i32op(s, 1))
 		append(&props, Md_Op{present = true, id = bc_md_node(&s.m, {i32op(s, 3), i32op(s, s.gs_max), i32op(s, 1), i32op(s, 5), i32op(s, 1)})})
 	}
-	if s.has_wave {
+	if s.has_wave && s.has_threads {
 		wn := Md_Op{present = true, id = bc_md_node(&s.m, {i32op(s, s.wave_size)})}
 		append(&props, i32op(s, 11), wn)
 	}
@@ -1811,6 +1823,47 @@ lower_valu :: proc(l: ^Lower_Ctx, inst: ^Inst, guard: Maybe(V)) {
 		return
 	}
 
+	if name == "v_cvt_pkrtz_f16_f32" && len(inst.fields.valu.src) >= 2 {
+		fa, oka := lower_foperand(l, inst, 0, inst.fields.valu.src[0])
+		fb, okb := lower_foperand(l, inst, 1, inst.fields.valu.src[1])
+		if oka && okb {
+			lo := shader_op(&l.s, c, "legacyF32ToF16", .Read_None, l.s.t.i32, 130, {fa})
+			hi := shader_op(&l.s, c, "legacyF32ToF16", .Read_None, l.s.t.i32, 130, {fb})
+			lo_m := bc_bin(&l.s.m, c, .And, lo, bc_i32(&l.s.m, 0xFFFF))
+			hi_s := bc_bin(&l.s.m, c, .Shl, hi, bc_i32(&l.s.m, 16))
+			write_v(l, inst, guard, bc_bin(&l.s.m, c, .Or, lo_m, hi_s))
+		}
+		return
+	}
+
+	if name == "v_cvt_f16_f32" {
+		if fa, ok := lower_foperand(l, inst, 0, inst.fields.valu.src[0]); ok {
+			lo := shader_op(&l.s, c, "legacyF32ToF16", .Read_None, l.s.t.i32, 130, {fa})
+			write_v(l, inst, guard, bc_bin(&l.s.m, c, .And, lo, bc_i32(&l.s.m, 0xFFFF)))
+		}
+		return
+	}
+
+	if name == "v_cvt_f32_f16" {
+		if ia, ok := lower_operand(l, inst, inst.fields.valu.src[0]); ok {
+			lo := bc_bin(&l.s.m, c, .And, ia, bc_i32(&l.s.m, 0xFFFF))
+			fv := shader_op(&l.s, c, "legacyF16ToF32", .Read_None, l.s.t.f32, 131, {lo})
+			write_f(l, inst, guard, fv)
+		}
+		return
+	}
+
+	if name == "v_pack_b32_f16" && len(inst.fields.valu.src) >= 2 {
+		ia, oka := lower_operand(l, inst, inst.fields.valu.src[0])
+		ib, okb := lower_operand(l, inst, inst.fields.valu.src[1])
+		if oka && okb {
+			lo_m := bc_bin(&l.s.m, c, .And, ia, bc_i32(&l.s.m, 0xFFFF))
+			hi_s := bc_bin(&l.s.m, c, .Shl, ib, bc_i32(&l.s.m, 16))
+			write_v(l, inst, guard, bc_bin(&l.s.m, c, .Or, lo_m, hi_s))
+		}
+		return
+	}
+
 	if name == "v_cvt_f32_i32" || name == "v_cvt_f32_u32" || name == "v_cvt_i32_f32" || name == "v_cvt_u32_f32" {
 		if name == "v_cvt_f32_i32" || name == "v_cvt_f32_u32" {
 			if a, ok := lower_operand(l, inst, inst.fields.valu.src[0]); ok {
@@ -1841,6 +1894,36 @@ lower_valu :: proc(l: ^Lower_Ctx, inst: ^Inst, guard: Maybe(V)) {
 		case "v_max_f32":  r = shader_op(&l.s, c, "binary.f32", .Read_None, l.s.t.f32, 35, {fa, fb})
 		}
 		write_f(l, inst, guard, r)
+		return
+	}
+
+	if name == "v_med3_f32" && len(inst.fields.valu.src) >= 3 {
+		fa, oka := lower_foperand(l, inst, 0, inst.fields.valu.src[0])
+		fb, okb := lower_foperand(l, inst, 1, inst.fields.valu.src[1])
+		fc, okc := lower_foperand(l, inst, 2, inst.fields.valu.src[2])
+		if oka && okb && okc {
+			mn := shader_op(&l.s, c, "binary.f32", .Read_None, l.s.t.f32, 36, {fa, fb})
+			mx := shader_op(&l.s, c, "binary.f32", .Read_None, l.s.t.f32, 35, {fa, fb})
+			m2 := shader_op(&l.s, c, "binary.f32", .Read_None, l.s.t.f32, 36, {mx, fc})
+			r := shader_op(&l.s, c, "binary.f32", .Read_None, l.s.t.f32, 35, {mn, m2})
+			write_f(l, inst, guard, r)
+		}
+		return
+	}
+
+	if (name == "v_med3_i32" || name == "v_med3_u32") && len(inst.fields.valu.src) >= 3 {
+		ia, oka := lower_operand(l, inst, inst.fields.valu.src[0])
+		ib, okb := lower_operand(l, inst, inst.fields.valu.src[1])
+		ic, okc := lower_operand(l, inst, inst.fields.valu.src[2])
+		if oka && okb && okc {
+			op_min := u32(38) if name == "v_med3_i32" else u32(40)
+			op_max := u32(37) if name == "v_med3_i32" else u32(39)
+			mn := shader_op(&l.s, c, "binary.i32", .Read_None, l.s.t.i32, op_min, {ia, ib})
+			mx := shader_op(&l.s, c, "binary.i32", .Read_None, l.s.t.i32, op_max, {ia, ib})
+			m2 := shader_op(&l.s, c, "binary.i32", .Read_None, l.s.t.i32, op_min, {mx, ic})
+			r := shader_op(&l.s, c, "binary.i32", .Read_None, l.s.t.i32, op_max, {mn, m2})
+			write_v(l, inst, guard, r)
+		}
 		return
 	}
 
@@ -2065,7 +2148,7 @@ lower_program :: proc(
 	l: Lower_Ctx
 	pixel := native.stage == .Ps
 	l.s = shader_create(pixel)
-	if options.wave_mode != .Auto {
+	if options.wave_mode != .Auto && (native.stage == .Cs || native.stage == .Ms) {
 		l.s.has_wave = true
 		l.s.wave_size = u32(target_wave_lanes(options.wave_mode))
 	}
@@ -2095,7 +2178,7 @@ lower_program :: proc(
 	l.samplers = make([dynamic][4]u32)
 	defer lower_destroy(&l)
 
-	if p.wave64 {
+	if p.wave64 && (native.stage == .Cs || native.stage == .Ms) {
 		l.s.has_wave = true
 		l.s.wave_size = 64
 	}
@@ -2191,11 +2274,27 @@ lower_program :: proc(
 					shader_op(&l.s, l.cur, "barrier", .No_Duplicate, l.s.t.void_ty, 80, {bc_i32(&l.s.m, 9)})
 				}
 			case .Smem:
-				if strings.has_prefix(name, "s_load_dword") || strings.has_prefix(name, "s_buffer_load_dword") {
+				if strings.has_prefix(name, "s_buffer_load_dword") {
+					if src, dok := l.desc_map[site]; dok && (src.kind == .Loaded || src.kind == .Built) && src.address.param < len(native.layout) {
+						rp := native.layout[src.address.param]
+						cbv := shader_root_cbv_handle(&l.s, rp.slot)
+						off_b := u32(inst.fields.s_offset) if inst.fields.s_offset >= 0 else u32(0)
+						off_w := off_b / 4
+						cnt := int(inst.fields.dst.dwords) if inst.fields.has_dst else 1
+						for dw in 0 ..< cnt {
+							idx_dw := off_w + u32(dw)
+							loaded := shader_op(&l.s, l.cur, "cbufferLoadLegacy.i32", .Read_Only, l.s.t.cbuf_ret, 59, {cbv, bc_i32(&l.s.m, idx_dw / 4)})
+							exv := bc_extract(&l.s.m, l.cur, loaded, idx_dw % 4)
+							if dw < len(inst.writes) {
+								l.vals[inst.writes[dw].val] = Val{kind = .I32, v = exv}
+							}
+						}
+					}
+				} else if strings.has_prefix(name, "s_load_dword") {
 					if addr, aok := l.scalar_map[site]; aok && addr.param < len(native.layout) {
 						rp := native.layout[addr.param]
 						if rp.root == .Descriptor || rp.root == .Table {
-							cbv := shader_root_cbv_handle(&l.s, u8(addr.param))
+							cbv := shader_root_cbv_handle(&l.s, rp.slot)
 							off_w := addr.offset / 4
 							cnt := int(inst.fields.dst.dwords) if inst.fields.has_dst else 1
 							for dw in 0 ..< cnt {
@@ -2234,13 +2333,39 @@ lower_program :: proc(
 				ex_err := lower_export(&l, site)
 				if ex_err != .None { return {}, ex_err }
 			case .Ds, .Buffer, .Image, .Flat:
-				if src, dok := l.desc_map[site]; dok && src.kind == .Loaded {
-					l.s.flags |= DXIL_FLAG_RESOURCE_HEAP
+				if src, dok := l.desc_map[site]; dok && (src.kind == .Loaded || src.kind == .Built) && src.address.param < len(native.layout) {
 					if inst.fields.kind == .Buffer && strings.contains(name, "load") {
-						l.s.flags |= DXIL_FLAG_RAW_BUFFERS
-						idx_v := bc_i32(&l.s.m, src.address.offset / 4)
-						h := shader_op(&l.s, l.cur, "createHandleFromHeap", .Read_None, l.s.t.handle, 218, {idx_v, bc_i1(&l.s.m, false), bc_i1(&l.s.m, false)})
-						res_ret := shader_op(&l.s, l.cur, "rawBufferLoad.i32", .Read_Only, l.s.t.res_ret, 139, {h, bc_i32(&l.s.m, 0), bc_undef(&l.s.m, l.s.t.i32), bc_i8(&l.s.m, 0xF), bc_i32(&l.s.m, 4)})
+						rp := native.layout[src.address.param]
+						h := shader_root_srv_handle(&l.s, rp.slot)
+						byte_off := bc_i32(&l.s.m, u32(inst.fields.offset0))
+						if inst.fields.idxen && inst.fields.has_base {
+							iop := inst.fields.base
+							iop.dwords = 1
+							if iv, iok := lower_operand(&l, inst, iop); iok {
+								stride := u32(16)
+								if inst.fields.has_dst && inst.fields.dst.dwords > 0 {
+									stride = u32(inst.fields.dst.dwords) * 4
+								}
+								scaled := bc_bin(&l.s.m, l.cur, .Mul, iv, bc_i32(&l.s.m, stride))
+								byte_off = bc_bin(&l.s.m, l.cur, .Add, byte_off, scaled)
+							}
+						}
+						if inst.fields.offen && inst.fields.has_base {
+							vop := inst.fields.base
+							if inst.fields.idxen {
+								vop.code += 1
+							}
+							vop.dwords = 1
+							if vv, vok := lower_operand(&l, inst, vop); vok {
+								byte_off = bc_bin(&l.s.m, l.cur, .Add, byte_off, vv)
+							}
+						}
+						if inst.fields.soffset.kind == .Scalar || (inst.fields.soffset.kind == .Const && inst.fields.soffset.code != 128) || inst.fields.soffset.kind == .Literal {
+							if sv, sok := lower_operand(&l, inst, inst.fields.soffset); sok {
+								byte_off = bc_bin(&l.s.m, l.cur, .Add, byte_off, sv)
+							}
+						}
+						res_ret := shader_op(&l.s, l.cur, "rawBufferLoad.i32", .Read_Only, l.s.t.res_ret, 139, {h, byte_off, bc_undef(&l.s.m, l.s.t.i32), bc_i8(&l.s.m, 0xF), bc_i32(&l.s.m, 4)})
 						for w, wi in inst.writes {
 							if wi < 4 {
 								l.vals[w.val] = Val{kind = .I32, v = bc_extract(&l.s.m, l.cur, res_ret, u32(wi))}

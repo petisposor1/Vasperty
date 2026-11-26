@@ -358,6 +358,8 @@ gpu_init :: proc() {
 gpu_fini :: proc() {
 	unregister_gpu_hooks()
 	gpu_runtime_fini()
+	fini_host_draw()
+	fini_host_textures()
 	fini_shader_cache()
 	fini_watch()
 	fini_gpu_objects()

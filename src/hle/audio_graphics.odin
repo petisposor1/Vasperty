@@ -557,8 +557,9 @@ dsp_process_fdn :: proc(rv: ^Dsp_Reverb, input, output: []f32, frames, ch: int, 
 	}
 }
 
-XDspConnectWithMaximumStreamLimit :: proc "system" (_mem: rawptr, _mem_sz: u32, _max_streams: u32, out: ^^Dsp_Instance) -> HRESULT {
+XDspConnectWithMaximumStreamLimit :: proc "system" (_mem: rawptr, _mem_sz: u32, _ir_seconds: u32, _max_streams: u32, _max_channels: u32, out: ^^Dsp_Instance) -> HRESULT {
 	context = hle_context()
+	_ = _mem; _ = _mem_sz; _ = _ir_seconds; _ = _max_streams; _ = _max_channels
 	if out == nil { return E_INVALIDARG }
 	inst := new(Dsp_Instance)
 	sync.mutex_lock(&dsp_state.mu)
@@ -965,18 +966,30 @@ fini_gameinput :: proc() {
 	context = hle_context()
 	return GAMEINPUT_READING_NOT_FOUND
 }
-@(private) gi_reg_cb :: proc "system" (_: ^GameInput_Object, _: rawptr, _: u32, _: u32, _: rawptr, _: rawptr, tok: ^u64) -> HRESULT {
+@(private) gi_reg_reading_cb :: proc "system" (_: ^GameInput_Object, _: rawptr, _: u32, _: u64, _: u32, _: rawptr, _: rawptr, tok: ^u64) -> HRESULT {
 	context = hle_context()
-	if tok != nil { tok^ = next_token() }
+	if uintptr(tok) > 0x10000 { tok^ = next_token() }
+	return S_OK
+}
+@(private) gi_reg_dev_cb :: proc "system" (_: ^GameInput_Object, _: rawptr, _: u32, _: u32, _: u32, _: rawptr, _: rawptr, tok: ^u64) -> HRESULT {
+	context = hle_context()
+	if uintptr(tok) > 0x10000 { tok^ = next_token() }
+	return S_OK
+}
+@(private) gi_reg_other_cb :: proc "system" (_: ^GameInput_Object, _: rawptr, _: rawptr, _: rawptr, tok: ^u64) -> HRESULT {
+	context = hle_context()
+	if uintptr(tok) > 0x10000 { tok^ = next_token() }
 	return S_OK
 }
 @(private) gi_unreg_cb :: proc "system" (_: ^GameInput_Object, _: u64, _: u64) -> bool { context = hle_context(); return true }
 
+@(private) gi_stop_cb :: proc "system" (_: ^GameInput_Object, _: u64) { context = hle_context() }
+
 GAMEINPUT_VTABLE := [18]rawptr{
 	rawptr(rt_missing), rawptr(gi_add_ref), rawptr(gi_release),
 	rawptr(gi_get_cur_ts), rawptr(gi_get_cur_reading), rawptr(gi_next_reading), rawptr(gi_prev_reading),
-	rawptr(rt_missing), rawptr(gi_reg_cb), rawptr(rt_missing), rawptr(rt_missing),
-	rawptr(gi_unreg_cb), rawptr(rt_missing), rawptr(rt_missing), rawptr(rt_missing), rawptr(rt_missing), rawptr(rt_missing), rawptr(rt_missing),
+	rawptr(rt_missing), rawptr(gi_reg_reading_cb), rawptr(gi_reg_dev_cb), rawptr(gi_reg_other_cb),
+	rawptr(gi_reg_other_cb), rawptr(gi_stop_cb), rawptr(gi_unreg_cb), rawptr(rt_missing), rawptr(rt_missing), rawptr(rt_missing), rawptr(rt_missing),
 }
 
 GameInputCreate :: proc "system" (out: ^^GameInput_Object) -> HRESULT {

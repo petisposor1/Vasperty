@@ -20,7 +20,7 @@ rt_add_ref :: proc "system" (_: ^Runtime_Object) -> u32 {
 	return 1
 }
 
-rt_missing :: proc "system" (this: ^Runtime_Object) -> HRESULT {
+rt_missing :: proc "system" (_: ^Runtime_Object) -> HRESULT {
 	context = hle_context()
 	return E_NOTIMPL
 }
