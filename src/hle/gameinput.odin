@@ -92,6 +92,22 @@ XInput_State :: struct {
 	gamepad:       XInput_Gamepad,
 }
 
+Joy_Info_Ex :: struct {
+	dwSize:         u32,
+	dwFlags:        u32,
+	dwXpos:         u32,
+	dwYpos:         u32,
+	dwZpos:         u32,
+	dwRpos:         u32,
+	dwUpos:         u32,
+	dwVpos:         u32,
+	dwButtons:      u32,
+	dwButtonNumber: u32,
+	dwPOV:          u32,
+	dwReserved1:    u32,
+	dwReserved2:    u32,
+}
+
 GameInput_Object :: struct {
 	vtable: rawptr,
 	refs:   u32,
@@ -117,6 +133,7 @@ GameInput_Reading :: struct {
 @(private) gi_auto_press_a: bool
 @(private) gi_xinput_loaded: bool
 @(private) gi_xinput_get_state: proc "system" (user_index: u32, state: ^XInput_State) -> u32
+@(private) gi_joy_get_pos_ex: proc "system" (joy_id: u32, pji: ^Joy_Info_Ex) -> u32
 
 @(private) gi_device_info := GameInput_Device_Info {
 	info_size        = size_of(GameInput_Device_Info),
@@ -161,8 +178,13 @@ gi_ensure_init :: proc() {
 		gi_xinput_loaded = true
 		if fn, ok := host_fn("xinput1_4.dll", "XInputGetState", proc "system" (u32, ^XInput_State) -> u32); ok {
 			gi_xinput_get_state = fn
+		} else if fn13, ok13 := host_fn("xinput1_3.dll", "XInputGetState", proc "system" (u32, ^XInput_State) -> u32); ok13 {
+			gi_xinput_get_state = fn13
 		} else if fn2, ok2 := host_fn("xinput9_1_0.dll", "XInputGetState", proc "system" (u32, ^XInput_State) -> u32); ok2 {
 			gi_xinput_get_state = fn2
+		}
+		if jfn, jok := host_fn("winmm.dll", "joyGetPosEx", proc "system" (u32, ^Joy_Info_Ex) -> u32); jok {
+			gi_joy_get_pos_ex = jfn
 		}
 	}
 }
@@ -190,31 +212,74 @@ gi_sample_gamepad :: proc() -> GameInput_Gamepad_State {
 	gi_ensure_init()
 	st: GameInput_Gamepad_State
 
-	// 1. Real Xbox controller via XInput (slot 0)
+	// 1. Real Xbox controller via XInput (scan all 4 slots 0..3)
+	xinput_found := false
 	if gi_xinput_get_state != nil {
-		xs: XInput_State
-		if gi_xinput_get_state(0, &xs) == 0 {
-			xb := xs.gamepad.buttons
-			if (xb & 0x0001) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_UP }
-			if (xb & 0x0002) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_DOWN }
-			if (xb & 0x0004) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_LEFT }
-			if (xb & 0x0008) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_RIGHT }
-			if (xb & 0x0010) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_MENU }
-			if (xb & 0x0020) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_VIEW }
-			if (xb & 0x0040) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_LEFT_THUMBSTICK }
-			if (xb & 0x0080) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_RIGHT_THUMBSTICK }
-			if (xb & 0x0100) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_LEFT_SHOULDER }
-			if (xb & 0x0200) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_RIGHT_SHOULDER }
-			if (xb & 0x1000) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_A }
-			if (xb & 0x2000) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_B }
-			if (xb & 0x4000) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_X }
-			if (xb & 0x8000) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_Y }
-			st.left_trigger = f32(xs.gamepad.left_trigger) / 255.0
-			st.right_trigger = f32(xs.gamepad.right_trigger) / 255.0
-			st.left_thumbstick_x = gi_norm_stick(xs.gamepad.thumb_lx, 7849)
-			st.left_thumbstick_y = gi_norm_stick(xs.gamepad.thumb_ly, 7849)
-			st.right_thumbstick_x = gi_norm_stick(xs.gamepad.thumb_rx, 8689)
-			st.right_thumbstick_y = gi_norm_stick(xs.gamepad.thumb_ry, 8689)
+		for slot in u32(0) ..< 4 {
+			xs: XInput_State
+			if gi_xinput_get_state(slot, &xs) == 0 {
+				xinput_found = true
+				xb := xs.gamepad.buttons
+				if (xb & 0x0001) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_UP }
+				if (xb & 0x0002) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_DOWN }
+				if (xb & 0x0004) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_LEFT }
+				if (xb & 0x0008) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_RIGHT }
+				if (xb & 0x0010) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_MENU }
+				if (xb & 0x0020) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_VIEW }
+				if (xb & 0x0040) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_LEFT_THUMBSTICK }
+				if (xb & 0x0080) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_RIGHT_THUMBSTICK }
+				if (xb & 0x0100) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_LEFT_SHOULDER }
+				if (xb & 0x0200) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_RIGHT_SHOULDER }
+				if (xb & 0x1000) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_A }
+				if (xb & 0x2000) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_B }
+				if (xb & 0x4000) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_X }
+				if (xb & 0x8000) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_Y }
+				st.left_trigger = f32(xs.gamepad.left_trigger) / 255.0
+				st.right_trigger = f32(xs.gamepad.right_trigger) / 255.0
+				st.left_thumbstick_x = gi_norm_stick(xs.gamepad.thumb_lx, 7849)
+				st.left_thumbstick_y = gi_norm_stick(xs.gamepad.thumb_ly, 7849)
+				st.right_thumbstick_x = gi_norm_stick(xs.gamepad.thumb_rx, 8689)
+				st.right_thumbstick_y = gi_norm_stick(xs.gamepad.thumb_ry, 8689)
+				break
+			}
+		}
+	}
+
+	// 1b. PlayStation (DualShock 4 / DualSense) & Generic USB/BT gamepad via WinMM joyGetPosEx
+	if !xinput_found && gi_joy_get_pos_ex != nil {
+		for jid in u32(0) ..< 4 {
+			ji := Joy_Info_Ex{dwSize = size_of(Joy_Info_Ex), dwFlags = 0xFF} // JOY_RETURNALL
+			if gi_joy_get_pos_ex(jid, &ji) == 0 {
+				jb := ji.dwButtons
+				// DualShock 4 / DualSense HID button mapping: 0=Square(X), 1=Cross(A), 2=Circle(B), 3=Triangle(Y)
+				if (jb & (1 << 0)) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_X }
+				if (jb & (1 << 1)) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_A }
+				if (jb & (1 << 2)) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_B }
+				if (jb & (1 << 3)) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_Y }
+				if (jb & (1 << 4)) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_LEFT_SHOULDER }
+				if (jb & (1 << 5)) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_RIGHT_SHOULDER }
+				if (jb & (1 << 6)) != 0 { st.left_trigger = 1.0 }
+				if (jb & (1 << 7)) != 0 { st.right_trigger = 1.0 }
+				if (jb & (1 << 8)) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_VIEW }
+				if (jb & (1 << 9)) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_MENU }
+				if (jb & (1 << 10)) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_LEFT_THUMBSTICK }
+				if (jb & (1 << 11)) != 0 { st.buttons |= GAMEINPUT_GAMEPAD_RIGHT_THUMBSTICK }
+				if ji.dwPOV != 0xFFFF && ji.dwPOV < 36000 {
+					if ji.dwPOV >= 31500 || ji.dwPOV <= 4500 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_UP }
+					if ji.dwPOV >= 4500 && ji.dwPOV <= 13500 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_RIGHT }
+					if ji.dwPOV >= 13500 && ji.dwPOV <= 22500 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_DOWN }
+					if ji.dwPOV >= 22500 && ji.dwPOV <= 31500 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_LEFT }
+				}
+				lx := (f32(ji.dwXpos) - 32767.5) / 32767.5
+				ly := -(f32(ji.dwYpos) - 32767.5) / 32767.5
+				rx := (f32(ji.dwZpos) - 32767.5) / 32767.5
+				ry := -(f32(ji.dwRpos) - 32767.5) / 32767.5
+				if lx > 0.2 || lx < -0.2 { st.left_thumbstick_x = lx }
+				if ly > 0.2 || ly < -0.2 { st.left_thumbstick_y = ly }
+				if rx > 0.2 || rx < -0.2 { st.right_thumbstick_x = rx }
+				if ry > 0.2 || ry < -0.2 { st.right_thumbstick_y = ry }
+				break
+			}
 		}
 	}
 

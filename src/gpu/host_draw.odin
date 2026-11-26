@@ -164,6 +164,18 @@ g_dummy_zero_buf: rawptr
 @(private)
 g_dummy_zero_va: u64
 
+UPLOAD_RING_BYTES :: u64(16 << 20) // 16 MiB persistent mapped upload ring buffer
+@(private)
+g_upload_ring_mu: sync.Mutex
+@(private)
+g_upload_ring_buf: rawptr
+@(private)
+g_upload_ring_cpu: [^]u8
+@(private)
+g_upload_ring_gpu: u64
+@(private)
+g_upload_ring_pos: u64
+
 @(private)
 Upload_Res_Vtbl :: struct {
 	_pad0:                 [8]rawptr,
@@ -290,6 +302,15 @@ fini_host_draw :: proc() {
 	if g_default_srv_heap != nil { com_release(g_default_srv_heap); g_default_srv_heap = nil }
 	if g_default_smp_heap != nil { com_release(g_default_smp_heap); g_default_smp_heap = nil }
 	if g_dummy_zero_buf != nil { com_release(g_dummy_zero_buf); g_dummy_zero_buf = nil; g_dummy_zero_va = 0 }
+	sync.mutex_lock(&g_upload_ring_mu)
+	if g_upload_ring_buf != nil {
+		com_release(g_upload_ring_buf)
+		g_upload_ring_buf = nil
+		g_upload_ring_cpu = nil
+		g_upload_ring_gpu = 0
+		g_upload_ring_pos = 0
+	}
+	sync.mutex_unlock(&g_upload_ring_mu)
 }
 
 @(private)
@@ -510,6 +531,41 @@ map_host_topology :: proc "contextless" (t: u32) -> u32 {
 g_up_err_logs: u64
 
 @(private)
+ensure_upload_ring_locked :: proc(hdev: rawptr) -> bool {
+	if g_upload_ring_buf != nil && g_upload_ring_cpu != nil && g_upload_ring_gpu != 0 {
+		return true
+	}
+	hp := D3D12_HEAP_PROPERTIES{Type = D3D12_HEAP_TYPE_UPLOAD}
+	rd := D3D12_RESOURCE_DESC{
+		Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER,
+		Width            = UPLOAD_RING_BYTES,
+		Height           = 1,
+		DepthOrArraySize = 1,
+		MipLevels        = 1,
+		Format           = 0,
+		SampleCount      = 1,
+		Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+	}
+	dvt := (cast(^^Draw_Dev_Vtbl)hdev)^
+	res_iid := IID_ID3D12Resource_G
+	buf: rawptr
+	if dvt.CreateCommittedResource(hdev, &hp, 0, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nil, &res_iid, &buf) < 0 || buf == nil {
+		return false
+	}
+	rvt := (cast(^^Upload_Res_Vtbl)buf)^
+	mapped: rawptr
+	if rvt.Map(buf, 0, nil, &mapped) < 0 || mapped == nil {
+		com_release(buf)
+		return false
+	}
+	g_upload_ring_buf = buf
+	g_upload_ring_cpu = cast([^]u8)mapped
+	g_upload_ring_gpu = rvt.GetGPUVirtualAddress(buf)
+	g_upload_ring_pos = 0
+	return true
+}
+
+@(private)
 upload_cpu_to_host_buf :: proc(cl: ^Console_Cmd_List, cpu_va: u64, size: u32) -> u64 {
 	if cl == nil || cpu_va < 0x10000 || size == 0 || size > (64 << 20) {
 		return 0
@@ -517,6 +573,25 @@ upload_cpu_to_host_buf :: proc(cl: ^Console_Cmd_List, cpu_va: u64, size: u32) ->
 	hdev := ensure_host_device()
 	if hdev == nil { return 0 }
 	aligned_sz := (u64(size) + 255) & ~u64(255)
+
+	// Fast path: sub-allocate from persistent 16 MiB mapped upload ring (zero D3D12 allocations per draw!).
+	if aligned_sz <= (4 << 20) {
+		sync.mutex_lock(&g_upload_ring_mu)
+		if ensure_upload_ring_locked(hdev) {
+			if g_upload_ring_pos + aligned_sz > UPLOAD_RING_BYTES {
+				g_upload_ring_pos = 0
+			}
+			off := g_upload_ring_pos
+			g_upload_ring_pos += aligned_sz
+			dst := rawptr(&g_upload_ring_cpu[off])
+			gpu_va := g_upload_ring_gpu + off
+			sync.mutex_unlock(&g_upload_ring_mu)
+			mem.copy(dst, rawptr(uintptr(cpu_va)), int(size))
+			return gpu_va
+		}
+		sync.mutex_unlock(&g_upload_ring_mu)
+	}
+
 	hp := D3D12_HEAP_PROPERTIES{Type = D3D12_HEAP_TYPE_UPLOAD}
 	rd := D3D12_RESOURCE_DESC{
 		Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER,

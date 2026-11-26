@@ -585,18 +585,18 @@ XDspDisconnect :: proc "system" (inst: ^Dsp_Instance) -> HRESULT {
 	}
 	return S_OK
 }
-XDspActivate :: proc "system" (inst: ^Dsp_Instance, _kind, opts, ir_floats, ch: u32, out_stream: ^^Dsp_Stream, out_status: ^rawptr) -> HRESULT {
+XDspActivate :: proc "system" (inst: ^Dsp_Instance, _kind: u32, _params: rawptr, out_stream: ^^Dsp_Stream, out_status: ^rawptr) -> HRESULT {
 	context = hle_context()
-	_ = opts
-	if inst == nil || out_stream == nil { return E_INVALIDARG }
+	_ = _kind; _ = _params
+	if inst == nil || uintptr(out_stream) < 0x10000 { return E_INVALIDARG }
 	s := new(Dsp_Stream)
-	s.channels = clamp(ch, 1, 2)
-	s.reverb = dsp_make_reverb(ir_floats)
+	s.channels = 2
+	s.reverb = dsp_make_reverb(16384)
 	sync.mutex_lock(&dsp_state.mu)
 	append(&inst.streams, s)
 	sync.mutex_unlock(&dsp_state.mu)
 	out_stream^ = s
-	if out_status != nil { out_status^ = rawptr(&s.status[0]) }
+	if uintptr(out_status) >= 0x10000 { out_status^ = rawptr(&s.status[0]) }
 	return S_OK
 }
 XDspDeactivate :: proc "system" (s: ^Dsp_Stream) -> HRESULT {
