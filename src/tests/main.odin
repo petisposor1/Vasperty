@@ -1416,6 +1416,41 @@ test_vendor_and_ring :: proc() {
 	got_blob, got_ok := vasperty_gpu.pso_library_load(&lib, pso_desc[:])
 	assert(got_ok && len(got_blob) == len(pso_blob) && got_blob[0] == 0xDE)
 	delete(got_blob)
+
+	// Branchless u64-stride shadow_merge_writeback oracle verification
+	for n in ([?]int{0, 1, 7, 8, 63, 64, 65, 193, 4096}) {
+		old := make([]u8, n)
+		title := make([]u8, n)
+		host := make([]u8, n)
+		expected := make([]u8, n)
+		for i := 0; i < n; i += 1 {
+			old[i] = 0x11
+			title[i] = 0x22 if (i % 3 == 0) else 0x11
+			host[i] = (0x22 if (i % 2 == 0) else 0x33) if (i % 5 == 0) else 0x11
+			expected[i] = title[i] if host[i] == old[i] else host[i]
+		}
+		_, _ = vasperty_gpu.shadow_merge_writeback(title, host, old)
+		assert(slice.equal(title, expected))
+		assert(slice.equal(host, expected))
+		delete(old); delete(title); delete(host); delete(expected)
+	}
+
+	// Integer RT blend sanitization (#1152), typed UAV format guard (#2462), sampler filter (#2031)
+	rt_fmts := [2]u32{28, 62} // R8G8B8A8_UNORM + R8_UINT
+	indep := false
+	en := [8]bool{true, false, false, false, false, false, false, false}
+	disabled := vasperty_gpu.sanitize_blend_for_targets(rt_fmts[:], &indep, &en)
+	assert(disabled == 1 && indep && en[0] && !en[1])
+	assert(vasperty_gpu.format_supports_typed_uav_store(62, false))
+	assert(!vasperty_gpu.format_supports_typed_uav_store(28, false))
+	assert(vasperty_gpu.format_supports_typed_uav_store(28, true))
+	assert(vasperty_gpu.sampler_filter_for_host(0x54, true) == 0x54)
+	assert(vasperty_gpu.sampler_filter_for_host(0x54, false) == 0x55)
+
+	// PE DllCharacteristics bit names (#1988)
+	dnames := vasperty_pe.dll_characteristics_names(0x0160)
+	assert(dnames == "HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT")
+	delete(dnames)
 	fmt.println("ok")
 }
 

@@ -2,6 +2,7 @@ package vasperty_cli
 
 import "core:fmt"
 import "core:os"
+import "core:strconv"
 import vasperty_app "vasperty:app"
 import vasperty_hle "vasperty:hle"
 import vasperty_shader "vasperty:shader"
@@ -14,7 +15,8 @@ usage :: proc() {
 	fmt.println("  vasperty.exe doctor [--prune-cache]")
 	fmt.println("  vasperty.exe inspect <pe-path> [--imports] [--exports]")
 	fmt.println("  vasperty.exe census <paths...> [--strict] [--missing]")
-	fmt.println("  vasperty.exe translate <paths...> [--validate] [--wave16|--wave32|--wave64]")
+	fmt.println("  vasperty.exe translate <paths...> [--validate] [--wave16|--wave32|--wave64] [--jobs N]")
+	fmt.println("  vasperty.exe probe <archives...>")
 	fmt.println("  vasperty.exe run <exe> [--strict] [--zero] [--execute] [--series-s]")
 	fmt.println("  vasperty.exe bench [seconds]")
 }
@@ -72,20 +74,41 @@ main :: proc() {
 	case "translate":
 		validate := false
 		wave := vasperty_shader.Target_Wave_Mode.Auto
+		jobs := 0
 		paths := make([dynamic]string, 0, len(rest), context.temp_allocator)
-		for a in rest {
+		for i := 0; i < len(rest); i += 1 {
+			a := rest[i]
 			if a == "--validate" { validate = true }
 			else if a == "--wave16" { wave = .Wave16 }
 			else if a == "--wave32" { wave = .Wave32 }
 			else if a == "--wave64" { wave = .Wave64 }
-			else { append(&paths, a) }
+			else if a == "--jobs" {
+				if i + 1 >= len(rest) {
+					fmt.eprintln("translate: --jobs requires a positive integer")
+					os.exit(2)
+				}
+				i += 1
+				v, ok := strconv.parse_int(rest[i])
+				if !ok || v <= 0 {
+					fmt.eprintln("translate: --jobs must be >= 1")
+					os.exit(2)
+				}
+				jobs = v
+			} else { append(&paths, a) }
 		}
 		if len(paths) == 0 {
 			fmt.eprintln("translate requires at least one path")
 			os.exit(2)
 		}
-		_, code := vasperty_app.app_translate(paths[:], validate, wave)
+		_, code := vasperty_app.app_translate(paths[:], validate, wave, jobs)
 		os.exit(code)
+
+	case "probe":
+		if len(rest) == 0 {
+			fmt.eprintln("probe requires at least one archive path")
+			os.exit(2)
+		}
+		os.exit(vasperty_app.app_probe(rest))
 
 	case "run":
 		strict, execute, zero := false, false, false

@@ -64,7 +64,8 @@ vasperty.exe config
 vasperty.exe doctor [--prune-cache]
 vasperty.exe inspect <pe-path> [--imports] [--exports]
 vasperty.exe census <paths...> [--strict] [--missing]
-vasperty.exe translate <paths...> [--validate] [--wave16|--wave32|--wave64]
+vasperty.exe translate <paths...> [--validate] [--wave16|--wave32|--wave64] [--jobs N]
+vasperty.exe probe <archives...>
 vasperty.exe run <exe-path> [--strict] [--zero] [--execute] [--series-s]
 vasperty.exe bench [seconds]
 ```

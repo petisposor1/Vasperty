@@ -1,10 +1,11 @@
 package vasperty_game
 
-import "core:os"
+import win32 "core:sys/windows"
 
 // TTPF (Tiled Texture Pack File) & low-RAM streaming archive probe.
-// Designed for UMA / Intel Integrated GPUs so multi-gigabyte archives are never
-// read wholesale into system memory just to inspect headers.
+// Uses Windows shared-read opening (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+// and reads at most 4 KiB so multi-gigabyte or actively downloading archives can be
+// inspected safely without exhausting UMA / system memory.
 
 Archive_Kind :: enum {
 	Unknown,
@@ -23,13 +24,15 @@ Archive_Probe :: struct {
 }
 
 TTPF_MAGIC :: [4]u8{'T', 'T', 'P', 'F'}
+RDS5_MAGIC :: [4]u8{'R', 'D', 'S', '5'}
 
 is_ttpf :: proc(data: []u8) -> bool {
-	return len(data) >= 16 &&
-		data[0] == TTPF_MAGIC[0] &&
-		data[1] == TTPF_MAGIC[1] &&
-		data[2] == TTPF_MAGIC[2] &&
-		data[3] == TTPF_MAGIC[3]
+	if len(data) < 16 {
+		return false
+	}
+	is_t := data[0] == TTPF_MAGIC[0] && data[1] == TTPF_MAGIC[1] && data[2] == TTPF_MAGIC[2] && data[3] == TTPF_MAGIC[3]
+	is_r := data[0] == RDS5_MAGIC[0] && data[1] == RDS5_MAGIC[1] && data[2] == RDS5_MAGIC[2] && data[3] == RDS5_MAGIC[3]
+	return is_t || is_r
 }
 
 probe_archive_bytes :: proc(head: []u8, total_size: i64 = 0) -> Archive_Probe {
@@ -66,22 +69,23 @@ probe_archive_bytes :: proc(head: []u8, total_size: i64 = 0) -> Archive_Probe {
 	return out
 }
 
-// Streaming low-RAM file probe: reads at most 4 KiB from disk.
+// Streaming low-RAM shared-read file probe: reads at most 4 KiB from disk.
 probe_archive_file :: proc(path: string) -> (Archive_Probe, bool) {
-	f, err := os.open(path)
-	if err != nil {
+	wpath := win32.utf8_to_wstring(path, context.temp_allocator)
+	share := win32.FILE_SHARE_READ | win32.FILE_SHARE_WRITE | win32.FILE_SHARE_DELETE
+	h := win32.CreateFileW(wpath, win32.GENERIC_READ, share, nil, win32.OPEN_EXISTING, win32.FILE_ATTRIBUTE_NORMAL, nil)
+	if h == win32.INVALID_HANDLE_VALUE {
 		return {}, false
 	}
-	defer os.close(f)
+	defer win32.CloseHandle(h)
 
-	fsize, serr := os.file_size(f)
-	if serr != nil {
-		fsize = 0
-	}
+	fsize: win32.LARGE_INTEGER
+	_ = win32.GetFileSizeEx(h, &fsize)
+
 	buf: [4096]u8
-	n, rerr := os.read(f, buf[:])
-	if rerr != nil || n < 4 {
+	got: win32.DWORD
+	if !win32.ReadFile(h, &buf[0], u32(len(buf)), &got, nil) || got < 4 {
 		return {}, false
 	}
-	return probe_archive_bytes(buf[:n], fsize), true
+	return probe_archive_bytes(buf[:got], i64(fsize)), true
 }

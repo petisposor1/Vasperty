@@ -6,6 +6,8 @@ import "core:path/filepath"
 import "core:slice"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
+import "core:thread"
 import "core:time"
 
 import vasperty_core "vasperty:core"
@@ -126,9 +128,10 @@ app_doctor :: proc(prune_cache := false) -> int {
 		caps.display_mode_count, caps.max_refresh_hz, caps.allow_tearing)
 	tune := vasperty_gpu.classify_vendor(&caps)
 	fmt.printf("GPU profile     : %s [%v]\n", tune.profile_name, tune.tier)
-	fmt.printf("  uma=%v wave=%d emulate_wave64=%v mesh_fallback=%v in_flight=%d pool=%d MiB async=%v dxr=%v\n",
-		tune.is_uma, tune.target_wave_size, tune.emulate_wave64, tune.emulate_mesh_shaders,
-		tune.max_frames_in_flight, tune.buffer_pool_budget_bytes >> 20, tune.prefer_async_compute, tune.enable_dxr_bvh)
+	fmt.printf("  uma=%v coherent=%v wave=%d emulate_wave64=%v mesh_fallback=%v in_flight=%d pool=%d MiB async=%v dxr=%v depth_bounds=%v typed_uav=%v\n",
+		tune.is_uma, tune.cache_coherent_uma, tune.target_wave_size, tune.emulate_wave64, tune.emulate_mesh_shaders,
+		tune.max_frames_in_flight, tune.buffer_pool_budget_bytes >> 20, tune.prefer_async_compute, tune.enable_dxr_bvh,
+		caps.depth_bounds, caps.typed_uav_additional)
 
 	if cache, c_err := vasperty_pipeline.cache_open(cfg.cache_dir); c_err == .None {
 		defer vasperty_pipeline.cache_destroy(&cache)
@@ -179,6 +182,9 @@ app_inspect :: proc(path: string, show_imports := false, show_exports := false) 
 	fmt.printf("Image           : %s\n", path)
 	fmt.printf("Machine         : 0x%04X\n", info.machine)
 	fmt.printf("Subsystem       : %s (%d)\n", vasperty_pe.subsystem_name(info.subsystem), info.subsystem)
+	dll_flags := vasperty_pe.dll_characteristics_names(info.dll_characteristics)
+	defer delete(dll_flags)
+	fmt.printf("DllChars        : 0x%04X (%s)\n", info.dll_characteristics, dll_flags)
 	fmt.printf("ImageBase       : 0x%X\n", info.image_base)
 	fmt.printf("SizeOfImage     : %d bytes\n", info.size_of_image)
 	fmt.printf("EntryRVA        : 0x%X\n", info.entry_rva)
@@ -271,6 +277,7 @@ app_census :: proc(paths: []string, strict := false, show_missing := false) -> i
 	}
 
 	total: Census_Result
+	unreadable := 0
 	for p in paths {
 		if os.is_file(p) {
 			if r, ok := app_census_file(&res, p, &missing_map); ok {
@@ -278,10 +285,20 @@ app_census :: proc(paths: []string, strict := false, show_missing := false) -> i
 				total.hle += r.hle
 				total.host += r.host
 				total.missing += r.missing
+			} else {
+				unreadable += 1
+				fmt.eprintf("census: warning: unreadable or non-PE file '%s'\n", p)
 			}
+		} else {
+			unreadable += 1
+			fmt.eprintf("census: warning: path not found '%s'\n", p)
 		}
 	}
-	fmt.printf("census: %d images -> %d hle, %d host, %d missing\n", total.images, total.hle, total.host, total.missing)
+	fmt.printf("census: %d images -> %d hle, %d host, %d missing", total.images, total.hle, total.host, total.missing)
+	if unreadable > 0 {
+		fmt.printf(" (%d unreadable/skipped)", unreadable)
+	}
+	fmt.println("")
 	if show_missing && len(missing_map) > 0 {
 		for k, cnt in missing_map {
 			fmt.printf("  missing (%dx): %s\n", cnt, k)
@@ -300,7 +317,59 @@ Translate_Tally :: struct {
 	failed:     int,
 }
 
-app_translate_blob :: proc(blob: []u8, validate: bool, tally: ^Translate_Tally, wave_mode := vasperty_shader.Target_Wave_Mode.Auto) {
+@(private)
+Translate_Job_State :: struct {
+	blob:      []u8,
+	entries:   []vasperty_shader.Embedded_Dxbc,
+	validate:  bool,
+	wave_mode: vasperty_shader.Target_Wave_Mode,
+	next_idx:  int,
+	mu:        sync.Mutex,
+	tally:     Translate_Tally,
+}
+
+@(private)
+translate_worker_proc :: proc(t: ^thread.Thread) {
+	st := cast(^Translate_Job_State)t.data
+	local: Translate_Tally
+	for {
+		idx := sync.atomic_add(&st.next_idx, 1)
+		if idx >= len(st.entries) {
+			break
+		}
+		e := st.entries[idx]
+		if e.has_xdat { local.xdat += 1 }
+		if e.has_accc { local.accc += 1 }
+		if e.has_dxil { local.dxil += 1 }
+		local.containers += 1
+		hs, terr := vasperty_shader.translate_with(
+			st.blob[e.offset:e.offset + e.size],
+			vasperty_shader.Shader_Options{wave_mode = st.wave_mode},
+		)
+		if terr != .None {
+			local.failed += 1
+			continue
+		}
+		local.translated += 1
+		if st.validate {
+			vok, vmsg, _ := vasperty_shader.validate_dxil(hs.dxil[:])
+			if vmsg != "" { delete(vmsg) }
+			if vok { local.validated += 1 }
+		}
+		vasperty_shader.destroy_host_shader(&hs)
+	}
+	sync.mutex_lock(&st.mu)
+	st.tally.xdat += local.xdat
+	st.tally.accc += local.accc
+	st.tally.dxil += local.dxil
+	st.tally.containers += local.containers
+	st.tally.translated += local.translated
+	st.tally.validated += local.validated
+	st.tally.failed += local.failed
+	sync.mutex_unlock(&st.mu)
+}
+
+app_translate_blob :: proc(blob: []u8, validate: bool, tally: ^Translate_Tally, wave_mode := vasperty_shader.Target_Wave_Mode.Auto, jobs := 1) {
 	if len(blob) >= 4 && blob[0] == 'D' && blob[1] == 'X' && blob[2] == 'B' && blob[3] == 'C' {
 		tally.containers += 1
 		hs, terr := vasperty_shader.translate_with(blob, vasperty_shader.Shader_Options{wave_mode = wave_mode})
@@ -333,41 +402,103 @@ app_translate_blob :: proc(blob: []u8, validate: bool, tally: ^Translate_Tally, 
 		defer vasperty_game.sgd5_destroy_unpack_results(unpacked)
 		for &ur in unpacked {
 			if ur.ok && len(ur.data) > 0 {
-				app_translate_blob(ur.data, validate, tally, wave_mode)
+				app_translate_blob(ur.data, validate, tally, wave_mode, jobs)
 			}
 		}
 		return
 	}
 	emb := vasperty_shader.scan_embedded_dxbc(blob)
 	defer delete(emb)
-	for e in emb {
-		if e.has_xdat { tally.xdat += 1 }
-		if e.has_accc { tally.accc += 1 }
-		if e.has_dxil { tally.dxil += 1 }
-		app_translate_blob(blob[e.offset:e.offset + e.size], validate, tally, wave_mode)
+	if len(emb) == 0 {
+		return
 	}
+	n_workers := min(max(jobs, 1), len(emb))
+	if n_workers <= 1 {
+		for e in emb {
+			if e.has_xdat { tally.xdat += 1 }
+			if e.has_accc { tally.accc += 1 }
+			if e.has_dxil { tally.dxil += 1 }
+			app_translate_blob(blob[e.offset:e.offset + e.size], validate, tally, wave_mode, 1)
+		}
+		return
+	}
+	st := Translate_Job_State{
+		blob      = blob,
+		entries   = emb[:],
+		validate  = validate,
+		wave_mode = wave_mode,
+	}
+	threads := make([dynamic]^thread.Thread, 0, n_workers)
+	defer delete(threads)
+	for _ in 0 ..< n_workers {
+		t := thread.create(translate_worker_proc)
+		if t != nil {
+			t.data = &st
+			thread.start(t)
+			append(&threads, t)
+		}
+	}
+	for t in threads {
+		thread.join(t)
+		thread.destroy(t)
+	}
+	tally.xdat += st.tally.xdat
+	tally.accc += st.tally.accc
+	tally.dxil += st.tally.dxil
+	tally.containers += st.tally.containers
+	tally.translated += st.tally.translated
+	tally.validated += st.tally.validated
+	tally.failed += st.tally.failed
 }
 
-app_translate :: proc(paths: []string, validate := false, wave_mode := vasperty_shader.Target_Wave_Mode.Auto) -> (Translate_Tally, int) {
+app_translate :: proc(paths: []string, validate := false, wave_mode := vasperty_shader.Target_Wave_Mode.Auto, jobs := 0) -> (Translate_Tally, int) {
+	workers := jobs
+	if workers <= 0 {
+		workers = min(max(os.get_processor_core_count(), 1), 8)
+	}
+	t0 := time.tick_now()
 	tally: Translate_Tally
 	for p in paths {
 		if os.is_file(p) {
 			raw, rerr := os.read_entire_file_from_path(p, context.allocator)
 			if rerr == nil {
-				app_translate_blob(raw, validate, &tally, wave_mode)
+				app_translate_blob(raw, validate, &tally, wave_mode, workers)
 				delete(raw)
 			}
 		}
 	}
+	el_ms := time.duration_milliseconds(time.tick_since(t0))
+	rate := f64(tally.translated) / max(el_ms / 1000.0, 0.0001)
 	fmt.printf(
-		"translate: wave=%v embedded(xdat=%d accc=%d dxil=%d)\n",
-		wave_mode, tally.xdat, tally.accc, tally.dxil,
+		"translate: wave=%v workers=%d embedded(xdat=%d accc=%d dxil=%d) time=%.1fms (%.0f shaders/s)\n",
+		wave_mode, workers, tally.xdat, tally.accc, tally.dxil, el_ms, rate,
 	)
 	fmt.printf(
 		"translate: %d containers -> %d translated, %d validated, %d failed/unsupported\n",
 		tally.containers, tally.translated, tally.validated, tally.failed,
 	)
 	return tally, 0
+}
+
+app_probe :: proc(paths: []string) -> int {
+	ok_count := 0
+	for p in paths {
+		pr, ok := vasperty_game.probe_archive_file(p)
+		if !ok {
+			fmt.eprintf("probe: cannot open '%s'\n", p)
+			continue
+		}
+		ok_count += 1
+		mib := f64(pr.file_size) / (1024.0 * 1024.0)
+		fmt.printf("probe: %-11v %9.2f MiB  magic=%c%c%c%c  ver=0x%X  entries=%d  %s\n",
+			pr.kind, mib,
+			pr.magic[0] if pr.magic[0] >= 32 && pr.magic[0] <= 126 else '.',
+			pr.magic[1] if pr.magic[1] >= 32 && pr.magic[1] <= 126 else '.',
+			pr.magic[2] if pr.magic[2] >= 32 && pr.magic[2] <= 126 else '.',
+			pr.magic[3] if pr.magic[3] >= 32 && pr.magic[3] <= 126 else '.',
+			pr.version, pr.entry_hint, p)
+	}
+	return 0 if ok_count > 0 else 1
 }
 
 app_run :: proc(

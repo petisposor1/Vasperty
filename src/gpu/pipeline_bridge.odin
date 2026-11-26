@@ -32,6 +32,67 @@ root_desc_without_console_flags :: proc(d: Root_Sig_Desc) -> Root_Sig_Desc {
 	return out
 }
 
+// Integer DXGI formats cannot use hardware blending in D3D12 (upstream #1152).
+is_integer_dxgi_format :: proc "contextless" (fmt_id: u32) -> bool {
+	switch fmt_id {
+	case 3, 4, 12, 14, 17, 18, 30, 32, 36, 38, 42, 43, 50, 52, 57, 59, 62, 64, 25:
+		return true
+	}
+	return false
+}
+
+// Disables blending on any integer render target; promotes IndependentBlendEnable
+// when disabling an integer target so non-integer targets keep their blend state.
+sanitize_blend_for_targets :: proc(rtv_formats: []u32, independent_blend: ^bool, rt_blend_enable: ^[8]bool) -> int {
+	if independent_blend == nil || rt_blend_enable == nil {
+		return 0
+	}
+	count := min(len(rtv_formats), 8)
+	disabled := 0
+	if !independent_blend^ {
+		has_int := false
+		for i := 0; i < count; i += 1 {
+			if is_integer_dxgi_format(rtv_formats[i]) {
+				has_int = true
+				break
+			}
+		}
+		if has_int && rt_blend_enable[0] {
+			independent_blend^ = true
+			for i := 1; i < 8; i += 1 {
+				rt_blend_enable[i] = rt_blend_enable[0]
+			}
+		}
+	}
+	for i := 0; i < count; i += 1 {
+		if is_integer_dxgi_format(rtv_formats[i]) && rt_blend_enable[i] {
+			rt_blend_enable[i] = false
+			disabled += 1
+		}
+	}
+	return disabled
+}
+
+// Guards against creating typed UAVs in DXGI formats the host cannot store to (upstream #2462).
+format_supports_typed_uav_store :: proc "contextless" (fmt_id: u32, typed_uav_additional: bool) -> bool {
+	// Baseline D3D12 typed UAV formats always guaranteed
+	switch fmt_id {
+	case 41, 42, 43, 61, 62, 63, 64, 54, 56, 57, 58, 59:
+		return true
+	case 2, 3, 4, 10, 11, 12, 13, 14, 16, 17, 18, 24, 25, 26, 28, 30, 31, 32, 34, 35, 36, 37, 38, 49, 50, 51, 52:
+		return typed_uav_additional
+	}
+	return false
+}
+
+// Preserves point mip filtering on anisotropic heap samplers when host supports Options19 (upstream #2031).
+sampler_filter_for_host :: proc "contextless" (filter: u32, aniso_point_mip: bool) -> u32 {
+	if !aniso_point_mip && (filter & ~u32(0x180)) == 0x54 {
+		return filter | 1
+	}
+	return filter
+}
+
 host_serialize_root_signature :: proc "system" (desc: rawptr, version: u32, blob, err_blob: ^rawptr) -> HRESULT {
 	context = gpu_context()
 	if desc == nil {

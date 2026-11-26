@@ -419,17 +419,67 @@ shadow_refresh_from :: proc(sc: ^Shadow_Copy, src: []u8) {
 	}
 }
 
+// Fast branchless writeback merge with 64-bit word fast-skip (upstream #2054 + u64 stride).
+// For each byte: if host[i] != old[i], title[i] = host[i]; else keep title[i]. Always syncs host[i] = title[i].
+shadow_merge_writeback :: proc(title, host, old: []u8) -> (changed_bytes: u64, any_changed: bool) {
+	n := min(len(title), min(len(host), len(old)))
+	i := 0
+	// Fast 8-byte word skip for untouched regions (common in 64 KiB pages)
+	for i + 8 <= n {
+		h_w := (cast(^u64)&host[i])^
+		o_w := (cast(^u64)&old[i])^
+		if h_w == o_w {
+			// GPU did not touch these 8 bytes; mirror CPU title bytes back to host snapshot
+			t_w := (cast(^u64)&title[i])^
+			if h_w != t_w {
+				(cast(^u64)&host[i])^ = t_w
+			}
+			i += 8
+			continue
+		}
+		for k := 0; k < 8; k += 1 {
+			idx := i + k
+			hb := host[idx]
+			ob := old[idx]
+			tb := title[idx]
+			mask := u8(0) - u8(1 if hb != ob else 0)
+			delta := (tb ~ hb) & mask
+			nt := tb ~ delta
+			title[idx] = nt
+			host[idx] = nt
+			if delta != 0 {
+				changed_bytes += 1
+				any_changed = true
+			}
+		}
+		i += 8
+	}
+	for i < n {
+		hb := host[i]
+		ob := old[i]
+		tb := title[i]
+		mask := u8(0) - u8(1 if hb != ob else 0)
+		delta := (tb ~ hb) & mask
+		nt := tb ~ delta
+		title[i] = nt
+		host[i] = nt
+		if delta != 0 {
+			changed_bytes += 1
+			any_changed = true
+		}
+		i += 1
+	}
+	return changed_bytes, any_changed
+}
+
 // Compares backing against snapshot and writes only changed bytes back into `dst_title`, returning bytes copied back.
 shadow_copy_back :: proc(sc: ^Shadow_Copy, dst_title: []u8) -> u64 {
 	n := min(len(sc.backing), min(len(sc.snapshot), len(dst_title)))
-	written := u64(0)
-	for i := 0; i < n; i += 1 {
-		if sc.backing[i] != sc.snapshot[i] {
-			dst_title[i] = sc.backing[i]
-			sc.snapshot[i] = sc.backing[i]
-			written += 1
-		}
+	if n == 0 {
+		return 0
 	}
+	written, _ := shadow_merge_writeback(dst_title[:n], sc.backing[:n], sc.snapshot[:n])
+	copy(sc.snapshot[:n], sc.backing[:n])
 	return written
 }
 
@@ -448,15 +498,11 @@ shadow_copy_back_pages :: proc(sc: ^Shadow_Copy, dst_title: []u8, dirty_pages: [
 		if page_end <= sc.title_start || page >= sc.title_start + n {
 			continue
 		}
-		lo := max(page, sc.title_start) - sc.title_start
-		hi := min(page_end, sc.title_start + n) - sc.title_start
-		for i := int(lo); i < int(hi); i += 1 {
-			if sc.backing[i] != sc.snapshot[i] {
-				dst_title[i] = sc.backing[i]
-				sc.snapshot[i] = sc.backing[i]
-				written += 1
-			}
-		}
+		lo := int(max(page, sc.title_start) - sc.title_start)
+		hi := int(min(page_end, sc.title_start + n) - sc.title_start)
+		w, _ := shadow_merge_writeback(dst_title[lo:hi], sc.backing[lo:hi], sc.snapshot[lo:hi])
+		copy(sc.snapshot[lo:hi], sc.backing[lo:hi])
+		written += w
 	}
 	return written
 }

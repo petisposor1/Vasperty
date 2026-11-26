@@ -198,6 +198,40 @@ subsystem_name :: proc(subsystem: u16) -> string {
 	}
 }
 
+// Names every PE DllCharacteristics bit (upstream #1988).
+dll_characteristics_names :: proc(flags: u16, allocator := context.allocator) -> string {
+	Bit_Name :: struct {
+		bit:  u16,
+		name: string,
+	}
+	TABLE := [?]Bit_Name{
+		{0x0020, "HIGH_ENTROPY_VA"},
+		{0x0040, "DYNAMIC_BASE"},
+		{0x0080, "FORCE_INTEGRITY"},
+		{0x0100, "NX_COMPAT"},
+		{0x0200, "NO_ISOLATION"},
+		{0x0400, "NO_SEH"},
+		{0x0800, "NO_BIND"},
+		{0x1000, "APPCONTAINER"},
+		{0x2000, "WDM_DRIVER"},
+		{0x4000, "GUARD_CF"},
+		{0x8000, "TERMINAL_SERVER_AWARE"},
+	}
+	b := strings.builder_make(allocator)
+	for entry in TABLE {
+		if (flags & entry.bit) != 0 {
+			if strings.builder_len(b) > 0 {
+				strings.write_string(&b, " | ")
+			}
+			strings.write_string(&b, entry.name)
+		}
+	}
+	if strings.builder_len(b) == 0 {
+		strings.write_string(&b, "NONE")
+	}
+	return strings.to_string(b)
+}
+
 import_count :: proc(info: ^Image_Info) -> int {
 	total := 0
 	for &m in info.imports {

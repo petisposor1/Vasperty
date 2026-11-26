@@ -37,9 +37,10 @@ Gpu_Profile_Tier :: enum {
 Vendor_Tuning :: struct {
 	vendor:                     Gpu_Vendor,
 	tier:                       Gpu_Profile_Tier,
-	profile_name:               string,
-	is_uma:                     bool,
-	target_wave_size:           u8,
+	profile_name:                 string,
+	is_uma:                       bool,
+	cache_coherent_uma:           bool,
+	target_wave_size:             u8,
 	emulate_wave64:             bool,
 	emulate_mesh_shaders:       bool,
 	prefer_async_compute:       bool,
@@ -71,12 +72,13 @@ classify_vendor :: proc(caps: ^Host_Capabilities) -> Vendor_Tuning {
 	switch caps.vendor_id {
 	case VENDOR_INTEL:
 		out.vendor = .Intel
-		uma := caps.dedicated_video_memory < (512 << 20) ||
+		uma := caps.uma || caps.dedicated_video_memory < (512 << 20) ||
 			caps.shared_system_memory > caps.dedicated_video_memory * 2
 		if uma {
 			out.tier = .Intel_Integrated_Uhd_Xe
 			out.profile_name = "Intel Integrated (UHD / Xe UMA Wave16)"
 			out.is_uma = true
+			out.cache_coherent_uma = caps.cache_coherent_uma
 			out.target_wave_size = 16
 			if caps.wave_lane_count_max >= 32 && caps.wave_lane_count_min >= 32 {
 				out.target_wave_size = 32

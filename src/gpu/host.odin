@@ -218,6 +218,10 @@ Host_Capabilities :: struct {
 	mesh_shaders:           bool,
 	mesh_shader_tier:       u32,
 	depth_bounds:           bool,
+	typed_uav_additional:   bool,
+	uma:                    bool,
+	cache_coherent_uma:     bool,
+	tile_based_renderer:    bool,
 	heap_atomics64:         bool,
 	wave_ops:               bool,
 	wave_lane_count_min:    u32,
@@ -370,6 +374,7 @@ probe_capabilities :: proc(allow_warp := true) -> Host_Capabilities {
 	// D3D12_FEATURE_D3D12_OPTIONS (0)
 	opt0: [16]u32
 	if dvt.CheckFeatureSupport(device, 0, &opt0[0], size_of(opt0)) >= 0 {
+		caps.typed_uav_additional = opt0[5] != 0
 		caps.resource_binding_tier = opt0[3]
 		caps.resource_heap_tier = opt0[7]
 	}
@@ -379,6 +384,18 @@ probe_capabilities :: proc(allow_warp := true) -> Host_Capabilities {
 		caps.wave_ops = opt1[0] != 0
 		caps.wave_lane_count_min = opt1[1]
 		caps.wave_lane_count_max = opt1[2]
+	}
+	// D3D12_FEATURE_ARCHITECTURE1 (16): NodeIndex, TileBasedRenderer, UMA, CacheCoherentUMA, IsolatedMMU
+	arch1: [5]u32
+	if dvt.CheckFeatureSupport(device, 16, &arch1[0], size_of(arch1)) >= 0 {
+		caps.tile_based_renderer = arch1[1] != 0
+		caps.uma = arch1[2] != 0
+		caps.cache_coherent_uma = arch1[3] != 0
+	}
+	// D3D12_FEATURE_D3D12_OPTIONS2 (18): DepthBoundsTestSupported, ProgrammableSamplePositionsTier
+	opt2: [2]u32
+	if dvt.CheckFeatureSupport(device, 18, &opt2[0], size_of(opt2)) >= 0 {
+		caps.depth_bounds = opt2[0] != 0
 	}
 	// D3D12_FEATURE_D3D12_OPTIONS5 (27) -> raytracing tier
 	opt5: [4]u32
