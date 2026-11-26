@@ -797,7 +797,7 @@ boot_veh_handler :: proc "system" (info: ^VEH_EXCEPTION_POINTERS) -> i32 {
 		return 0
 	}
 	code := info.ExceptionRecord.ExceptionCode
-	if code != 0xC0000005 && code != 0xC000001D && code != 0xC0000096 && code != 0xC00000FD {
+	if code != 0xC0000005 && code != 0xC000001D && code != 0xC0000096 && code != 0xC00000FD && code != 0x80000003 {
 		return 0
 	}
 	context = runtime.default_context()

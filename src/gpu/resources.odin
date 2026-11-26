@@ -34,10 +34,140 @@ Console_Device :: struct {
 #assert(size_of(Console_Device) == 0x58)
 
 @(private)
+g_host_dev_mu: sync.Mutex
+@(private)
+g_host_dev: rawptr
+
+ensure_host_device :: proc() -> rawptr {
+	sync.mutex_lock(&g_host_dev_mu)
+	defer sync.mutex_unlock(&g_host_dev_mu)
+	if g_host_dev != nil {
+		return g_host_dev
+	}
+	dlls := ensure_d3d12_dlls()
+	if dlls.create_device == nil {
+		return nil
+	}
+	D3D_FEATURE_LEVEL_12_0 :: u32(0xC000)
+	dev_iid := guid(0x189819f1, 0x1db6, 0x4b57, {0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7})
+	_ = dlls.create_device(nil, D3D_FEATURE_LEVEL_12_0, &dev_iid, &g_host_dev)
+	return g_host_dev
+}
+
+@(private)
+Full_Dev_Vtbl :: struct {
+	_pad0:                  [8]rawptr,
+	CreateCommandQueue:     proc "system" (rawptr, rawptr, ^Iid, ^rawptr) -> HRESULT,         // 8
+	CreateCommandAllocator: proc "system" (rawptr, u32, ^Iid, ^rawptr) -> HRESULT,            // 9
+	_pad1:                  [2]rawptr,                                                         // 10..11
+	CreateCommandList:      proc "system" (rawptr, u32, u32, rawptr, rawptr, ^Iid, ^rawptr) -> HRESULT, // 12
+	CheckFeatureSupport:    proc "system" (rawptr, u32, rawptr, u32) -> HRESULT,              // 13
+	CreateDescriptorHeap:   proc "system" (rawptr, rawptr, ^Iid, ^rawptr) -> HRESULT,         // 14
+	GetDescInc:             proc "system" (rawptr, u32) -> u32,                               // 15
+	CreateRootSignature:    proc "system" (rawptr, u32, rawptr, uint, ^Iid, ^rawptr) -> HRESULT, // 16
+	_pad2:                  [19]rawptr,                                                        // 17..35
+	CreateFence:            proc "system" (rawptr, u64, u32, ^Iid, ^rawptr) -> HRESULT,       // 36
+	GetDeviceRemovedReason: proc "system" (rawptr) -> HRESULT,                                // 37
+}
+
+@(private)
 device_stub_slot :: proc "system" (this: This, a1, a2, a3: uintptr) -> HRESULT {
 	context = gpu_context()
-	_ = this; _ = a1; _ = a2; _ = a3
+	_ = this
+	ret := intrinsics.return_address()
+	slot_off := i32(-1)
+	if ret != nil {
+		b := cast([^]u8)ret
+		// Match common x64 indirect vtable calls right before `ret`:
+		// FF 50 disp8 (call [rax+disp8]) or FF 90 disp32 (call [rax+disp32])
+		if b[-3] == 0xFF && (b[-2] & 0xF8) == 0x50 {
+			slot_off = i32(b[-1])
+		} else if b[-6] == 0xFF && (b[-5] & 0xF8) == 0x90 {
+			slot_off = i32(u32(b[-4]) | (u32(b[-3]) << 8) | (u32(b[-2]) << 16) | (u32(b[-1]) << 24))
+		} else if b[-4] == 0xFF && (b[-3] & 0xF8) == 0x50 {
+			slot_off = i32(b[-1])
+		} else if b[-7] == 0xFF && (b[-6] & 0xF8) == 0x90 {
+			slot_off = i32(u32(b[-4]) | (u32(b[-3]) << 8) | (u32(b[-2]) << 16) | (u32(b[-1]) << 24))
+		}
+	}
+	if slot_off >= 0 {
+		fmt.printf("[d3d12x] unimpl device slot #%d (off=0x%X a1=0x%X a2=0x%X a3=0x%X)\n", slot_off / 8, slot_off, a1, a2, a3)
+	} else {
+		fmt.printf("[d3d12x] unimpl device slot (ret=%p a1=0x%X a2=0x%X a3=0x%X)\n", ret, a1, a2, a3)
+	}
+	if a2 > 0x10000 {
+		g := guid_text((cast(^Iid)a2)^, context.temp_allocator)
+		fmt.printf("  a2-as-guid: %s\n", g)
+	}
 	return E_NOTIMPL
+}
+
+@(private)
+device_create_command_queue :: proc "system" (this: This, desc: rawptr, iid: ^Iid, out: ^rawptr) -> HRESULT {
+	context = gpu_context()
+	_ = this
+	hdev := ensure_host_device()
+	if hdev == nil { return E_NOTIMPL }
+	vt := (cast(^^Full_Dev_Vtbl)hdev)^
+	hr := vt.CreateCommandQueue(hdev, desc, iid, out)
+	fmt.printf("[d3d12x] CreateCommandQueue -> hr=0x%08X\n", u32(hr))
+	return hr
+}
+
+@(private)
+device_create_command_allocator :: proc "system" (this: This, kind: u32, iid: ^Iid, out: ^rawptr) -> HRESULT {
+	context = gpu_context()
+	_ = this
+	hdev := ensure_host_device()
+	if hdev == nil { return E_NOTIMPL }
+	vt := (cast(^^Full_Dev_Vtbl)hdev)^
+	return vt.CreateCommandAllocator(hdev, kind, iid, out)
+}
+
+@(private)
+device_create_command_list :: proc "system" (this: This, node_mask: u32, kind: u32, alloc: rawptr, pso: rawptr, iid: ^Iid, out: ^rawptr) -> HRESULT {
+	context = gpu_context()
+	_ = this
+	hdev := ensure_host_device()
+	if hdev == nil { return E_NOTIMPL }
+	vt := (cast(^^Full_Dev_Vtbl)hdev)^
+	return vt.CreateCommandList(hdev, node_mask, kind, alloc, pso, iid, out)
+}
+
+@(private)
+device_create_descriptor_heap :: proc "system" (this: This, desc: rawptr, iid: ^Iid, out: ^rawptr) -> HRESULT {
+	context = gpu_context()
+	_ = this
+	hdev := ensure_host_device()
+	if hdev == nil { return E_NOTIMPL }
+	vt := (cast(^^Full_Dev_Vtbl)hdev)^
+	return vt.CreateDescriptorHeap(hdev, desc, iid, out)
+}
+
+@(private)
+device_create_root_signature :: proc "system" (this: This, node_mask: u32, blob: rawptr, blob_len: uint, iid: ^Iid, out: ^rawptr) -> HRESULT {
+	context = gpu_context()
+	_ = this
+	hdev := ensure_host_device()
+	if hdev == nil { return E_NOTIMPL }
+	vt := (cast(^^Full_Dev_Vtbl)hdev)^
+	return vt.CreateRootSignature(hdev, node_mask, blob, blob_len, iid, out)
+}
+
+@(private)
+device_create_fence :: proc "system" (this: This, initial: u64, flags: u32, iid: ^Iid, out: ^rawptr) -> HRESULT {
+	context = gpu_context()
+	_ = this
+	hdev := ensure_host_device()
+	if hdev == nil { return E_NOTIMPL }
+	vt := (cast(^^Full_Dev_Vtbl)hdev)^
+	return vt.CreateFence(hdev, initial, flags, iid, out)
+}
+
+@(private)
+device_get_removed_reason :: proc "system" (this: This) -> HRESULT {
+	_ = this
+	return S_OK
 }
 
 @(private)
@@ -51,31 +181,114 @@ device_get_desc_inc :: proc "system" (this: This, kind: u32) -> u32 {
 device_check_feature_support :: proc "system" (this: This, feature: u32, data: rawptr, size: u32) -> HRESULT {
 	context = gpu_context()
 	_ = this
-	fmt.printf("[d3d12x] CheckFeatureSupport(feature=%d, size=%d)\n", feature, size)
 	if data == nil || size == 0 {
 		return E_INVALIDARG
 	}
-	// Forward to real host ID3D12Device when available
-	dlls := ensure_d3d12_dlls()
-	if dlls.create_device != nil {
-		D3D_FEATURE_LEVEL_12_0 :: u32(0xC000)
-		dev_iid := guid(0x189819f1, 0x1db6, 0x4b57, {0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7})
-		hdev: rawptr
-		if dlls.create_device(nil, D3D_FEATURE_LEVEL_12_0, &dev_iid, &hdev) >= 0 && hdev != nil {
-			defer com_release(hdev)
-			Dev_Cfs_Vtbl :: struct {
-				_pad:                [13]rawptr,
-				CheckFeatureSupport: proc "system" (rawptr, u32, rawptr, u32) -> HRESULT,
-			}
-			vt := (cast(^^Dev_Cfs_Vtbl)hdev)^
-			return vt.CheckFeatureSupport(hdev, feature, data, size)
-		}
+	hdev := ensure_host_device()
+	if hdev != nil {
+		vt := (cast(^^Full_Dev_Vtbl)hdev)^
+		return vt.CheckFeatureSupport(hdev, feature, data, size)
 	}
 	return E_NOTIMPL
 }
 
 @(private)
-g_device_vtable: [96]rawptr
+D3D12_HEAP_PROPERTIES :: struct {
+	Type:                 u32,
+	CPUPageProperty:      u32,
+	MemoryPoolPreference: u32,
+	CreationNodeMask:     u32,
+	VisibleNodeMask:      u32,
+}
+
+@(private)
+device_get_custom_heap_props :: proc "system" (out: ^D3D12_HEAP_PROPERTIES, this: This, node_mask: u32, heap_type: u32) -> ^D3D12_HEAP_PROPERTIES {
+	context = gpu_context()
+	_ = this
+	if out != nil {
+		// Return valid UMA/discrete custom heap properties matching standard D3D12
+		cpu_prop := u32(0) // UNKNOWN
+		pool := u32(1)     // L0
+		if heap_type == 2 { cpu_prop = 2 }      // WRITE_COMBINE for UPLOAD
+		else if heap_type == 3 { cpu_prop = 3 } // WRITE_BACK for READBACK
+		else { cpu_prop = 1; pool = 2 }         // NOT_AVAILABLE / L1 for DEFAULT
+		out^ = D3D12_HEAP_PROPERTIES{
+			Type                 = 4, // D3D12_HEAP_TYPE_CUSTOM
+			CPUPageProperty      = cpu_prop,
+			MemoryPoolPreference = pool,
+			CreationNodeMask     = max(node_mask, u32(1)),
+			VisibleNodeMask      = max(node_mask, u32(1)),
+		}
+	}
+	return out
+}
+
+@(private)
+device_create_command_queue_x :: proc "system" (this: This, desc: rawptr, iid: ^Iid, out: ^rawptr) -> HRESULT {
+	context = gpu_context()
+	_ = this
+	hdev := ensure_host_device()
+	if hdev == nil || desc == nil { return E_NOTIMPL }
+	// Xbox D3D12X_COMMAND_QUEUE_DESC starts with Type(u32), Priority(i32), Flags(u32), NodeMask(u32).
+	// Sanitize console-only flags/types for PC D3D12.
+	raw_q := (cast(^D3D12_COMMAND_QUEUE_DESC)desc)^
+	pc_q := D3D12_COMMAND_QUEUE_DESC{
+		Type     = raw_q.Type if (raw_q.Type == 0 || raw_q.Type == 2 || raw_q.Type == 3) else 0,
+		Priority = 0,
+		Flags    = raw_q.Flags & 1, // only DISABLE_GPU_TIMEOUT
+		NodeMask = 0,
+	}
+	vt := (cast(^^Full_Dev_Vtbl)hdev)^
+	hr := vt.CreateCommandQueue(hdev, &pc_q, iid, out)
+	fmt.printf("[d3d12x] CreateCommandQueueX(type=%d -> %d) -> hr=0x%08X\n", raw_q.Type, pc_q.Type, u32(hr))
+	return hr
+}
+
+@(private)
+device_ignore_ok :: proc "system" (this: This) -> HRESULT {
+	_ = this
+	return S_OK
+}
+
+@(private)
+device_create_command_list_x :: proc "system" (this: This, desc: rawptr, allocator: rawptr, pipeline: rawptr, iid: ^Iid, out: ^rawptr) -> HRESULT {
+	context = gpu_context()
+	_ = this
+	hdev := ensure_host_device()
+	if hdev == nil || desc == nil || out == nil { return E_INVALIDARG }
+	raw_kind := (cast(^u32)desc)^
+	pc_kind := raw_kind if (raw_kind == 0 || raw_kind == 2 || raw_kind == 3) else u32(0)
+	// Use standard ID3D12GraphicsCommandList IID if console passed a newer console IID
+	list_iid := IID_ID3D12GraphicsCommandList_G
+	use_iid := iid if iid != nil else &list_iid
+	vt := (cast(^^Full_Dev_Vtbl)hdev)^
+	hr := vt.CreateCommandList(hdev, 0, pc_kind, allocator, pipeline, use_iid, out)
+	if hr < 0 {
+		hr = vt.CreateCommandList(hdev, 0, pc_kind, allocator, pipeline, &list_iid, out)
+	}
+	if hr >= 0 && out^ != nil {
+		// Console CreateCommandListX returns a closed list ready for Reset(); PC D3D12 returns it open.
+		lvt := (cast(^^Exec_List_Vtbl)out^)^
+		_ = lvt.Close(out^)
+	}
+	fmt.printf("[d3d12x] CreateCommandListX(kind=%d -> %d) -> hr=0x%08X\n", raw_kind, pc_kind, u32(hr))
+	return hr
+}
+
+@(private)
+g_frame_token_seq: u64 = 1
+
+@(private)
+device_wait_frame_event_x :: proc "system" (this: This, kind: u32, timeout_ms: u32, extra: rawptr, out_token: ^u64) -> HRESULT {
+	_ = this; _ = kind; _ = timeout_ms; _ = extra
+	if out_token != nil {
+		out_token^ = intrinsics.atomic_add(&g_frame_token_seq, 1)
+	}
+	return S_OK
+}
+
+@(private)
+g_device_vtable: [128]rawptr
 
 @(init)
 init_device_vtable :: proc "contextless" () {
@@ -88,8 +301,25 @@ init_device_vtable :: proc "contextless" () {
 	g_device_vtable[3] = rawptr(object_get_private_data)
 	g_device_vtable[4] = rawptr(object_set_private_data)
 	g_device_vtable[7] = rawptr(device_get_node_count)
+	g_device_vtable[8] = rawptr(device_create_command_queue)
+	g_device_vtable[9] = rawptr(device_create_command_allocator)
+	g_device_vtable[12] = rawptr(device_create_command_list)
 	g_device_vtable[13] = rawptr(device_check_feature_support)
+	g_device_vtable[14] = rawptr(device_create_descriptor_heap)
 	g_device_vtable[15] = rawptr(device_get_desc_inc)
+	g_device_vtable[16] = rawptr(device_create_root_signature)
+	g_device_vtable[26] = rawptr(device_get_custom_heap_props)
+	g_device_vtable[36] = rawptr(device_create_fence)
+	g_device_vtable[37] = rawptr(device_get_removed_reason)
+	g_device_vtable[48] = rawptr(device_create_command_queue_x)
+	g_device_vtable[69] = rawptr(device_ignore_ok)
+	g_device_vtable[73] = rawptr(device_create_command_list_x)
+	g_device_vtable[74] = rawptr(device_ignore_ok)
+	g_device_vtable[75] = rawptr(device_ignore_ok)
+	g_device_vtable[78] = rawptr(device_ignore_ok)
+	g_device_vtable[79] = rawptr(device_ignore_ok)
+	g_device_vtable[80] = rawptr(device_wait_frame_event_x)
+	g_device_vtable[81] = rawptr(device_ignore_ok)
 }
 
 g_device := Console_Device{
