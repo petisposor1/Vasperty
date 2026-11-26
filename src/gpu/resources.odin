@@ -506,3 +506,72 @@ shadow_copy_back_pages :: proc(sc: ^Shadow_Copy, dst_title: []u8, dirty_pages: [
 	}
 	return written
 }
+
+// =========================================================================
+// Pooled Title-Memory Dirty Bitmap with 64-bit Zero-Word Skip (upstream #1865)
+// =========================================================================
+
+Dirty_Bitmap :: struct {
+	words:      [dynamic]u64,
+	page_count: u64,
+}
+
+dirty_bitmap_init :: proc(page_count: u64, allocator := context.allocator) -> Dirty_Bitmap {
+	n_words := int((page_count + 63) / 64)
+	return Dirty_Bitmap{
+		words      = make([dynamic]u64, n_words, allocator),
+		page_count = page_count,
+	}
+}
+
+dirty_bitmap_destroy :: proc(bm: ^Dirty_Bitmap) {
+	if bm == nil {
+		return
+	}
+	delete(bm.words)
+	bm^ = {}
+}
+
+dirty_bitmap_clear :: proc(bm: ^Dirty_Bitmap) {
+	if bm == nil {
+		return
+	}
+	for i := 0; i < len(bm.words); i += 1 {
+		bm.words[i] = 0
+	}
+}
+
+dirty_bitmap_mark :: proc(bm: ^Dirty_Bitmap, page_index: u64) {
+	if bm == nil || page_index >= bm.page_count {
+		return
+	}
+	bm.words[page_index >> 6] |= u64(1) << (page_index & 63)
+}
+
+dirty_bitmap_mark_range :: proc(bm: ^Dirty_Bitmap, start_page, count: u64) {
+	if bm == nil || count == 0 {
+		return
+	}
+	end := min(start_page + count, bm.page_count)
+	for p := start_page; p < end; p += 1 {
+		bm.words[p >> 6] |= u64(1) << (p & 63)
+	}
+}
+
+// Collects all dirty page indices by skipping zero 64-bit words in O(1) via CTZ.
+dirty_bitmap_collect :: proc(bm: ^Dirty_Bitmap, out: ^[dynamic]u64) {
+	if bm == nil || out == nil {
+		return
+	}
+	for w, wi in bm.words {
+		bits := w
+		for bits != 0 {
+			tz := intrinsics.count_trailing_zeros(bits)
+			page := (u64(wi) << 6) | tz
+			if page < bm.page_count {
+				append(out, page)
+			}
+			bits &= bits - 1
+		}
+	}
+}

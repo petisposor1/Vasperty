@@ -1102,6 +1102,44 @@ wave_lane_mask :: proc "contextless" (mode: Target_Wave_Mode) -> u64 {
 	return 0x0000_0000_FFFF_FFFF
 }
 
+// Scopes ds_bpermute_b32 lane indices to 16-lane (Intel UHD/Xe) or 32-lane (NVIDIA / Wave64 halves, #573).
+bpermute_lane_mask :: proc "contextless" (mode: Target_Wave_Mode) -> u32 {
+	if mode == .Wave16 {
+		return 0x0F
+	}
+	return 0x1F
+}
+
+bpermute_base_mask :: proc "contextless" (mode: Target_Wave_Mode) -> u32 {
+	return ~bpermute_lane_mask(mode)
+}
+
+// Guards LDS accesses against out-of-bounds reads/writes past program LDS allocation (#1870/#1949).
+lds_offset_in_bounds :: proc "contextless" (offset, width_bytes, lds_bytes: u32) -> bool {
+	if lds_bytes == 0 || width_bytes == 0 {
+		return false
+	}
+	return u64(offset) + u64(width_bytes) <= u64(lds_bytes)
+}
+
+// Safe 64-bit integer comparison via split hi/lo dwords (avoids driver shared-dword i64 compare bugs, #1599).
+cmp_i64_dwords_safe :: proc "contextless" (a, b: u64, signed: bool) -> i32 {
+	a_hi := u32(a >> 32)
+	b_hi := u32(b >> 32)
+	if a_hi != b_hi {
+		if signed {
+			return -1 if i32(a_hi) < i32(b_hi) else 1
+		}
+		return -1 if a_hi < b_hi else 1
+	}
+	a_lo := u32(a)
+	b_lo := u32(b)
+	if a_lo == b_lo {
+		return 0
+	}
+	return -1 if a_lo < b_lo else 1
+}
+
 Shader_Options :: struct {
 	view_marks: bool,
 	loop_limit: u32,

@@ -480,7 +480,7 @@ app_translate :: proc(paths: []string, validate := false, wave_mode := vasperty_
 	return tally, 0
 }
 
-app_probe :: proc(paths: []string) -> int {
+app_probe :: proc(paths: []string, scan := false) -> int {
 	ok_count := 0
 	for p in paths {
 		pr, ok := vasperty_game.probe_archive_file(p)
@@ -497,6 +497,13 @@ app_probe :: proc(paths: []string) -> int {
 			pr.magic[2] if pr.magic[2] >= 32 && pr.magic[2] <= 126 else '.',
 			pr.magic[3] if pr.magic[3] >= 32 && pr.magic[3] <= 126 else '.',
 			pr.version, pr.entry_hint, p)
+		if scan && pr.kind == .Rpf9 {
+			if sum, sok := vasperty_game.rpf9_scan_embedded(p, 64 << 20); sok {
+				fmt.printf("  scan (%.1f MiB): sgd5=%d (first=0x%X) dxbc=%d (first=0x%X)\n",
+					f64(sum.bytes_scanned) / (1024.0 * 1024.0),
+					sum.sgd5_hits, sum.first_sgd5, sum.dxbc_hits, sum.first_dxbc)
+			}
+		}
 	}
 	return 0 if ok_count > 0 else 1
 }
@@ -747,6 +754,28 @@ app_bench :: proc(secs: f64) -> int {
 	fmt.printf("d3d12 adapter   : %s (%s, mesh=%v, wave=%v %d..%d, tearing=%v)\n",
 		caps.adapter_name, caps.highest_shader_model, caps.mesh_shaders,
 		caps.wave_ops, caps.wave_lane_count_min, caps.wave_lane_count_max, caps.allow_tearing)
+
+	if ex, ex_ok := vasperty_gpu.host_executor_init(true); ex_ok {
+		defer vasperty_gpu.host_executor_destroy(&ex)
+		tg := time.tick_now()
+		submitted := 0
+		for submitted < 256 {
+			if slot, bok := vasperty_gpu.host_executor_begin_frame(&ex); bok {
+				if _, sok := vasperty_gpu.host_executor_submit_frame(&ex, slot); sok {
+					submitted += 1
+				} else {
+					break
+				}
+			} else {
+				break
+			}
+		}
+		vasperty_gpu.host_executor_drain(&ex)
+		el_gpu := time.duration_seconds(time.tick_since(tg))
+		fmt.printf("d3d12 async ring: %6d frames in %.3fs -> %.0f frames/s (in_flight=%d async_compute=%v)\n",
+			submitted, el_gpu, f64(submitted) / max(el_gpu, 0.0001),
+			ex.tuning.max_frames_in_flight, ex.compute_queue != nil)
+	}
 	return 0
 }
 

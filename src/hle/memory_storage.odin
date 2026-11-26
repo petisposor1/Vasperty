@@ -105,7 +105,6 @@ kb_fn :: proc(name: string, $T: typeid) -> (T, bool) {
 	return cast(T)rawptr(addr), true
 }
 
-@(private)
 xmem_address_range :: proc(flags: u64) -> (uintptr, uintptr) {
 	if flags & XMEM_ADDRESS_32BIT != 0 {
 		return 0, uintptr(0xFFFFFFFF)
@@ -113,6 +112,11 @@ xmem_address_range :: proc(flags: u64) -> (uintptr, uintptr) {
 	field := (flags >> 12) & 7
 	bits := uint(40) if field == 0 else uint(47 - field)
 	return uintptr(1) << 32, (uintptr(1) << bits) - 1
+}
+
+// Verifies that an address range respects the < 4 GiB 32-bit title memory boundary (#1009).
+xmem_is_low32 :: proc "contextless" (addr: uintptr, size: uint) -> bool {
+	return u64(addr) + u64(size) <= u64(0x1_0000_0000)
 }
 
 XMemVirtualAlloc :: proc "system" (base: rawptr, size: uint, kind: u32, flags: u64, protect: u32) -> rawptr {

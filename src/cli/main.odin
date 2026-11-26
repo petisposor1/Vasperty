@@ -16,7 +16,7 @@ usage :: proc() {
 	fmt.println("  vasperty.exe inspect <pe-path> [--imports] [--exports]")
 	fmt.println("  vasperty.exe census <paths...> [--strict] [--missing]")
 	fmt.println("  vasperty.exe translate <paths...> [--validate] [--wave16|--wave32|--wave64] [--jobs N]")
-	fmt.println("  vasperty.exe probe <archives...>")
+	fmt.println("  vasperty.exe probe <archives...> [--scan]")
 	fmt.println("  vasperty.exe run <exe> [--strict] [--zero] [--execute] [--series-s]")
 	fmt.println("  vasperty.exe bench [seconds]")
 }
@@ -104,11 +104,17 @@ main :: proc() {
 		os.exit(code)
 
 	case "probe":
-		if len(rest) == 0 {
+		scan := false
+		paths := make([dynamic]string, 0, len(rest), context.temp_allocator)
+		for a in rest {
+			if a == "--scan" { scan = true }
+			else { append(&paths, a) }
+		}
+		if len(paths) == 0 {
 			fmt.eprintln("probe requires at least one archive path")
 			os.exit(2)
 		}
-		os.exit(vasperty_app.app_probe(rest))
+		os.exit(vasperty_app.app_probe(paths[:], scan))
 
 	case "run":
 		strict, execute, zero := false, false, false

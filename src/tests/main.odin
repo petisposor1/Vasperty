@@ -1451,6 +1451,38 @@ test_vendor_and_ring :: proc() {
 	dnames := vasperty_pe.dll_characteristics_names(0x0160)
 	assert(dnames == "HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT")
 	delete(dnames)
+
+	// Dirty_Bitmap 64-bit CTZ zero-word skip (#1865)
+	bm := vasperty_gpu.dirty_bitmap_init(1024)
+	defer vasperty_gpu.dirty_bitmap_destroy(&bm)
+	vasperty_gpu.dirty_bitmap_mark(&bm, 0)
+	vasperty_gpu.dirty_bitmap_mark(&bm, 65)
+	vasperty_gpu.dirty_bitmap_mark_range(&bm, 512, 3)
+	pages := make([dynamic]u64)
+	defer delete(pages)
+	vasperty_gpu.dirty_bitmap_collect(&bm, &pages)
+	assert(len(pages) == 5 && pages[0] == 0 && pages[1] == 65 && pages[2] == 512 && pages[4] == 514)
+
+	// Shader LDS guard, Wave16/32 bpermute scoping, i64 dword compare, XMem <4GiB range
+	assert(vasperty_shader.bpermute_lane_mask(.Wave16) == 0x0F && vasperty_shader.bpermute_lane_mask(.Wave32) == 0x1F)
+	assert(vasperty_shader.lds_offset_in_bounds(0, 16, 4096) && !vasperty_shader.lds_offset_in_bounds(4090, 16, 4096))
+	assert(vasperty_shader.cmp_i64_dwords_safe(0xFFFF_FFFF_FFFF_FFFF, 1, true) == -1)
+	assert(vasperty_shader.cmp_i64_dwords_safe(0xFFFF_FFFF_FFFF_FFFF, 1, false) == 1)
+	lo32, hi32 := vasperty_hle.xmem_address_range(vasperty_hle.XMEM_ADDRESS_32BIT)
+	assert(lo32 == 0 && hi32 == 0xFFFF_FFFF && vasperty_hle.xmem_is_low32(0x1000_0000, 0x1000))
+
+	// Live D3D12 Host_Executor async Frame_Ring submission (real GPU or WARP)
+	if ex, ex_ok := vasperty_gpu.host_executor_init(true); ex_ok {
+		defer vasperty_gpu.host_executor_destroy(&ex)
+		for _ in 0 ..< 6 {
+			slot, bok := vasperty_gpu.host_executor_begin_frame(&ex)
+			assert(bok)
+			fval, sok := vasperty_gpu.host_executor_submit_frame(&ex, slot)
+			assert(sok && fval > 0)
+		}
+		vasperty_gpu.host_executor_drain(&ex)
+		assert(ex.frames_submitted == 6)
+	}
 	fmt.println("ok")
 }
 
