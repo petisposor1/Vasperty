@@ -81,7 +81,7 @@ make_sgd5_record_bytes :: proc(name: string, kind: u8, payload: []u8, out: ^[dyn
 test_core_policy_and_config :: proc() {
 	fmt.print("[test] core_policy_and_config ... ")
 	assert(vasperty_core.ensure_outside_repo("cache\\textures") == .Inside_Repo)
-	assert(vasperty_core.ensure_outside_repo("crates\\..\\not-created\\out") == .Inside_Repo)
+	assert(vasperty_core.ensure_outside_repo("odin\\..\\not-created\\out") == .Inside_Repo)
 	assert(vasperty_core.ensure_outside_repo("") == .Empty_Path)
 
 	temp_base, found_tmp := os.lookup_env("TEMP", context.allocator)
@@ -1335,6 +1335,48 @@ test_app_phase7 :: proc() {
 	fmt.println("ok")
 }
 
+test_vendor_and_ring :: proc() {
+	fmt.print("[test] vendor_profiles_frame_ring_scanner ... ")
+	intel := vasperty_gpu.Host_Capabilities{vendor_id = 0x8086, dedicated_video_memory = 128 << 20, shared_system_memory = 8 << 30, wave_lane_count_min = 16, wave_lane_count_max = 16}
+	t := vasperty_gpu.classify_vendor(&intel)
+	assert(t.tier == .Intel_Integrated_Uhd_Xe && t.is_uma && t.target_wave_size == 16 && t.max_frames_in_flight == 2)
+	nv := vasperty_gpu.Host_Capabilities{vendor_id = 0x10DE, dedicated_video_memory = 8 << 30, wave_lane_count_min = 32, wave_lane_count_max = 32}
+	t = vasperty_gpu.classify_vendor(&nv)
+	assert(t.tier == .Nvidia_Modern_Wave32 && t.target_wave_size == 32 && t.prefer_async_compute && t.max_frames_in_flight == 3)
+	amd := vasperty_gpu.Host_Capabilities{vendor_id = 0x1002, dedicated_video_memory = 8 << 30, wave_lane_count_max = 64}
+	t = vasperty_gpu.classify_vendor(&amd)
+	assert(t.tier == .Amd_Rdna && t.target_wave_size == 64 && !t.emulate_wave64)
+	warp := vasperty_gpu.Host_Capabilities{vendor_id = 0x1414}
+	assert(vasperty_gpu.classify_vendor(&warp).tier == .Software_Warp)
+
+	ring := vasperty_gpu.frame_ring_init(2)
+	defer vasperty_gpu.frame_ring_destroy(&ring)
+	s0, _, w0 := vasperty_gpu.frame_ring_begin(&ring)
+	assert(!w0)
+	vasperty_gpu.frame_ring_mark_dirty_page(&ring, s0, 0x1_0000_0010)
+	vasperty_gpu.frame_ring_mark_dirty_page(&ring, s0, 0x1_0000_FFF0)
+	assert(len(ring.slots[s0].dirty_pages) == 1)
+	f0 := vasperty_gpu.frame_ring_submit(&ring, s0)
+	s1, _, w1 := vasperty_gpu.frame_ring_begin(&ring)
+	assert(!w1 && s1 != s0)
+	f1 := vasperty_gpu.frame_ring_submit(&ring, s1)
+	_, wf, w2 := vasperty_gpu.frame_ring_begin(&ring)
+	assert(w2 && wf == f0)
+	vasperty_gpu.frame_ring_complete(&ring, f0)
+	_, _, w3 := vasperty_gpu.frame_ring_begin(&ring)
+	assert(!w3 && f1 > f0)
+
+	buf := make([]u8, 256)
+	defer delete(buf)
+	emb := vasperty_shader.scan_embedded_dxbc(buf)
+	assert(len(emb) == 0)
+	delete(emb)
+	assert(!vasperty_game.is_rpf9(buf))
+	copy(buf, []u8{'9', 'F', 'P', 'R'})
+	assert(vasperty_game.is_rpf9(buf))
+	fmt.println("ok")
+}
+
 main :: proc() {
 	track: mem.Tracking_Allocator
 	mem.tracking_allocator_init(&track, context.allocator)
@@ -1355,6 +1397,7 @@ main :: proc() {
 	test_hle_phase4()
 	test_shader_phase5()
 	test_gpu_phase6()
+	test_vendor_and_ring()
 	test_app_phase7()
 
 	if len(track.allocation_map) > 0 {

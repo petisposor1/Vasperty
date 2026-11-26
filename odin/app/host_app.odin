@@ -1,4 +1,4 @@
-package vasperty_app
+﻿package vasperty_app
 
 import "core:fmt"
 import "core:os"
@@ -63,9 +63,9 @@ app_fini :: proc(rt: ^Host_Runtime) {
 
 app_status :: proc() -> int {
 	cores := os.get_processor_core_count()
-	fmt.printf("vasperty-odin: All 7 phases online (cores=%d)\n", cores)
+	fmt.printf("vasperty: native Odin runtime online (cores=%d)\n", cores)
 	fmt.println("  packages: core, pe, game, formats, pipeline, loader, hle, shader, gpu, app, cli")
-	fmt.println("  baseline: Marvisak/VIctory upstream 13f91ca (GTA VI prologue)")
+	fmt.println("  targets : NVIDIA (Wave32 async) + Intel Integrated (Wave16 UMA)")
 	return 0
 }
 
@@ -124,6 +124,11 @@ app_doctor :: proc(prune_cache := false) -> int {
 	)
 	fmt.printf("Display         : %d modes, max %d Hz, tearing=%v\n",
 		caps.display_mode_count, caps.max_refresh_hz, caps.allow_tearing)
+	tune := vasperty_gpu.classify_vendor(&caps)
+	fmt.printf("GPU profile     : %s [%v]\n", tune.profile_name, tune.tier)
+	fmt.printf("  uma=%v wave=%d emulate_wave64=%v mesh_fallback=%v in_flight=%d pool=%d MiB async=%v dxr=%v\n",
+		tune.is_uma, tune.target_wave_size, tune.emulate_wave64, tune.emulate_mesh_shaders,
+		tune.max_frames_in_flight, tune.buffer_pool_budget_bytes >> 20, tune.prefer_async_compute, tune.enable_dxr_bvh)
 
 	if cache, c_err := vasperty_pipeline.cache_open(cfg.cache_dir); c_err == .None {
 		defer vasperty_pipeline.cache_destroy(&cache)
@@ -286,16 +291,19 @@ app_census :: proc(paths: []string, strict := false, show_missing := false) -> i
 }
 
 Translate_Tally :: struct {
+	xdat:       int,
+	accc:       int,
+	dxil:       int,
 	containers: int,
 	translated: int,
 	validated:  int,
 	failed:     int,
 }
 
-app_translate_blob :: proc(blob: []u8, validate: bool, tally: ^Translate_Tally) {
+app_translate_blob :: proc(blob: []u8, validate: bool, tally: ^Translate_Tally, wave_mode := vasperty_shader.Target_Wave_Mode.Auto) {
 	if len(blob) >= 4 && blob[0] == 'D' && blob[1] == 'X' && blob[2] == 'B' && blob[3] == 'C' {
 		tally.containers += 1
-		hs, terr := vasperty_shader.translate(blob)
+		hs, terr := vasperty_shader.translate_with(blob, vasperty_shader.Shader_Options{wave_mode = wave_mode})
 		if terr != .None {
 			tally.failed += 1
 			return
@@ -325,23 +333,36 @@ app_translate_blob :: proc(blob: []u8, validate: bool, tally: ^Translate_Tally) 
 		defer vasperty_game.sgd5_destroy_unpack_results(unpacked)
 		for &ur in unpacked {
 			if ur.ok && len(ur.data) > 0 {
-				app_translate_blob(ur.data, validate, tally)
+				app_translate_blob(ur.data, validate, tally, wave_mode)
 			}
 		}
+		return
+	}
+	emb := vasperty_shader.scan_embedded_dxbc(blob)
+	defer delete(emb)
+	for e in emb {
+		if e.has_xdat { tally.xdat += 1 }
+		if e.has_accc { tally.accc += 1 }
+		if e.has_dxil { tally.dxil += 1 }
+		app_translate_blob(blob[e.offset:e.offset + e.size], validate, tally, wave_mode)
 	}
 }
 
-app_translate :: proc(paths: []string, validate := false) -> (Translate_Tally, int) {
+app_translate :: proc(paths: []string, validate := false, wave_mode := vasperty_shader.Target_Wave_Mode.Auto) -> (Translate_Tally, int) {
 	tally: Translate_Tally
 	for p in paths {
 		if os.is_file(p) {
 			raw, rerr := os.read_entire_file_from_path(p, context.allocator)
 			if rerr == nil {
-				app_translate_blob(raw, validate, &tally)
+				app_translate_blob(raw, validate, &tally, wave_mode)
 				delete(raw)
 			}
 		}
 	}
+	fmt.printf(
+		"translate: wave=%v embedded(xdat=%d accc=%d dxil=%d)\n",
+		wave_mode, tally.xdat, tally.accc, tally.dxil,
+	)
 	fmt.printf(
 		"translate: %d containers -> %d translated, %d validated, %d failed/unsupported\n",
 		tally.containers, tally.translated, tally.validated, tally.failed,

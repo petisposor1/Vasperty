@@ -3,10 +3,10 @@
   Build, verify, benchmark, and diagnose the Vasperty Odin subsystem.
 
 .PARAMETER Action
-  One of: check, test, build, bench, doctor, all (default: all)
+  One of: check, test, policy, build, bench, doctor, all (default: all)
 #>
 param(
-    [ValidateSet("check", "test", "build", "bench", "doctor", "all")]
+    [ValidateSet("check", "test", "policy", "build", "bench", "doctor", "all")]
     [string]$Action = "all"
 )
 
@@ -139,12 +139,49 @@ function Run-CliBuild {
     return (Build-OdinBinary (Join-Path $OdinRoot "cli") "vasperty" -Opt)
 }
 
+function Run-Policy {
+    Write-Host "[policy] Auditing tracked and staged files against asset policy..."
+    $forbiddenExts = @(
+        ".exe", ".dll", ".pdb", ".lib", ".sys", ".obj", ".exp", ".ilk",
+        ".xvd", ".xvc", ".msixvc", ".xsp", ".cab", ".msi",
+        ".rpf", ".dds", ".ktx", ".ktx2", ".dxbc", ".dxil", ".cso", ".spv",
+        ".wav", ".xma", ".ogg", ".opus", ".mp3", ".mp4", ".bik", ".bk2", ".awc",
+        ".pak", ".dat", ".zip", ".7z", ".rar", ".bin"
+    )
+    $tracked = @(& git -C $RepoRoot ls-files)
+    $untracked = @(& git -C $RepoRoot ls-files --others --exclude-standard)
+    $allFiles = ($tracked + $untracked) | Sort-Object -Unique
+    $checked = 0
+    foreach ($rel in $allFiles) {
+        if ([string]::IsNullOrWhiteSpace($rel)) { continue }
+        $full = Join-Path $RepoRoot $rel
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
+        $checked++
+        $norm = $rel.Replace('\', '/')
+        if ($norm -eq "odin/formats/bcpack-tables.bin" -or $norm -eq "LICENSE") {
+            continue
+        }
+        $ext = [System.IO.Path]::GetExtension($norm).ToLowerInvariant()
+        if ($forbiddenExts -contains $ext) {
+            throw "Asset policy violation: forbidden extension '$ext' at '$norm'"
+        }
+        $len = (Get-Item -LiteralPath $full).Length
+        if ($len -gt (512 * 1024)) {
+            throw "Asset policy violation: file '$norm' exceeds 512 KiB ($len bytes)"
+        }
+    }
+    Write-Host "[policy] PASS: $checked files verified clean."
+}
+
 switch ($Action) {
     "check" {
         Run-Check
     }
     "test" {
         Run-Tests
+    }
+    "policy" {
+        Run-Policy
     }
     "build" {
         $null = Run-CliBuild
@@ -161,6 +198,7 @@ switch ($Action) {
     }
     "all" {
         Run-Check
+        Run-Policy
         Run-Tests
         $cliExe = Run-CliBuild
         Write-Host "[cli] status"

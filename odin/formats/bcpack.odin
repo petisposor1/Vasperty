@@ -15,7 +15,7 @@ BCPACK_TABLES_SIZE :: BCPACK_MODELS * BCPACK_BUCKETS * 2 +
 	512 * 2 +
 	BCPACK_DICTIONARY * (6 + 16 + 8 + 32 + 2 + 16 + 4 + 32 + 25 + 33 + 50 + 66)
 
-BCPACK_TABLES_BYTES :: #load("../../crates/victory-formats/src/bcpack-tables.bin")
+BCPACK_TABLES_BYTES :: #load("bcpack-tables.bin")
 
 Bcpack_Error :: enum {
 	None,

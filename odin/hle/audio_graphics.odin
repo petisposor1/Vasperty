@@ -1084,7 +1084,10 @@ D3D12X_EXPORTS := [?]Hle_Export {
 }
 
 ffx_serving :: proc() -> bool {
-	dir, ok := os.lookup_env("VICTORY_FIDELITYFX_DIR", context.temp_allocator)
+	dir, ok := os.lookup_env("VASPERTY_FIDELITYFX_DIR", context.temp_allocator)
+	if !ok || len(dir) == 0 {
+		dir, ok = os.lookup_env("VICTORY_FIDELITYFX_DIR", context.temp_allocator)
+	}
 	if !ok || len(dir) == 0 { return false }
 	p, _ := filepath.join({dir, "amd_fidelityfx_upscaler_dx12.dll"}, context.temp_allocator)
 	return os.is_file(p)

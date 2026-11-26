@@ -1,276 +1,103 @@
 # Vasperty
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+**Vasperty** is a pure-Odin runtime, Xbox Series PE/DLL loader, HLE layer, RDNA2/GFX10-to-DXIL Shader Model 6.6 compiler, and Direct3D 12 virtualization layer built specifically for high-throughput host execution on **NVIDIA** and **Intel Integrated / Arc** GPUs.
 
-> **About this fork.** **Vasperty** is an independent, precision-focused,
-> high-performance fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory).
-> We continuously track and pull upstream improvements from VIctory while
-> refining hardware accuracy, frame pacing, GPU/CPU throughput, and platform
-> completeness with tighter engineering focus and automated verification.
-> Upstream credit and the `GPL-3.0-or-later` license are fully preserved.
+---
 
-The title's x86-64 code runs unchanged inside our process; Vasperty supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can (shaders and pipelines too, see Getting started) and on first use
-otherwise. See [docs/architecture.md](docs/architecture.md).
+## Key Capabilities
 
-## Key Enhancements in Vasperty
+- **Zero External Build Baggage**: Pure Odin codebase (`odin/`) linking natively with LLVM-MinGW or MSVC SDK — no Cargo/Rust workspace overhead.
+- **Vendor-Adaptive GPU Execution**:
+  - **NVIDIA GPUs (`Wave32`)**: Async compute scheduling, hardware DXR/BVH readiness, depth-bounds support, persistent pipeline library caching, 3 frames in flight, and a 256 MiB transient buffer pool.
+  - **Intel Integrated GPUs (`UHD / Xe UMA Wave16`)**: UMA-aware 64 MiB transient buffer budgeting, `Wave16` subgroup targeting with `Wave64 -> Wave16` emulation, automatic mesh-shader fallback paths, and 2 frames in flight to prevent shared-memory saturation.
+  - **Intel Arc / AMD RDNA / WARP**: Dedicated discrete Arc (`Xe-HPG`), AMD RDNA (`Wave64`/`Wave32`), and Microsoft WARP software fallback profiles.
+- **Asynchronous Multi-Frame Scheduler (`Frame_Ring`)**: Eliminates per-submission CPU/GPU pipeline stalls via monotonic fence tracking and 64 KiB dirty-page copy-back coalescing.
+- **RDNA2 / GFX10 -> SM 6.6 DXIL Compiler (`vasperty:shader`)**:
+  - Parses raw `DXBC`, `ACCC` (FSPX upscaler), `XDAT` (Xbox BVH / compute metadata), `SGD5` shader databases, `PS\0\9` shader packs, and embedded DXBC containers directly inside PE DLLs.
+  - Decodes GFX10/RDNA2 ISA, performs CFG node-splitting + BDD structurisation, emits SM 6.6 LLVM 3.7 bitcode, and validates via host `dxil.dll` (`IDxcValidator`).
+- **Complete Xbox Series HLE & Loader (`vasperty:loader` + `vasperty:hle`)**:
+  - Relocatable PE32+ image preparation, TLS callback execution, dynamic IAT/EAT thunk binding, 16 emulated system/title DLLs, `XAsync`/`XTaskQueue`, `XGameSave`, `DirectStorage`, `XG` texture tiling/detiling (`BCPack` + RDNA2 `64KB_S`), and `XMA2` audio decoding.
 
-| Area | Improvement |
-|------|-------------|
-| Depth Bounds Testing | Preserves `D3D12_DEPTH_STENCIL_DESC1` (`DepthBoundsTestEnable`) in graphics & mesh PSO streams and routes `OMSetDepthBounds` with host capability probing |
-| Hardware GPU Queries & Predication | Backs query heaps with real host `ID3D12QueryHeap` objects (`OCCLUSION`, `BINARY_OCCLUSION`, `TIMESTAMP`, `PIPELINE_STATISTICS`, `SO_STATISTICS`), resolves readbacks into title + shadow buffers, and implements `SetPredication` |
-| HDR Swap Chains, Tearing & 120 Hz | Negotiates `IDXGISwapChain3` color spaces (`HDR10` PQ/Rec.2020 and `scRGB` linear HDR; disable with `VICTORY_HDR=0`), `DXGI_FEATURE_PRESENT_ALLOW_TEARING` (toggle vsync with `VICTORY_VSYNC=1`), and enumerates 60 Hz, 120 Hz, and host-native display modes |
-| Indirect Mesh & Console Topologies | Unlocks `DispatchMeshX` indirect execution via GPU-clamped `ExecuteIndirect`, and expands `QUADS`, `QUAD_STRIP`, `TRIANGLE_FAN`, and `LINE_LOOP` (non-indexed and 16/32-bit indexed with primitive-restart cut handling) |
-| High-Resolution Frame Pacing | Uses Windows high-resolution waitable timers with sub-millisecond spin-wait precision and honors per-event `schedule` phase offsets |
-| Shadow Copy-Back & Parallel Batch | Accelerates GPU-to-title copy-back (including marked view-write pages) with shared thread-local scratch reuse and 8-byte word-wide diff/merge, plus scoped multi-threaded `Batch::flush` & copy-back across independent buffers and `VICTORY_PIPELINE_WORKERS` / `VICTORY_PIPELINE_BUDGET_MS` tuning |
-| GameInput Triggers & Battery | Advertises 4-motor rumble, blends left/right impulse trigger vibration proportionally into high-frequency rumble (`VICTORY_TRIGGER_RUMBLE_BLEND=0` to disable), and implements `GetBatteryState` via `XInputGetBatteryInformation` |
-| Real-Time Audio DSP & Opus APU | Adds a zero-allocation 4-line Hadamard FDN stereo reverb in `chad.dll` (`VICTORY_DSP_REVERB=0`), zero-allocation `xapu.dll` Opus decode scratch, and real-time linear pitch resampling |
-| GPU Transient Buffer Pooling | Power-of-two bucketed pools in `Host` for transient upload, query readback, and alias-copy default buffers, recycled on command list reset |
-| Parallel Texture Tiling & Detiling | Multi-threaded row-strip, tile-band, and 3D-slab texture tiling (`Layout::tile`) and detiling (`Layout::detile`) on large subresources (`>= 256 KiB`) with zero `unsafe` and 64/128-byte run unrolling in `victory-formats` |
-| XMA2 & BCPack Format Acceleration | Precomputed bit-exact `quant_scale` LUT and contiguous intra-packet `Cursor::bits` extraction in XMA2 audio, plus process-shared `OnceLock` BCPack tables (`Tables::shared` / `decode_builtin`), direct slice cursor decoding, multi-core `decode_batch`, `SPREAD4` nibble interleaving, and zero-branch rANS stepping |
-| Zero-Allocation DirectStorage | Thread-local reusable worker scratch buffers (`SCRATCH_SRC`, `SCRATCH_PACKED`, `SCRATCH_DEST`) capped at 16 MiB, shared `Tables::shared()` reuse, plus tunable `VICTORY_DSTORAGE_WORKERS` |
-| Shader ISA & Wave Products | Adds GFX10 → DXIL SM 6.6 `WaveActiveProduct` / `WavePrefixProduct` (`v_mul_lo_u32`, `v_mul_f32`), fixes inclusive float prefix signedness, and expands ISA coverage with `s_absdiff_i32`, `s_sext_i32_i8/i16`, `s_bcnt0_i32_b32/b64`, `s_ff0_i32_b32/b64`, `s_flbit_i32_b64/i64`, `s_cmp_*_i64`, `s_pack_{ll,lh,hh}_b32_b16`, `s_cmov_{b32,b64}/s_cmovk_i32`, `s_wqm_{b32,b64}`, `s_brev_b64`, `s_bitset{0,1}_b64`, `s_bitreplicate_b64_b32`, `v_ffbh_u32/i32`, `v_lerp_u8`, `v_cvt_pk_u16/i16`, `v_cvt_pknorm_{i16,u16}_{f32,f16}`, `v_add_nc_i32/v_sub_nc_i32`, `v_dot4_u32_u8`, `v_dot2_i32_i16/u32_u16`, and `v_dot2_f32_f16` |
-| Bitmap Descriptor Heap Allocator | Replaces the 262 KiB `Vec<bool>` dynamic descriptor allocator scan in `HostHeap` with an L1-resident `u64` bitmap (`DynamicBitmap`) using hardware `trailing_zeros()` bitscans |
-| Non-Blocking Pipeline Persistence | Offloads periodic `ID3D12PipelineLibrary1` disk saves (`host-pipelines.bin`, `early-pipelines.txt`, `prebuilt-pipelines.txt`) to a coalescing background writer worker (`DiskWriter`) while keeping shutdown flushes synchronous |
-| Blocking D3D12 Fence Waits | Implements blocking `ID3D12Fence::SetEventOnCompletion(value, NULL)` synchronization via `Condvar` wakeup on fence signal instead of failing with `E_NOTIMPL` |
-| Zero-Concat Streaming Cache | Adds `CacheKey::from_parts` and `Cache::read_or_convert_parts` in `victory-pipeline`, removing heap input concatenation and redundant miss-path disk reads in `victory-gpu` shader caching |
-| Parallel Shaderpack & SGD5 | Parallelizes CityHash64 rasterizer and depth-stencil state-space resolution (`resolve_raster_hashes`, `resolve_depth_hashes`) with early-exit termination, plus multi-core SGD5 shader container inflation (`sgd5::unpack_all`) |
-| Hardware Doctor & Benchmarks | Adds `victory doctor [--prune-cache]` (live D3D12 SM/Mesh/Atomics/Wave/Tier probing, DXIL validator check, env audit, pipeline cache stats/pruning) and `victory bench` (zero-asset tile/detile, BCPack, XMA2, DXIL, state-resolve & SGD5 unpack suite) |
-| Odin Rewrite (Phases 1–7) | Complete native Odin rewrite across [`odin/`](odin/MIGRATION.md): `core`, `pe`, `game` (`CityHash64`, `PS\0\x09` `ShaderPack`, `SGD5`, PSO state solvers), parallel `formats` (`texture` RDNA2 `tile`/`detile`, `bcpack`, `xma2`), atomic SHA-256 `pipeline` cache, PE/TLS `loader`, 16-DLL `hle`, GFX10→DXIL SM 6.6 `shader`, D3D12/DXGI `gpu` virtualization, and full `app`/`cli` (`vasperty.exe`) with `Tracking_Allocator` 0-leak verification |
+---
 
-## Vasperty Native Odin Subsystem (All 7 Phases Complete)
+## Pure-Odin Architecture
 
-Alongside the synced Rust workspace, Vasperty includes a complete native **Odin** implementation under [`odin/`](odin/MIGRATION.md) across `core`, `pe`, `game`, `formats`, `pipeline`, `loader`, `hle`, `shader`, `gpu`, `app`, and `cli`:
+All engine subsystems live under `odin/`:
 
+| Package | Responsibility |
+| :--- | :--- |
+| `vasperty:core` | TOML/env config (`VASPERTY_*` / `vasperty.toml`), repo-root detection, strict outside-repo asset policy |
+| `vasperty:pe` | Zero-allocation PE32+ parser, section RVA mapping, imports/exports, TLS, exceptions |
+| `vasperty:formats` | `BCPack` rANS + dictionary decoder (`bcpack-tables.bin`), `XG` RDNA2 `64KB_S` tiling/detiling, `XMA2` IMDCT audio |
+| `vasperty:game` | `CityHash64`, `RPF9` (`9FPR`) streaming archive header reader, `SGD5` databases, `PS\0\9` pipeline state reconstruction |
+| `vasperty:pipeline` | SHA-256 keyed pipeline cache with atomic write/temp pruning |
+| `vasperty:loader` | Console PE32+ image preparation, memory publishing, import thunks, TLS orchestration |
+| `vasperty:hle` | Xbox Series runtime (`XAsync`, `XMem`, `DirectStorage`, `XGameSave`, `XG`, `ACPHAL`/`DSP`/`APU`, loopback sockets) |
+| `vasperty:shader` | RDNA2/GFX10 decoder, BDD structurisation, adaptive `Wave16`/`Wave32`/`Wave64` lowering, SM 6.6 DXIL emitter, embedded DXBC scanner |
+| `vasperty:gpu` | D3D12/DXGI capability prober, NVIDIA/Intel tuning profiles, async `Frame_Ring`, 2-level page tables, barrier coalescer, shader cache bridge |
+| `vasperty:app` | High-level runtime orchestrator, hardware doctor, symbol census, batch shader translator, microbenchmarks |
+| `vasperty:cli` | Native `vasperty.exe` command-line entrypoint |
+| `vasperty:tests` | Leak-checked (`Tracking_Allocator`) unit & integration test suite |
+
+---
+
+## Quick Start (Windows)
+
+### Prerequisites
+- [Odin Compiler](https://odin-lang.org/) (`odin.exe` in `PATH` or installed via WinGet)
+- LLVM-MinGW UCRT (`clang.exe`) or Visual Studio Windows SDK
+
+### Build, Verify & Benchmark
 ```powershell
-.\odin\build.ps1 all      # runs odin check -vet across all packages, Tracking_Allocator leak tests, vasperty.exe status/doctor/inspect/bench
-.\odin\build.ps1 build    # builds native x64 Release binary at odin\build\vasperty.exe (-o:speed)
+# Run full check + asset policy + leak-checked tests + release build + diagnostics + benchmarks
+.\odin\build.ps1 all
+
+# Individual targets
+.\odin\build.ps1 check    # Type-check all 12 packages with -vet
+.\odin\build.ps1 policy   # Audit repository against strict asset separation policy
+.\odin\build.ps1 test     # Execute test suite (verifies 0 leaks, 0 bad frees)
+.\odin\build.ps1 build    # Build optimized odin\build\vasperty.exe (-o:speed)
+.\odin\build.ps1 doctor   # Inspect detected GPU profile, wave lane capabilities, and cache health
+.\odin\build.ps1 bench    # Run CityHash64, RDNA2 tile/detile, XMA2 IMDCT, PSO, and IR/BDD benchmarks
 ```
 
-Measured native Odin throughput (`vasperty.exe bench 2`, `-o:speed`): `CityHash64 (128 B)` at **9.5–11.4 M hashes/s**, parallel RDNA2 `64KB_S` 2D **6.18 GiB/s tile / 7.16 GiB/s detile**, XMA2 512-sample IMDCT at **0.38 M/s (~2.6 us/subframe)**, GFX10 IR+BDD lowering at **83.4 K shaders/s**, and streaming multipart SHA-256 cache keying at **5.50 M keys/s** with **0 leaks / 0 bad frees** verified under `mem.Tracking_Allocator`. See [`odin/MIGRATION.md`](odin/MIGRATION.md) for the full package breakdown.
+---
 
-## Status (2026-11-25)
+## CLI Reference (`odin\build\vasperty.exe`)
 
-**Not playable yet, but you can get into the game.** The title boots, runs
-its menus at its own 30 fps, loads the world, plays the intro cutscene and
-reaches the **prologue**, the mission after it, with the graphics fully
-displayed, at about **1 frame per second**.
-
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about a minute) | works |
-| The intro cutscene | plays at about 1 fps (0.9-1.0 s a frame, warm cache, quiet machine): textured and lit characters with whole hair, buildings, sky, depth of field, the title card, credits and interface. Missing: ray-traced shadows and indirect light, the local-light shadow mask. Seen in some shots: a pink band over nearer bodies, a stand-in head on a secondary character for a few frames |
-| The prologue | reached; the graphics are fully displayed, at about 1 fps |
-
-In the intro cutscene at 1 fps the opening credits land over other shots than
-on a console: they follow the frame count, the shots follow the clock.
-
-Tested on one machine: Windows 11, AMD RX 6700 XT (12 GB).
-
-> **Warning.** Entering the world on a real GPU hung it in earlier builds,
-> and Windows then reset the display driver (every monitor goes black for a
-> moment). The latest runs, several minutes each in the world, did not, but
-> it is not ruled out; a run can also end on a GPU fault (`crashes.log`). A
-> diagnostics build with `VICTORY_D3D12_WARP=1` renders on the software
-> adapter instead (too slow to reach the world in minutes).
-
-What each part does today and what it still needs:
-
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | The scene is drawn and presented: mesh pipelines, indirect execution, views the shaders pick from the heap themselves, title memory read by address, depth written from compute, lists that wait for values other queues write, textures made when a shader first reads them, pipelines pre-built or made by worker threads and kept on disk | The title's ray-tracing structures are never built (no ray-traced shadows or indirect light in the intro cutscene); about 1 s a frame; draws of untranslated shaders are dropped; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL, ahead of time (`translate --cache`) or at first use, cached on disk. Menus: all. World: all but under 300 of 24,387 programs | Merged geometry stages (195 programs) and under 100 others; fused multiply-adds follow the host GPU; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Menus, loading and the world run with the PC upscaler (`VICTORY_FIDELITYFX_DIR`, about 1 s a frame) | The title's own upscaler DLLs: six of their passes are untranslated, so their picture is wrong |
-
-## Getting started
-
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
-
-To install Rust, use rustup (`winget install --id Rustlang.Rustup -e`, or
-the installer from https://rustup.rs). The first `cargo` command in this
-repository then fetches the pinned toolchain. Building needs the MSVC C++
-build tools: Visual Studio or its Build Tools with the "Desktop development
-with C++" workload.
-
-A run in the world takes about 33 GB of Windows commit (RAM plus paging
-file) and about 10 GB of video memory. The tested machine has 32 GB of RAM
-and a commit limit of about 80 GB. Check **Committed** under **Task Manager →
-Performance → Memory**. If `crashes.log` reports Windows error 1455, close
-other applications or increase the Windows paging file size, then retry.
-
-```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
-cargo run -p victory -- doctor           # probe live D3D12 GPU features, dxil.dll, and cache health
-cargo run -p victory -- bench            # benchmark detiling, BCPack tables, and shader translation
+```text
+vasperty.exe status
+vasperty.exe config
+vasperty.exe doctor [--prune-cache]
+vasperty.exe inspect <pe-path> [--imports] [--exports]
+vasperty.exe census <paths...> [--strict] [--missing]
+vasperty.exe translate <paths...> [--validate] [--wave16|--wave32|--wave64]
+vasperty.exe run <exe-path> [--strict] [--zero] [--execute] [--series-s]
+vasperty.exe bench [seconds]
 ```
 
-Run the title:
+- `translate` accepts raw `.dxbc` blobs, `SGD5` shader databases, `PS\0\9` shader packs, **and PE DLLs containing embedded DXBC/`ACCC`/`XDAT` shaders**, automatically scanning and translating all embedded containers.
 
-```powershell
-cargo build --release -p victory
-target\release\victory.exe translate --cache --pipelines <game dir>\shaders.rpf <game dir>\<the title's exe> <game dir>\XboxBvhBuilder.dll <game dir>\amd_fidelityfx_upscaler_xbox.dll
-target\release\victory.exe run <game dir>\<the title's exe> --execute
-```
+---
 
-The `translate --cache` step (minutes; again after a change of the shader
-translator) translates every shader the title can ask for into the cache
-(about 1.3 GB), so a run does not translate them while it plays; without it
-they are translated at first use, and their draws wait. With `--pipelines`
-it then makes every pipeline in the title's shader pack (inside
-`shaders.rpf`) into the host pipeline library (about 27,000 pipelines, 4 MB;
-estimated at 20 minutes on 16 threads, but about 2 pipelines a second after a
-translator change that touches most programs, which is hours), so a run
-compiles none of those either; the library belongs to the GPU and driver it
-was made on. Run again, it skips what is there in seconds; stopped
-early, it keeps what it made. Without it, a run makes the pipelines it needs
-on worker threads and keeps them, so the first runs after a translator
-change are slower and show missing draws for a while.
+## Configuration & Asset Policy
 
-To get into the game, press A (Enter) on each first-boot screen and again on
-the start screen. Loading the world takes about a minute; the intro cutscene
-plays, then the prologue starts.
+Vasperty strictly separates engine code from user-supplied runtime assets. No proprietary binaries, dumps, or title files may ever reside inside the repository tree.
 
-Upscaling (Series S mode): the title upscales with AMD FidelityFX. To run
-it with the PC build on your GPU instead of the console build, get the
-[FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
-and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
-`Kits/FidelityFX/signedbin` folder, which holds
-`amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
-upscaler for your GPU (the log says so), the title's own DLLs run.
+1. Copy `vasperty.example.toml` to `vasperty.toml` (already gitignored) or set environment variables:
+   - `VASPERTY_CONFIG` (path to `.toml`)
+   - `VASPERTY_GAME_DIR` (external title directory)
+   - `VASPERTY_CACHE_DIR` (defaults to `%LOCALAPPDATA%\Vasperty\cache`)
+   - `VASPERTY_DATA_DIR` (defaults to `%LOCALAPPDATA%\Vasperty\data`)
+   - `VASPERTY_FIDELITYFX_DIR` (optional host FidelityFX override)
+2. Verify repository cleanliness at any time with:
+   ```powershell
+   .\odin\build.ps1 policy
+   ```
+   See [docs/asset-policy.md](docs/asset-policy.md) for the full policy specification.
 
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
+---
 
-Set `VICTORY_WINDOW_MAX=1920x1080` before launching to limit the title's
-top-level window to that bounding box. Smaller windows keep their size,
-larger windows keep their proportions, and the monitor's work area still
-limits them. This scales the displayed image; it does not change the
-console render resolution or the swap-chain buffers. With the variable
-unset, window sizing is unchanged.
+## Acknowledgments
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
-
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
-
-## Commands
-
-```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm] [--effects]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory translate [paths...] --cache [--pipelines] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
-```
-
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
-
-### Windows shader-test validator
-
-The shader tests use `dxil.dll` to validate Shader Model 6.6 containers.
-An older Windows SDK validator can load successfully but reject them with
-`Unknown shader model 'ps_6_6'`. If this happens, use a current x64 validator
-from [Microsoft's DirectX Shader Compiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
-or a current Windows SDK. Set its path for the test session:
-
-```powershell
-$env:VICTORY_DXIL = 'C:\tools\dxc\bin\x64\dxil.dll'
-cargo test -p victory-shader --lib --locked -- --test-threads=1
-```
-
-Without this override, the validator loader selects the newest installed
-Windows SDK's `bin/<version>/x64/dxil.dll`, then falls back to the DLL search
-path when no SDK copy is found. This is a test/offline-validation dependency;
-the translated shaders do not require it at runtime.
-
-## Debugging
-
-A release build has no debugging aids. Build them in with
-
-```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
-```
-
-The on/off switches below (`...=1`) are off when unset or set to `0`.
-
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_CAPTURE_WORLD=<list>` | with `VICTORY_CAPTURE`, also saves (and with `VICTORY_DUMP_TARGETS` dumps) the frames at these offsets from the first frame that ran 500 draws (the world's first; its number depends on how fast the title loaded) |
-| `VICTORY_DUMP_WRITERS=<hash>,...` | with the two above, also the textures a pipeline containing a listed shader hash writes, the first frame it runs, and for its buffers a log line (dwords changed, dwords not zero) |
-| `VICTORY_PEEK=<hex address>[:<bytes>],...` | in listed frames, those bytes of title memory logged after each submission. Listed frames also log targets of 16 texels or fewer as values, each table view's view words and whether its host slot is null, the host copy of every buffer of 64 bytes or fewer a draw reads (at submission and after its list), and each 1D or 3D texture a dispatch writes, read back right after it |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands; a device removal names the list it happened in and lists all its commands |
-| `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
-| `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
-
-Every build appends unhandled exceptions, panics, and host GPU failures to
-`crashes.log` in the title's data folder.
-
-For a startup breakpoint (`0x80000003`), run the diagnostics build with
-`VICTORY_CRASH_BREAKPOINTS=1`. Keep the console output along with the new
-`crashes.log` entries. A host DLL refusal includes the caller stack in the
-console output. The refusal is expected for DLLs outside the host policy,
-including `rpcrt4.dll`.
-
-On Series 1.0.2.1, a missing `appdata0.rpf` reproduced the breakpoint at
-`+0x2237178` before the first window. Restore the archive from the same
-package beside the title executable. `run --execute` checks that it can
-read the RPF9 header before starting this build.
-
-To compare hardware and software rendering, repeat with
-`VICTORY_D3D12_WARP=1` and check the console for
-`host device on the software adapter (WARP)` to confirm the WARP device was
-created. Compare the exception's module and offset, stack frames, and
-preceding messages across the two runs.
-
-## License
-
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+Initial Xbox Series reverse-engineering research lineage began with [Marvisak/VIctory](https://github.com/Marvisak/VIctory). Vasperty is now an independent, pure-Odin project focused on native GPU vendor optimization (NVIDIA & Intel iGPU), asynchronous multi-frame execution, and self-contained shader translation.

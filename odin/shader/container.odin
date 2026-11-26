@@ -813,3 +813,44 @@ build_psv0 :: proc(p: ^Psv_Desc, allocator := context.allocator) -> []u8 {
 	}
 	return out[:]
 }
+
+// =============================================================================
+// Embedded DXBC scanner (PE DLLs, archives, raw blobs)
+// =============================================================================
+
+Embedded_Dxbc :: struct {
+	offset:   int,
+	size:     int,
+	has_xdat: bool,
+	has_accc: bool,
+	has_dxil: bool,
+}
+
+scan_embedded_dxbc :: proc(data: []u8, allocator := context.allocator) -> [dynamic]Embedded_Dxbc {
+	out := make([dynamic]Embedded_Dxbc, 0, 16, allocator)
+	i := 0
+	for i + 32 <= len(data) {
+		if data[i] != 'D' || data[i + 1] != 'X' || data[i + 2] != 'B' || data[i + 3] != 'C' {
+			i += 1
+			continue
+		}
+		c, err := dxbc_parse(data[i:], context.temp_allocator)
+		if err != .None || c.total_size < 32 {
+			i += 4
+			continue
+		}
+		e := Embedded_Dxbc{offset = i, size = int(c.total_size)}
+		_, e.has_dxil = dxbc_part(&c, FOURCC_DXIL)
+		_, e.has_accc = dxbc_part(&c, FOURCC_ACCC)
+		blob := data[i:i + int(c.total_size)]
+		for k := 0; k + 4 <= len(blob); k += 1 {
+			if blob[k] == 'X' && blob[k + 1] == 'D' && blob[k + 2] == 'A' && blob[k + 3] == 'T' {
+				e.has_xdat = true
+				break
+			}
+		}
+		append(&out, e)
+		i += int(c.total_size)
+	}
+	return out
+}

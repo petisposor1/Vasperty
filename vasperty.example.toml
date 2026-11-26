@@ -1,0 +1,16 @@
+# Vasperty Configuration Example
+# Copy to `vasperty.toml` outside version control (already gitignored).
+# All runtime directories MUST point outside the Vasperty source tree.
+
+[paths]
+# Path to title folder containing MicrosoftGame.config and Xbox Series assets
+# game_dir = "C:\\Path\\To\\XboxTitle"
+
+# Optional override for host shader/pipeline caches (defaults to %LOCALAPPDATA%\Vasperty\cache)
+# cache_dir = "C:\\Path\\To\\VaspertyCache"
+
+# Optional override for virtual drive persistence / saves (defaults to %LOCALAPPDATA%\Vasperty\data)
+# data_dir = "C:\\Path\\To\\VaspertyData"
+
+# Optional host FidelityFX DLL directory override
+# fidelityfx_dir = "C:\\Path\\To\\FidelityFX"

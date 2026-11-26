@@ -1038,20 +1038,21 @@ User_Data :: struct {
 }
 
 Host_Shader :: struct {
-	stage:           Hw_Stage,
-	dxil:            [dynamic]u8,
-	user_data:       [dynamic]User_Data,
-	samplers:        [dynamic][4]u32,
-	static_samplers: [dynamic]Static_Sampler,
-	root_cbvs:       [dynamic]u8,
-	root_srvs:       [dynamic]u8,
-	root_uavs:       [dynamic]u8,
-	memory:          bool,
-	memory_writes:   bool,
-	view_addresses:  bool,
-	heap:            bool,
-	heap_writes:     bool,
-	view_marks:      bool,
+	stage:            Hw_Stage,
+	dxil:             [dynamic]u8,
+	user_data:        [dynamic]User_Data,
+	samplers:         [dynamic][4]u32,
+	static_samplers:  [dynamic]Static_Sampler,
+	root_cbvs:        [dynamic]u8,
+	root_srvs:        [dynamic]u8,
+	root_uavs:        [dynamic]u8,
+	memory:           bool,
+	memory_writes:    bool,
+	view_addresses:   bool,
+	heap:             bool,
+	heap_writes:      bool,
+	view_marks:       bool,
+	target_wave_size: u8,
 }
 
 host_shader_user_data_dwords :: proc(hs: ^Host_Shader) -> u32 {
@@ -1074,9 +1075,27 @@ destroy_host_shader :: proc(hs: ^Host_Shader) {
 	delete(hs.root_uavs)
 }
 
+Target_Wave_Mode :: enum {
+	Auto,
+	Wave64,
+	Wave32,
+	Wave16,
+}
+
+target_wave_lanes :: proc "contextless" (mode: Target_Wave_Mode) -> u8 {
+	switch mode {
+	case .Wave16: return 16
+	case .Wave32: return 32
+	case .Wave64: return 64
+	case .Auto:   return 32
+	}
+	return 32
+}
+
 Shader_Options :: struct {
 	view_marks: bool,
 	loop_limit: u32,
+	wave_mode:  Target_Wave_Mode,
 }
 
 // =========================================================================
@@ -2115,6 +2134,7 @@ lower_program :: proc(
 	hs.heap = (l.s.flags & DXIL_FLAG_RESOURCE_HEAP) != 0
 	hs.heap_writes = false
 	hs.view_marks = options.view_marks
+	hs.target_wave_size = target_wave_lanes(options.wave_mode)
 	return hs, .None
 }
 

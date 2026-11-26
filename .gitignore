@@ -1,19 +1,16 @@
 # ---------------------------------------------------------------------------
-# RULE #1: nothing from the game (or any other proprietary source) is ever
-# committed.
+# RULE #1: nothing from any proprietary title source is ever committed.
 # Everything is built from files the user supplies at runtime.
-# This file is the first line of defence; `cargo xtask policy` (also run by
-# the pre-commit hook in .githooks/) is the second and is authoritative.
+# Run `.\odin\build.ps1 policy` to verify the repository before committing.
 # See docs/asset-policy.md.
 # ---------------------------------------------------------------------------
 
 # Build output
-/target/
-/tests/fixtures/*/target/
 /odin/build/
 /.odin_cache/
 
 # Local configuration (contains paths to YOUR files)
+/vasperty.toml
 /victory.toml
 
 # Places people tend to drop data into. Keep data outside the repo instead.
@@ -48,7 +45,7 @@
 # Typical game data (non-exhaustive on purpose; the policy check is an allowlist)
 *.bin
 # The one exception (docs/asset-policy.md): the BCPack format's constant tables.
-!/crates/victory-formats/src/bcpack-tables.bin
+!/odin/formats/bcpack-tables.bin
 *.dat
 *.pak
 *.rpf

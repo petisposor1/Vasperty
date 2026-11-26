@@ -224,9 +224,10 @@ host_shader_from_container :: proc(container: []u8, view_marks := true) -> (res:
 			memory          = ent.host.memory,
 			memory_writes   = ent.host.memory_writes,
 			view_addresses  = ent.host.view_addresses,
-			heap            = ent.host.heap,
-			heap_writes     = ent.host.heap_writes,
-			view_marks      = ent.host.view_marks,
+			heap             = ent.host.heap,
+			heap_writes      = ent.host.heap_writes,
+			view_marks       = ent.host.view_marks,
+			target_wave_size = ent.host.target_wave_size,
 		}
 		copy(cp.dxil[:], ent.host.dxil[:])
 		copy(cp.user_data[:], ent.host.user_data[:])
@@ -258,9 +259,10 @@ host_shader_from_container :: proc(container: []u8, view_marks := true) -> (res:
 				memory          = hs.memory,
 				memory_writes   = hs.memory_writes,
 				view_addresses  = hs.view_addresses,
-				heap            = hs.heap,
-				heap_writes     = hs.heap_writes,
-				view_marks      = hs.view_marks,
+				heap             = hs.heap,
+				heap_writes      = hs.heap_writes,
+				view_marks       = hs.view_marks,
+				target_wave_size = hs.target_wave_size,
 			}
 			copy(store.dxil[:], hs.dxil[:])
 			copy(store.user_data[:], hs.user_data[:])

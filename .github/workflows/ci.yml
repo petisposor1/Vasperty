@@ -12,22 +12,18 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
-  check:
+  verify:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      # The version and components pinned in rust-toolchain.toml.
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Clippy, diagnostics build
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      # Includes xtask's repository_passes_policy, the asset-policy check.
-      - name: Tests
-        run: cargo test --workspace --locked
+      - name: Install Odin compiler
+        run: |
+          winget install --id OdinLang.Odin --silent --accept-package-agreements --accept-source-agreements
+      - name: Check, test, and asset policy
+        shell: pwsh
+        run: |
+          ./odin/build.ps1 check
+          ./odin/build.ps1 policy
+          ./odin/build.ps1 test

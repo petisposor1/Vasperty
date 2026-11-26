@@ -4,16 +4,17 @@ import "core:fmt"
 import "core:os"
 import vasperty_app "vasperty:app"
 import vasperty_hle "vasperty:hle"
+import vasperty_shader "vasperty:shader"
 
 usage :: proc() {
-	fmt.println("Vasperty Native Odin CLI (Phases 1-7 Complete)")
+	fmt.println("Vasperty Native Odin CLI")
 	fmt.println("Usage:")
 	fmt.println("  vasperty.exe status")
 	fmt.println("  vasperty.exe config")
 	fmt.println("  vasperty.exe doctor [--prune-cache]")
 	fmt.println("  vasperty.exe inspect <pe-path> [--imports] [--exports]")
 	fmt.println("  vasperty.exe census <paths...> [--strict] [--missing]")
-	fmt.println("  vasperty.exe translate <paths...> [--validate]")
+	fmt.println("  vasperty.exe translate <paths...> [--validate] [--wave16|--wave32|--wave64]")
 	fmt.println("  vasperty.exe run <exe> [--strict] [--zero] [--execute] [--series-s]")
 	fmt.println("  vasperty.exe bench [seconds]")
 }
@@ -41,16 +42,18 @@ main :: proc() {
 		os.exit(vasperty_app.app_doctor(prune))
 
 	case "inspect":
-		if len(rest) < 1 {
+		show_imp, show_exp := false, false
+		path := ""
+		for a in rest {
+			if a == "--imports" { show_imp = true }
+			else if a == "--exports" { show_exp = true }
+			else if path == "" { path = a }
+		}
+		if path == "" {
 			fmt.eprintln("inspect requires <pe-path>")
 			os.exit(2)
 		}
-		show_imp, show_exp := false, false
-		for a in rest[1:] {
-			if a == "--imports" { show_imp = true }
-			if a == "--exports" { show_exp = true }
-		}
-		os.exit(vasperty_app.app_inspect(rest[0], show_imp, show_exp))
+		os.exit(vasperty_app.app_inspect(path, show_imp, show_exp))
 
 	case "census":
 		strict, missing := false, false
@@ -68,32 +71,38 @@ main :: proc() {
 
 	case "translate":
 		validate := false
+		wave := vasperty_shader.Target_Wave_Mode.Auto
 		paths := make([dynamic]string, 0, len(rest), context.temp_allocator)
 		for a in rest {
 			if a == "--validate" { validate = true }
+			else if a == "--wave16" { wave = .Wave16 }
+			else if a == "--wave32" { wave = .Wave32 }
+			else if a == "--wave64" { wave = .Wave64 }
 			else { append(&paths, a) }
 		}
 		if len(paths) == 0 {
 			fmt.eprintln("translate requires at least one path")
 			os.exit(2)
 		}
-		_, code := vasperty_app.app_translate(paths[:], validate)
+		_, code := vasperty_app.app_translate(paths[:], validate, wave)
 		os.exit(code)
 
 	case "run":
-		if len(rest) < 1 {
-			fmt.eprintln("run requires <exe-path>")
-			os.exit(2)
-		}
 		strict, execute, zero := false, false, false
 		console := vasperty_hle.Console_Model.Series_X
-		for a in rest[1:] {
+		exe := ""
+		for a in rest {
 			if a == "--strict" { strict = true }
 			else if a == "--execute" { execute = true }
 			else if a == "--zero" { zero = true }
 			else if a == "--series-s" { console = .Series_S }
+			else if exe == "" { exe = a }
 		}
-		os.exit(vasperty_app.app_run(rest[0], strict, execute, zero, console))
+		if exe == "" {
+			fmt.eprintln("run requires <exe-path>")
+			os.exit(2)
+		}
+		os.exit(vasperty_app.app_run(exe, strict, execute, zero, console))
 
 	case "bench":
 		secs := 2.0

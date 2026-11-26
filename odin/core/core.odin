@@ -4,7 +4,8 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 
-ROOT_MARKER :: ".victory-root"
+ROOT_MARKER_WIN :: "odin\\build.ps1"
+ROOT_MARKER_LEGACY :: ".victory-root"
 
 Policy_Error :: enum {
 	None,
@@ -45,7 +46,7 @@ destroy_config :: proc(cfg: ^Config, allocator := context.allocator) {
 }
 
 // ensure_outside_repo verifies that `path` (even if not yet created) does not
-// land inside any Vasperty / VIctory source tree identified by `.victory-root`.
+// land inside any Vasperty source tree identified by `odin/build.ps1` or `.victory-root`.
 ensure_outside_repo :: proc(path: string, allocator := context.allocator) -> Policy_Error {
 	trimmed := strings.trim_space(path)
 	if len(trimmed) == 0 {
@@ -81,12 +82,22 @@ ensure_outside_repo :: proc(path: string, allocator := context.allocator) -> Pol
 
 	cur := cleaned
 	for len(cur) > 0 {
-		marker, m_err := filepath.join({cur, ROOT_MARKER}, allocator)
+		marker, m_err := filepath.join({cur, ROOT_MARKER_WIN}, allocator)
 		if m_err != nil {
 			return .Io_Error
 		}
 		has_marker := os.is_file(marker)
 		delete(marker, allocator)
+
+		if !has_marker {
+			legacy, l_err := filepath.join({cur, ROOT_MARKER_LEGACY}, allocator)
+			if l_err != nil {
+				return .Io_Error
+			}
+			has_marker = os.is_file(legacy)
+			delete(legacy, allocator)
+		}
+
 		if has_marker {
 			return .Inside_Repo
 		}
@@ -140,6 +151,23 @@ default_vasperty_dir :: proc(leaf: string, allocator := context.allocator) -> (s
 	return strings.clone(leaf, allocator), true
 }
 
+@(private)
+lookup_env_pair :: proc(primary, fallback: string, allocator := context.allocator) -> (string, bool) {
+	if v, ok := os.lookup_env(primary, allocator); ok {
+		if len(v) > 0 {
+			return v, true
+		}
+		delete(v, allocator)
+	}
+	if v, ok := os.lookup_env(fallback, allocator); ok {
+		if len(v) > 0 {
+			return v, true
+		}
+		delete(v, allocator)
+	}
+	return "", false
+}
+
 // load_config resolves paths from environment variables, optional TOML config,
 // and safe OS-local defaults outside the repository.
 load_config :: proc(allocator := context.allocator) -> (cfg: Config, err: Policy_Error) {
@@ -148,14 +176,13 @@ load_config :: proc(allocator := context.allocator) -> (cfg: Config, err: Policy
 	config_path := ""
 	owns_cfg_path := false
 	explicit_cfg := false
-	if env_cfg, found := os.lookup_env("VICTORY_CONFIG", allocator); found && len(env_cfg) > 0 {
+	if env_cfg, found := lookup_env_pair("VASPERTY_CONFIG", "VICTORY_CONFIG", allocator); found {
 		config_path = env_cfg
 		owns_cfg_path = true
 		explicit_cfg = true
+	} else if os.is_file("vasperty.toml") {
+		config_path = "vasperty.toml"
 	} else {
-		if found {
-			delete(env_cfg, allocator)
-		}
 		config_path = "victory.toml"
 	}
 	defer if owns_cfg_path {
@@ -226,38 +253,26 @@ load_config :: proc(allocator := context.allocator) -> (cfg: Config, err: Policy
 		return cfg, .Io_Error
 	}
 
-	if env_game, ok_g := os.lookup_env("VICTORY_GAME_DIR", allocator); ok_g {
-		if len(env_game) > 0 {
-			cfg.game_dir = env_game
-			cfg.has_game_dir = true
-		} else {
-			delete(env_game, allocator)
-		}
+	if env_game, ok_g := lookup_env_pair("VASPERTY_GAME_DIR", "VICTORY_GAME_DIR", allocator); ok_g {
+		cfg.game_dir = env_game
+		cfg.has_game_dir = true
 	}
 	if !cfg.has_game_dir && len(file_game) > 0 {
 		cfg.game_dir = strings.clone(file_game, allocator)
 		cfg.has_game_dir = true
 	}
 
-	if env_ffx, ok_f := os.lookup_env("VICTORY_FIDELITYFX_DIR", allocator); ok_f {
-		if len(env_ffx) > 0 {
-			cfg.fidelityfx_dir = env_ffx
-			cfg.has_fidelityfx_dir = true
-		} else {
-			delete(env_ffx, allocator)
-		}
+	if env_ffx, ok_f := lookup_env_pair("VASPERTY_FIDELITYFX_DIR", "VICTORY_FIDELITYFX_DIR", allocator); ok_f {
+		cfg.fidelityfx_dir = env_ffx
+		cfg.has_fidelityfx_dir = true
 	}
 	if !cfg.has_fidelityfx_dir && len(file_ffx) > 0 {
 		cfg.fidelityfx_dir = strings.clone(file_ffx, allocator)
 		cfg.has_fidelityfx_dir = true
 	}
 
-	if env_cache, ok_c := os.lookup_env("VICTORY_CACHE_DIR", allocator); ok_c {
-		if len(env_cache) > 0 {
-			cfg.cache_dir = env_cache
-		} else {
-			delete(env_cache, allocator)
-		}
+	if env_cache, ok_c := lookup_env_pair("VASPERTY_CACHE_DIR", "VICTORY_CACHE_DIR", allocator); ok_c {
+		cfg.cache_dir = env_cache
 	}
 	if len(cfg.cache_dir) == 0 {
 		if len(file_cache) > 0 {
@@ -268,12 +283,8 @@ load_config :: proc(allocator := context.allocator) -> (cfg: Config, err: Policy
 		}
 	}
 
-	if env_data, ok_d := os.lookup_env("VICTORY_DATA_DIR", allocator); ok_d {
-		if len(env_data) > 0 {
-			cfg.data_dir = env_data
-		} else {
-			delete(env_data, allocator)
-		}
+	if env_data, ok_d := lookup_env_pair("VASPERTY_DATA_DIR", "VICTORY_DATA_DIR", allocator); ok_d {
+		cfg.data_dir = env_data
 	}
 	if len(cfg.data_dir) == 0 {
 		if len(file_data) > 0 {
@@ -284,15 +295,13 @@ load_config :: proc(allocator := context.allocator) -> (cfg: Config, err: Policy
 		}
 	}
 
-	if env_titles, ok_t := os.lookup_env("VICTORY_TEST_TITLES", allocator); ok_t {
+	if env_titles, ok_t := lookup_env_pair("VASPERTY_TEST_TITLES", "VICTORY_TEST_TITLES", allocator); ok_t {
 		defer delete(env_titles, allocator)
-		if len(env_titles) > 0 {
-			it := env_titles
-			for item in strings.split_iterator(&it, ";") {
-				trimmed := strings.trim_space(item)
-				if len(trimmed) > 0 {
-					append(&cfg.test_titles, strings.clone(trimmed, allocator))
-				}
+		it := env_titles
+		for item in strings.split_iterator(&it, ";") {
+			trimmed := strings.trim_space(item)
+			if len(trimmed) > 0 {
+				append(&cfg.test_titles, strings.clone(trimmed, allocator))
 			}
 		}
 	}
