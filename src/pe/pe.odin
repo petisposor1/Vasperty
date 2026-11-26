@@ -545,5 +545,62 @@ parse_image :: proc(data: []u8, allocator := context.allocator) -> (info: Image_
 		}
 	}
 
+	// Export Directory (DIR_EXPORT = 0)
+	if exp_rva, exp_size, has_exp := read_dir(data, opt, num_rva_sizes, DIR_EXPORT); has_exp {
+		if exp_off, ok_eo := rva_to_file_offset(info.sections[:], exp_rva); ok_eo {
+			ord_base, ok0 := read_u32(data, int(exp_off) + 16)
+			num_funcs, ok1 := read_u32(data, int(exp_off) + 20)
+			num_names, ok2 := read_u32(data, int(exp_off) + 24)
+			funcs_rva, ok3 := read_u32(data, int(exp_off) + 28)
+			names_rva, ok4 := read_u32(data, int(exp_off) + 32)
+			ords_rva, ok5 := read_u32(data, int(exp_off) + 36)
+			if ok0 && ok1 && ok2 && ok3 && ok4 && ok5 && num_funcs <= 65536 && num_names <= 65536 {
+				if funcs_off, ok_fo := rva_to_file_offset(info.sections[:], funcs_rva); ok_fo {
+					// Map function index -> first name (if any)
+					name_by_idx := make(map[u32]string, int(num_names), context.temp_allocator)
+					if num_names > 0 {
+						names_off, ok_no := rva_to_file_offset(info.sections[:], names_rva)
+						ords_off, ok_oo := rva_to_file_offset(info.sections[:], ords_rva)
+						if ok_no && ok_oo {
+							for ni := u32(0); ni < num_names; ni += 1 {
+								nrva, ok_nr := read_u32(data, int(names_off) + int(ni) * 4)
+								fidx16, ok_oi := read_u16(data, int(ords_off) + int(ni) * 2)
+								if !ok_nr || !ok_oi { continue }
+								if noff, ok_nf := rva_to_file_offset(info.sections[:], nrva); ok_nf {
+									if s, ok_s := read_cstr_at(data, int(noff), 512, context.temp_allocator); ok_s {
+										if _, exists := name_by_idx[u32(fidx16)]; !exists {
+											name_by_idx[u32(fidx16)] = s
+										}
+									}
+								}
+							}
+						}
+					}
+					for fi := u32(0); fi < num_funcs; fi += 1 {
+						frva, ok_fr := read_u32(data, int(funcs_off) + int(fi) * 4)
+						if !ok_fr || frva == 0 { continue }
+						ent := Export_Entry{
+							ordinal = u16(ord_base + fi),
+						}
+						if nm, has_nm := name_by_idx[fi]; has_nm {
+							ent.name = strings.clone(nm, allocator)
+						}
+						if frva >= exp_rva && frva < exp_rva + exp_size {
+							if foff, ok_f := rva_to_file_offset(info.sections[:], frva); ok_f {
+								if fwd, ok_fw := read_cstr_at(data, int(foff), 512, allocator); ok_fw {
+									ent.forward = fwd
+								}
+							}
+						} else {
+							ent.has_rva = true
+							ent.rva = frva
+						}
+						append(&info.exports, ent)
+					}
+				}
+			}
+		}
+	}
+
 	return info, .None
 }

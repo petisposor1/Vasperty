@@ -808,6 +808,80 @@ app_run :: proc(
 	defer vasperty_hle.destroy_hle_resolver(&resolver)
 
 	unimpl_pol := vasperty_loader.Unimplemented_Policy.Return_Zero if zero_unimplemented else vasperty_loader.Unimplemented_Policy.Trap
+
+	// Load & bind sibling title DLLs shipped in title_dir (e.g. Bink2Scarlett, XboxBvhBuilder,
+	// libHttpClient.GDK, amd_fidelityfx_loader_xbox) so all title imports resolve cleanly.
+	Sibling_Loaded :: struct {
+		img:       vasperty_loader.Loaded_Image,
+		dll_name:  string,
+		exp_names: [dynamic]string,
+	}
+	siblings := make([dynamic]Sibling_Loaded)
+	defer {
+		for &sib in siblings {
+			vasperty_loader.loaded_unload(&sib.img)
+			delete(sib.dll_name)
+			for en in sib.exp_names { delete(en) }
+			delete(sib.exp_names)
+		}
+		delete(siblings)
+	}
+
+	seen_sib := make(map[string]bool)
+	defer {
+		for k, _ in seen_sib { delete(k) }
+		delete(seen_sib)
+	}
+	for &imp in prep.info.imports {
+		low := strings.to_lower(imp.dll, context.temp_allocator)
+		if seen_sib[low] { continue }
+		sib_path, jerr := filepath.join({title_dir, imp.dll}, context.temp_allocator)
+		if jerr != nil || !os.is_file(sib_path) { continue }
+		// Skip DLLs already provided by host system policy unless they are title-specific DLLs
+		if vasperty_hle.host_policy_allows(&host_policy, imp.dll) { continue }
+		seen_sib[strings.clone(low)] = true
+
+		s_raw, s_rerr := os.read_entire_file_from_path(sib_path, context.allocator)
+		if s_rerr != nil { continue }
+		defer delete(s_raw)
+		s_prep, s_perr := vasperty_loader.prepare_image(s_raw)
+		if s_perr != .None { continue }
+		defer vasperty_loader.destroy_prepared_image(&s_prep)
+
+		s_img, s_lerr := vasperty_loader.load_prepared(&s_prep, images_dir)
+		if s_lerr != .None { continue }
+		s_base := vasperty_loader.loaded_base(&s_img)
+		vasperty_hle.set_image_path(s_base, sib_path)
+
+		s_rep, s_berr := vasperty_loader.loaded_bind_imports(&s_img, vasperty_hle.as_loader_resolver(&resolver), unimpl_pol)
+		if s_berr == .None {
+			fmt.printf("  sibling %s at 0x%X: %d hle, %d host, %d missing\n",
+				imp.dll, s_base, s_rep.hle, s_rep.host, len(s_rep.missing))
+			vasperty_loader.destroy_bind_report(&s_rep)
+		}
+
+		sib_rec := Sibling_Loaded{
+			img       = s_img,
+			dll_name  = strings.clone(imp.dll),
+			exp_names = make([dynamic]string, 0, len(s_prep.info.exports)),
+		}
+		exps := make([dynamic]vasperty_hle.Hle_Export, 0, len(s_prep.info.exports), context.temp_allocator)
+		for &exp in s_prep.info.exports {
+			if !exp.has_rva { continue }
+			if len(exp.name) > 0 {
+				nm := strings.clone(exp.name)
+				append(&sib_rec.exp_names, nm)
+				append(&exps, vasperty_hle.Hle_Export{name = nm, address = s_base + uintptr(exp.rva)})
+			}
+			ord_nm := fmt.aprintf("#%d", exp.ordinal)
+			append(&sib_rec.exp_names, ord_nm)
+			append(&exps, vasperty_hle.Hle_Export{name = ord_nm, address = s_base + uintptr(exp.rva)})
+		}
+		dll_arr := [1]string{sib_rec.dll_name}
+		vasperty_hle.register_module(sib_rec.dll_name, dll_arr[:], exps[:])
+		append(&siblings, sib_rec)
+	}
+
 	report, berr := vasperty_loader.loaded_bind_imports(&img, vasperty_hle.as_loader_resolver(&resolver), unimpl_pol)
 	if berr != .None {
 		fmt.eprintf("run: bind imports failed: %v\n", berr)
