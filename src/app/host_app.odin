@@ -1,5 +1,6 @@
 ﻿package vasperty_app
 
+import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -8,6 +9,7 @@ import "core:slice"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
+import win32 "core:sys/windows"
 import "core:thread"
 import "core:time"
 
@@ -741,6 +743,106 @@ app_probe :: proc(paths: []string, scan := false) -> int {
 	return 0 if ok_count > 0 else 1
 }
 
+@(private)
+VEH_EXCEPTION_RECORD :: struct {
+	ExceptionCode:        u32,
+	ExceptionFlags:       u32,
+	ExceptionRecord:      rawptr,
+	ExceptionAddress:     uintptr,
+	NumberParameters:     u32,
+	_pad:                 u32,
+	ExceptionInformation: [15]uintptr,
+}
+
+@(private)
+VEH_CONTEXT_X64 :: struct {
+	_pad0:  [120]u8,
+	Rax:    u64, // 0x78
+	Rcx:    u64, // 0x80
+	Rdx:    u64, // 0x88
+	Rbx:    u64, // 0x90
+	Rsp:    u64, // 0x98
+	Rbp:    u64, // 0xA0
+	Rsi:    u64, // 0xA8
+	Rdi:    u64, // 0xB0
+	R8:     u64, // 0xB8
+	R9:     u64, // 0xC0
+	R10:    u64, // 0xC8
+	R11:    u64, // 0xD0
+	R12:    u64, // 0xD8
+	R13:    u64, // 0xE0
+	R14:    u64, // 0xE8
+	R15:    u64, // 0xF0
+	Rip:    u64, // 0xF8
+}
+
+@(private)
+VEH_EXCEPTION_POINTERS :: struct {
+	ExceptionRecord: ^VEH_EXCEPTION_RECORD,
+	ContextRecord:   ^VEH_CONTEXT_X64,
+}
+
+@(private)
+g_boot_self_base: uintptr
+@(private)
+g_boot_main_base: uintptr
+@(private)
+g_boot_main_size: uintptr
+@(private)
+g_boot_stage: string
+
+@(private)
+boot_veh_handler :: proc "system" (info: ^VEH_EXCEPTION_POINTERS) -> i32 {
+	if info == nil || info.ExceptionRecord == nil {
+		return 0
+	}
+	code := info.ExceptionRecord.ExceptionCode
+	if code != 0xC0000005 && code != 0xC000001D && code != 0xC0000096 && code != 0xC00000FD {
+		return 0
+	}
+	context = runtime.default_context()
+	addr := info.ExceptionRecord.ExceptionAddress
+	op := info.ExceptionRecord.ExceptionInformation[0]
+	fault_va := info.ExceptionRecord.ExceptionInformation[1]
+	op_str := "READ"
+	if op == 1 { op_str = "WRITE" } else if op == 8 { op_str = "EXEC" }
+
+	if g_boot_main_base != 0 && addr >= g_boot_main_base && addr < g_boot_main_base + g_boot_main_size {
+		fmt.eprintf("[crash] stage=%s code=0x%08X rip=0x%X (main+0x%X) %s va=0x%X\n",
+			g_boot_stage, code, addr, addr - g_boot_main_base, op_str, fault_va)
+	} else if g_boot_self_base != 0 && addr >= g_boot_self_base && addr < g_boot_self_base + 0x2000000 {
+		fmt.eprintf("[crash] stage=%s code=0x%08X rip=0x%X (vasperty+0x%X) %s va=0x%X\n",
+			g_boot_stage, code, addr, addr - g_boot_self_base, op_str, fault_va)
+	} else {
+		fmt.eprintf("[crash] stage=%s code=0x%08X rip=0x%X %s va=0x%X\n",
+			g_boot_stage, code, addr, op_str, fault_va)
+	}
+	if info.ContextRecord != nil {
+		ctx := info.ContextRecord
+		fmt.eprintf("  RAX=0x%X RCX=0x%X RDX=0x%X R8=0x%X R9=0x%X RSP=0x%X\n",
+			ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9, ctx.Rsp)
+		if ctx.Rsp != 0 {
+			sp := cast([^]uintptr)uintptr(ctx.Rsp)
+			for i in 0 ..< 8 {
+				v := sp[i]
+				if g_boot_main_base != 0 && v >= g_boot_main_base && v < g_boot_main_base + g_boot_main_size {
+					fmt.eprintf("  stack[%d]=0x%X (main+0x%X)\n", i, v, v - g_boot_main_base)
+				} else if g_boot_self_base != 0 && v >= g_boot_self_base && v < g_boot_self_base + 0x2000000 {
+					fmt.eprintf("  stack[%d]=0x%X (vasperty+0x%X)\n", i, v, v - g_boot_self_base)
+				}
+			}
+		}
+	}
+	return 0
+}
+
+foreign import kernel32_app_veh "system:Kernel32.lib"
+@(default_calling_convention = "system")
+foreign kernel32_app_veh {
+	AddVectoredExceptionHandler    :: proc(first: u32, handler: rawptr) -> rawptr ---
+	RemoveVectoredExceptionHandler :: proc(handle: rawptr) -> u32 ---
+}
+
 app_run :: proc(
 	exe_path: string,
 	strict := false,
@@ -895,8 +997,18 @@ app_run :: proc(
 	)
 
 	if execute {
+		g_boot_self_base = uintptr(win32.GetModuleHandleW(nil))
+		g_boot_main_base = base
+		g_boot_main_size = uintptr(prep.info.size_of_image)
+		veh := AddVectoredExceptionHandler(1, rawptr(boot_veh_handler))
+		defer if veh != nil { _ = RemoveVectoredExceptionHandler(veh) }
+
 		vasperty_hle.use_console_timers()
+		g_boot_stage = "tls_callbacks"
+		fmt.printf("[boot] running %d TLS callbacks...\n", len(prep.info.tls.callback_rvas))
 		vasperty_loader.loaded_run_tls_callbacks(&img, 1)
+		g_boot_stage = "entry_point"
+		fmt.printf("[boot] entering EntryRVA 0x%X (0x%X)...\n", prep.info.entry_rva, base + uintptr(prep.info.entry_rva))
 		entry_ptr := rawptr(base + uintptr(prep.info.entry_rva))
 		if prep.info.entry_rva != 0 {
 			Entry_Proc :: #type proc "system" () -> i32

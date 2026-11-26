@@ -234,8 +234,9 @@ XMemFree :: proc "system" (addr: rawptr, attrs: u64) {
 
 XMemIsToolsMemAvailable :: proc "system" (_out: ^u8) -> bool { context = hle_context(); return false }
 
-XMemAllocatePhysicalPages :: proc "system" (count_ptr: ^uint, out_pages: [^]uint) -> bool {
+XMemAllocatePhysicalPages :: proc "system" (flags: u64, count_ptr: ^uint, out_pages: [^]uint) -> win32.BOOL {
 	context = hle_context()
+	_ = flags
 	if count_ptr == nil || out_pages == nil { return false }
 	cnt := count_ptr^
 	if cnt == 0 { return true }
@@ -261,9 +262,9 @@ XMemAllocatePhysicalPages :: proc "system" (count_ptr: ^uint, out_pages: [^]uint
 	return true
 }
 
-XMemFreePhysicalPages :: proc "system" (count: uint, pages: [^]uint) -> bool {
+XMemFreePhysicalPages :: proc "system" (flags: u64, count: uint, pages: [^]uint) -> win32.BOOL {
 	context = hle_context()
-	_ = count; _ = pages
+	_ = flags; _ = count; _ = pages
 	return true
 }
 

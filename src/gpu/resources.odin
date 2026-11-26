@@ -1,6 +1,7 @@
 package vasperty_gpu
 
 import "base:intrinsics"
+import "core:fmt"
 import "core:sync"
 import win32 "core:sys/windows"
 import vasperty_hle "vasperty:hle"
@@ -33,15 +34,62 @@ Console_Device :: struct {
 #assert(size_of(Console_Device) == 0x58)
 
 @(private)
-g_device_vtable := [8]rawptr{
-	rawptr(device_qi),
-	rawptr(object_add_ref),
-	rawptr(object_release_static),
-	rawptr(object_get_private_data),
-	rawptr(object_set_private_data),
-	nil, // SetPrivateDataInterface
-	nil, // SetName
-	rawptr(device_get_node_count),
+device_stub_slot :: proc "system" (this: This, a1, a2, a3: uintptr) -> HRESULT {
+	context = gpu_context()
+	_ = this; _ = a1; _ = a2; _ = a3
+	return E_NOTIMPL
+}
+
+@(private)
+device_get_desc_inc :: proc "system" (this: This, kind: u32) -> u32 {
+	context = gpu_context()
+	_ = this
+	return descriptor_increment(kind)
+}
+
+@(private)
+device_check_feature_support :: proc "system" (this: This, feature: u32, data: rawptr, size: u32) -> HRESULT {
+	context = gpu_context()
+	_ = this
+	fmt.printf("[d3d12x] CheckFeatureSupport(feature=%d, size=%d)\n", feature, size)
+	if data == nil || size == 0 {
+		return E_INVALIDARG
+	}
+	// Forward to real host ID3D12Device when available
+	dlls := ensure_d3d12_dlls()
+	if dlls.create_device != nil {
+		D3D_FEATURE_LEVEL_12_0 :: u32(0xC000)
+		dev_iid := guid(0x189819f1, 0x1db6, 0x4b57, {0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7})
+		hdev: rawptr
+		if dlls.create_device(nil, D3D_FEATURE_LEVEL_12_0, &dev_iid, &hdev) >= 0 && hdev != nil {
+			defer com_release(hdev)
+			Dev_Cfs_Vtbl :: struct {
+				_pad:                [13]rawptr,
+				CheckFeatureSupport: proc "system" (rawptr, u32, rawptr, u32) -> HRESULT,
+			}
+			vt := (cast(^^Dev_Cfs_Vtbl)hdev)^
+			return vt.CheckFeatureSupport(hdev, feature, data, size)
+		}
+	}
+	return E_NOTIMPL
+}
+
+@(private)
+g_device_vtable: [96]rawptr
+
+@(init)
+init_device_vtable :: proc "contextless" () {
+	for i in 0 ..< len(g_device_vtable) {
+		g_device_vtable[i] = rawptr(device_stub_slot)
+	}
+	g_device_vtable[0] = rawptr(device_qi)
+	g_device_vtable[1] = rawptr(object_add_ref)
+	g_device_vtable[2] = rawptr(object_release_static)
+	g_device_vtable[3] = rawptr(object_get_private_data)
+	g_device_vtable[4] = rawptr(object_set_private_data)
+	g_device_vtable[7] = rawptr(device_get_node_count)
+	g_device_vtable[13] = rawptr(device_check_feature_support)
+	g_device_vtable[15] = rawptr(device_get_desc_inc)
 }
 
 g_device := Console_Device{
