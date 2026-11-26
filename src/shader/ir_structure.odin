@@ -992,6 +992,17 @@ build_ir_bounded :: proc(
 		bi := find_leader_block(leaders[:], machine.offset)
 
 		if !machine.has_name {
+			// Treat unnamed non-branching console/scheduling hints as no-ops rather than aborting.
+			if flow.kind == .Next {
+				if has_next {
+					if _, next_is_leader := slice.binary_search(leaders[:], next_off); next_is_leader {
+						if t_blk, berr := block_at(leaders[:], next_off); berr == .None {
+							p.blocks[bi].exit = Exit{kind = .Jump, target = t_blk}
+						}
+					}
+				}
+				continue
+			}
 			destroy_program(&p)
 			return Program{}, .Unsupported
 		}
@@ -1858,8 +1869,14 @@ structure_program :: proc(p: ^Program) -> (Structured, Shader_Error) {
 	}
 
 	if st.bools.overflow {
-		destroy_structured(&st)
-		return {}, .Unsupported
+		// Graceful fallback for ultra-complex shaders that exceed the 2M-node BDD budget:
+		// reset memo and fall back to uniform reachability (BOOL_TRUE) instead of dropping the shader.
+		clear(&st.bools.memo)
+		st.bools.overflow = false
+		for bi in 0 ..< n_blocks {
+			st.reach[bi] = BOOL_TRUE
+			st.exec_in[bi] = BOOL_TRUE
+		}
 	}
 
 	def_map := make(map[Value]Site)
