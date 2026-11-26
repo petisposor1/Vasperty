@@ -43,17 +43,6 @@ D3D12_ROOT_DESCRIPTOR_TABLE1 :: struct {
 }
 
 @(private)
-D3D12_DESCRIPTOR_RANGE1 :: struct {
-	RangeType:                         u32,
-	NumDescriptors:                    u32,
-	BaseShaderRegister:                u32,
-	RegisterSpace:                     u32,
-	Flags:                             u32,
-	OffsetInDescriptorsFromTableStart: u32,
-}
-#assert(size_of(D3D12_DESCRIPTOR_RANGE1) == 24)
-
-@(private)
 D3D12_ROOT_CONSTANTS :: struct {
 	ShaderRegister: u32,
 	RegisterSpace:  u32,
@@ -338,19 +327,10 @@ build_host_root_signature :: proc(hdev: rawptr, p: ^Console_Pipeline) -> rawptr 
 	p.vs_ud_dwords = 0
 	p.ps_ud_param = -1
 	p.ps_ud_dwords = 0
-	p.ps_tex_table_param = -1
 	clear(&p.root_bindings)
 
 	params := make([dynamic]D3D12_ROOT_PARAMETER1, 0, 12, context.temp_allocator)
 	samplers := make([dynamic]D3D12_STATIC_SAMPLER_DESC, 0, 16, context.temp_allocator)
-	tex_range := D3D12_DESCRIPTOR_RANGE1{
-		RangeType                         = 0, // D3D12_DESCRIPTOR_RANGE_TYPE_SRV
-		NumDescriptors                    = 8,
-		BaseShaderRegister                = 0,
-		RegisterSpace                     = vasperty_shader.TEX_SRV_SPACE,
-		Flags                             = 0x2, // D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE
-		OffsetInDescriptorsFromTableStart = 0,
-	}
 
 	if p.is_compute {
 		ud := min(vasperty_shader.host_shader_user_data_dwords(&p.cs_shader), u32(64))
@@ -390,33 +370,6 @@ build_host_root_signature :: proc(hdev: rawptr, p: ^Console_Pipeline) -> rawptr 
 		append_shader_root_bindings(&p.vs_shader, D3D12_SHADER_VISIBILITY_VERTEX, &params, &samplers, &p.root_bindings)
 		if len(p.ps_shader.dxil) > 0 {
 			append_shader_root_bindings(&p.ps_shader, D3D12_SHADER_VISIBILITY_PIXEL, &params, &samplers, &p.root_bindings)
-			if len(p.ps_shader.tex_srvs) > 0 {
-				p.ps_tex_table_param = i32(len(params))
-				append(&params, D3D12_ROOT_PARAMETER1{
-					ParameterType    = 0, // D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
-					DescriptorTable  = D3D12_ROOT_DESCRIPTOR_TABLE1{
-						NumDescriptorRanges = 1,
-						pDescriptorRanges   = &tex_range,
-					},
-					ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL,
-				})
-				if len(samplers) == 0 {
-					append(&samplers, D3D12_STATIC_SAMPLER_DESC{
-						Filter           = 0x15, // D3D12_FILTER_MIN_MAG_MIP_LINEAR
-						AddressU         = 3,    // D3D12_TEXTURE_ADDRESS_MODE_CLAMP
-						AddressV         = 3,
-						AddressW         = 3,
-						MaxAnisotropy    = 1,
-						ComparisonFunc   = 1,
-						BorderColor      = 0,
-						MinLOD           = 0,
-						MaxLOD           = 3.4028235e+38,
-						ShaderRegister   = 0,
-						RegisterSpace    = vasperty_shader.SAMPLER_SPACE,
-						ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL,
-					})
-				}
-			}
 		}
 	}
 

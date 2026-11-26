@@ -71,9 +71,7 @@ Draw_Dev_Vtbl :: struct {
 	_pad2:                            rawptr,                                                                                                              // 13
 	CreateDescriptorHeap:             proc "system" (rawptr, ^D3D12_DESCRIPTOR_HEAP_DESC, ^Iid, ^rawptr) -> HRESULT,                                       // 14
 	GetDescriptorHandleIncrementSize: proc "system" (rawptr, u32) -> u32,                                                                                  // 15
-	_pad3a:                           [2]rawptr,                                                                                                           // 16..17
-	CreateShaderResourceView:         proc "system" (rawptr, rawptr, rawptr, u64),                                                                         // 18
-	_pad3b:                           rawptr,                                                                                                              // 19
+	_pad3:                            [4]rawptr,                                                                                                           // 16..19
 	CreateRenderTargetView:           proc "system" (rawptr, rawptr, rawptr, u64),                                                                         // 20
 	CreateDepthStencilView:           proc "system" (rawptr, rawptr, rawptr, u64),                                                                         // 21
 	_pad4:                            [5]rawptr,                                                                                                           // 22..26
@@ -107,11 +105,9 @@ Host_Cmd_List_Vtbl :: struct {
 	_pad5:                       rawptr,                                                                                                    // 27
 	SetDescriptorHeaps:          proc "system" (rawptr, u32, ^rawptr),                                                                      // 28
 	_pad5b:                      rawptr,                                                                                                    // 29
-	SetGraphicsRootSignature:       proc "system" (rawptr, rawptr),                                                                            // 30
-	_pad6a0:                        rawptr,                                                                                                    // 31
-	SetGraphicsRootDescriptorTable: proc "system" (rawptr, u32, u64),                                                                          // 32
-	_pad6a1:                        [3]rawptr,                                                                                                 // 33..35
-	SetGraphicsRoot32BitConsts:     proc "system" (rawptr, u32, u32, rawptr, u32),                                                             // 36
+	SetGraphicsRootSignature:    proc "system" (rawptr, rawptr),                                                                            // 30
+	_pad6a:                      [5]rawptr,                                                                                                 // 31..35
+	SetGraphicsRoot32BitConsts:  proc "system" (rawptr, u32, u32, rawptr, u32),                                                             // 36
 	_pad6a2:                     rawptr,                                                                                                    // 37
 	SetGraphicsRootCBV:          proc "system" (rawptr, u32, u64),                                                                          // 38
 	_pad6a3:                     rawptr,                                                                                                    // 39
@@ -162,41 +158,11 @@ g_dsv_ring: Desc_Ring_Heap
 @(private)
 g_default_srv_heap: rawptr
 @(private)
-g_srv_ring_cpu:     u64
-@(private)
-g_srv_ring_gpu:     u64
-@(private)
-g_srv_ring_inc:     u32
-@(private)
-g_srv_ring_cursor:  u32
-@(private)
-g_srv_ring_mu:      sync.Mutex
-@(private)
 g_default_smp_heap: rawptr
 @(private)
 g_dummy_zero_buf: rawptr
 @(private)
 g_dummy_zero_va: u64
-@(private)
-g_white_tex: rawptr
-
-@(private)
-Srv_Desc_Heap_Vtbl :: struct {
-	_pad0:                             [9]rawptr,
-	GetCPUDescriptorHandleForHeapStart: proc "system" (rawptr, ^u64) -> ^u64, // 9
-	GetGPUDescriptorHandleForHeapStart: proc "system" (rawptr, ^u64) -> ^u64, // 10
-}
-
-@(private)
-D3D12_SHADER_RESOURCE_VIEW_DESC :: struct {
-	Format:                  u32,
-	ViewDimension:           u32,
-	Shader4ComponentMapping: u32,
-	MostDetailedMip:         u32,
-	MipLevels:               u32,
-	PlaneSlice:              u32,
-	ResourceMinLODClamp:     f32,
-}
 
 @(private)
 Upload_Res_Vtbl :: struct {
@@ -260,13 +226,7 @@ init_host_desc_rings :: proc(hdev: rawptr) {
 	dh_iid := IID_ID3D12DescriptorHeap_G
 	if g_default_srv_heap == nil {
 		d := D3D12_DESCRIPTOR_HEAP_DESC{Type = 0, NumDescriptors = 1024, Flags = 1, NodeMask = 0}
-		if dvt.CreateDescriptorHeap(hdev, &d, &dh_iid, &g_default_srv_heap) >= 0 && g_default_srv_heap != nil {
-			svt := (cast(^^Srv_Desc_Heap_Vtbl)g_default_srv_heap)^
-			_ = svt.GetCPUDescriptorHandleForHeapStart(g_default_srv_heap, &g_srv_ring_cpu)
-			_ = svt.GetGPUDescriptorHandleForHeapStart(g_default_srv_heap, &g_srv_ring_gpu)
-			g_srv_ring_inc = dvt.GetDescriptorHandleIncrementSize(hdev, 0)
-			g_srv_ring_cursor = 0
-		}
+		_ = dvt.CreateDescriptorHeap(hdev, &d, &dh_iid, &g_default_srv_heap)
 	}
 	if g_default_smp_heap == nil {
 		d := D3D12_DESCRIPTOR_HEAP_DESC{Type = 1, NumDescriptors = 64, Flags = 1, NodeMask = 0}
@@ -328,7 +288,6 @@ fini_host_draw :: proc() {
 	destroy_desc_ring_heap(&g_rtv_ring)
 	destroy_desc_ring_heap(&g_dsv_ring)
 	if g_default_srv_heap != nil { com_release(g_default_srv_heap); g_default_srv_heap = nil }
-	if g_white_tex != nil { com_release(g_white_tex); g_white_tex = nil }
 	if g_default_smp_heap != nil { com_release(g_default_smp_heap); g_default_smp_heap = nil }
 	if g_dummy_zero_buf != nil { com_release(g_dummy_zero_buf); g_dummy_zero_buf = nil; g_dummy_zero_va = 0 }
 }
@@ -634,155 +593,6 @@ bind_stage_user_data :: proc(cl: ^Console_Cmd_List, hl: rawptr, lvt: ^Host_Cmd_L
 }
 
 @(private)
-ensure_white_tex :: proc(hdev: rawptr) -> rawptr {
-	if g_white_tex != nil {
-		return g_white_tex
-	}
-	hp := D3D12_HEAP_PROPERTIES{Type = 1} // D3D12_HEAP_TYPE_DEFAULT
-	rd := D3D12_RESOURCE_DESC{
-		Dimension        = 3, // TEXTURE2D
-		Width            = 1,
-		Height           = 1,
-		DepthOrArraySize = 1,
-		MipLevels        = 1,
-		Format           = DXGI_FORMAT_R8G8B8A8_UNORM,
-		SampleCount      = 1,
-		Layout           = 0,
-	}
-	dvt := (cast(^^Draw_Dev_Vtbl)hdev)^
-	res_iid := IID_ID3D12Resource_G
-	tex: rawptr
-	if dvt.CreateCommittedResource(hdev, &hp, 0, &rd, 0x80, nil, &res_iid, &tex) >= 0 && tex != nil {
-		g_white_tex = tex
-	}
-	return g_white_tex
-}
-
-@(private)
-find_srv_resource_at :: proc(va: u64) -> (^Console_Resource, u32) {
-	if va < 0x10000 || safe_readable_bytes(va, size_of(Srv_Record)) < size_of(Srv_Record) {
-		return nil, 0
-	}
-	rec := (cast(^Srv_Record)rawptr(uintptr(va)))^
-	if rec.tag != SRV_RECORD_TAG || uintptr(rec.resource) < 0x10000 {
-		return nil, 0
-	}
-	cr := cast(^Console_Resource)rec.resource
-	if (cr.object.bits & 0xFF) != u32(Object_Kind.Resource) || cr.desc.Dimension != 3 {
-		return nil, 0
-	}
-	return cr, rec.format
-}
-
-@(private)
-bind_host_ps_textures :: proc(cl: ^Console_Cmd_List, hl: rawptr, lvt: ^Host_Cmd_List_Vtbl, p: ^Console_Pipeline) {
-	hdev := ensure_host_device()
-	if hdev == nil { return }
-	dvt := (cast(^^Draw_Dev_Vtbl)hdev)^
-
-	sync.mutex_lock(&g_srv_ring_mu)
-	if g_srv_ring_cursor + 8 > 1024 {
-		g_srv_ring_cursor = 0
-	}
-	base_idx := g_srv_ring_cursor
-	g_srv_ring_cursor += 8
-	sync.mutex_unlock(&g_srv_ring_mu)
-
-	cpu_start := g_srv_ring_cpu + u64(base_idx) * u64(g_srv_ring_inc)
-	gpu_start := g_srv_ring_gpu + u64(base_idx) * u64(g_srv_ring_inc)
-	fallback := ensure_white_tex(hdev)
-	fallback_desc := D3D12_SHADER_RESOURCE_VIEW_DESC{
-		Format                  = DXGI_FORMAT_R8G8B8A8_UNORM,
-		ViewDimension           = 4,    // TEXTURE2D
-		Shader4ComponentMapping = 5768, // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
-		MipLevels               = 1,
-	}
-	for i in u32(0) ..< 8 {
-		if fallback != nil {
-			dvt.CreateShaderResourceView(hdev, fallback, &fallback_desc, cpu_start + u64(i) * u64(g_srv_ring_inc))
-		}
-	}
-
-	for ts in p.ps_shader.tex_srvs {
-		if ts >= 8 { continue }
-		cr: ^Console_Resource
-		rec_fmt: u32
-		if ts < 32 && cl.gfx_roots[ts].kind == 1 {
-			cr, rec_fmt = find_srv_resource_at(cl.gfx_roots[ts].va)
-		}
-		if cr == nil {
-			// Scan descriptor table entries for the first valid Texture2D SRV
-			for r_slot in 0 ..< 16 {
-				rs := cl.gfx_roots[r_slot]
-				if rs.kind != 1 || rs.va < 0x10000 { continue }
-				for off in u64(0) ..< 8 {
-					if c, f := find_srv_resource_at(rs.va + off * 32); c != nil {
-						cr = c; rec_fmt = f
-						break
-					}
-				}
-				if cr != nil { break }
-			}
-		}
-		if cr == nil { continue }
-		htex, _ := ensure_host_texture(cr)
-		if htex == nil { continue }
-		// Upload CPU-UMA texture data if not GPU-rendered and reasonably sized
-		if cr.address >= 0x10000 && !cr.was_drawn && cr.desc.Width > 0 && cr.desc.Width <= 4096 && cr.desc.Height > 0 && cr.desc.Height <= 4096 {
-			hfmt := map_host_texture_format(rec_fmt if rec_fmt != 0 else cr.desc.Format)
-			bpp, blk := dxgi_format_bpp(hfmt)
-			bw := (cr.desc.Width + u64(blk) - 1) / u64(blk)
-			bh := (u64(cr.desc.Height) + u64(blk) - 1) / u64(blk)
-			row_pitch := (bw * bpp + 255) & ~u64(255)
-			total_bytes := row_pitch * bh
-			if total_bytes > 0 && total_bytes <= (32 << 20) && safe_readable_bytes(cr.address, u32(total_bytes)) >= u32(total_bytes) {
-				if up_buf, mapped := create_host_upload_buffer(total_bytes); up_buf != nil && mapped != nil {
-					src_stride := bw * bpp
-					for row in u64(0) ..< bh {
-						mem.copy(
-							rawptr(uintptr(mapped) + uintptr(row * row_pitch)),
-							rawptr(uintptr(cr.address) + uintptr(row * src_stride)),
-							int(src_stride),
-						)
-					}
-					rvt := (cast(^^Win_Res_Vtbl)up_buf)^
-					rvt.Unmap(up_buf, 0, nil)
-					host_transition_resource(hl, cr, D3D12_RESOURCE_STATE_COPY_DEST)
-					dst_loc := D3D12_TEXTURE_COPY_LOCATION{pResource = htex, Type = 0, SubresourceIndex = 0}
-					src_loc := D3D12_TEXTURE_COPY_LOCATION{
-						pResource = up_buf,
-						Type      = 1,
-						PlacedFootprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT{
-							Offset = 0,
-							Footprint = D3D12_SUBRESOURCE_FOOTPRINT{
-								Format   = hfmt,
-								Width    = u32(cr.desc.Width),
-								Height   = cr.desc.Height,
-								Depth    = 1,
-								RowPitch = u32(row_pitch),
-							},
-						},
-					}
-					lvt.CopyTextureRegion(hl, &dst_loc, 0, 0, 0, &src_loc, nil)
-					append(&cl.host_temps, up_buf)
-				}
-			}
-		}
-		host_transition_resource(hl, cr, 0x80) // D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
-		hfmt := map_host_texture_format(rec_fmt if rec_fmt != 0 else cr.desc.Format)
-		sdesc := D3D12_SHADER_RESOURCE_VIEW_DESC{
-			Format                  = hfmt,
-			ViewDimension           = 4,
-			Shader4ComponentMapping = 5768,
-			MipLevels               = 1,
-		}
-		dvt.CreateShaderResourceView(hdev, htex, &sdesc, cpu_start + u64(ts) * u64(g_srv_ring_inc))
-	}
-
-	lvt.SetGraphicsRootDescriptorTable(hl, u32(p.ps_tex_table_param), gpu_start)
-}
-
-@(private)
 prepare_host_draw :: proc(cl: ^Console_Cmd_List) -> rawptr {
 	if cl == nil || cl.is_closed || uintptr(cl.cur_pso) < 0x10000 {
 		return nil
@@ -851,9 +661,6 @@ prepare_host_draw :: proc(cl: ^Console_Cmd_List) -> rawptr {
 		case 2:
 			lvt.SetGraphicsRootUAV(hl, b.param_idx, gpu_va)
 		}
-	}
-	if p.ps_tex_table_param >= 0 && g_default_srv_heap != nil && g_srv_ring_cpu != 0 && g_srv_ring_gpu != 0 && g_srv_ring_inc != 0 {
-		bind_host_ps_textures(cl, hl, lvt, p)
 	}
 	if cl.vp_dirty && cl.num_viewports > 0 {
 		lvt.RSSetViewports(hl, cl.num_viewports, &cl.viewports[0])

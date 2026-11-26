@@ -744,35 +744,12 @@ device_create_cbv :: proc "system" (this: This, desc: rawptr, handle: u64) {
 	}
 }
 
-SRV_RECORD_TAG :: u32(0x56525376) // "vSRV"
-
-Srv_Record :: struct {
-	tag:      u32,
-	format:   u32,
-	resource: This,
-	view_dim: u32,
-	_pad:     u32,
-}
-
-#assert(size_of(Srv_Record) == 24)
-
 device_create_srv :: proc "system" (this: This, resource: This, desc: rawptr, handle: u64) {
 	_ = this
 	if handle < 0x10000 { return }
-	rec := cast(^Srv_Record)rawptr(uintptr(handle))
-	fmt_val: u32 = 0
-	dim_val: u32 = 0
-	if uintptr(desc) >= 0x10000 {
-		d := cast([^]u32)desc
-		fmt_val = d[0]
-		dim_val = d[1]
-	}
-	rec^ = Srv_Record{
-		tag      = SRV_RECORD_TAG,
-		format   = fmt_val,
-		resource = resource,
-		view_dim = dim_val,
-	}
+	dst := cast(^[4]u64)rawptr(uintptr(handle))
+	dst[0] = u64(uintptr(resource))
+	dst[1] = u64(uintptr(desc))
 }
 
 device_create_uav :: proc "system" (this: This, resource: This, counter: This, desc: rawptr, handle: u64) {
@@ -926,10 +903,9 @@ Console_Pipeline :: struct #align(16) {
 	rast_desc:      D3D12_RASTERIZER_DESC,
 	vs_ud_param:    i32,
 	vs_ud_dwords:   u32,
-	ps_ud_param:        i32,
-	ps_ud_dwords:       u32,
-	ps_tex_table_param: i32,
-	root_bindings:      [dynamic]Host_Root_Binding,
+	ps_ud_param:    i32,
+	ps_ud_dwords:   u32,
+	root_bindings:  [dynamic]Host_Root_Binding,
 	host_attempted: bool,
 	host_root:      rawptr,
 	host_pso:       rawptr,
