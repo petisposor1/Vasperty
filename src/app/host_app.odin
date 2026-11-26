@@ -339,6 +339,7 @@ Translate_Tally :: struct {
 	stage_ps:        int,
 	stage_cs:        int,
 	stage_ms:        int,
+	stage_gs:        int,
 	stage_other:     int,
 	err_unpack:      int,
 	err_not_dxbc:    int,
@@ -355,6 +356,7 @@ tally_record_stage :: proc(t: ^Translate_Tally, st: vasperty_shader.Hw_Stage) {
 	case .Ps: t.stage_ps += 1
 	case .Cs: t.stage_cs += 1
 	case .Ms: t.stage_ms += 1
+	case .Gs, .Es, .Hs, .Ls: t.stage_gs += 1
 	case:     t.stage_other += 1
 	}
 }
@@ -383,6 +385,7 @@ tally_merge :: proc(dst: ^Translate_Tally, src: ^Translate_Tally) {
 	dst.stage_ps += src.stage_ps
 	dst.stage_cs += src.stage_cs
 	dst.stage_ms += src.stage_ms
+	dst.stage_gs += src.stage_gs
 	dst.stage_other += src.stage_other
 	dst.err_unpack += src.err_unpack
 	dst.err_not_dxbc += src.err_not_dxbc
@@ -668,8 +671,8 @@ app_translate :: proc(
 		wave_mode, workers, tally.sgd5_records, tally.xdat, tally.accc, tally.dxil, el_ms, rate,
 	)
 	fmt.printf(
-		"translate: %d containers -> %d translated (VS=%d PS=%d CS=%d MS=%d), %d validated, %d failed\n",
-		tally.containers, tally.translated, tally.stage_vs, tally.stage_ps, tally.stage_cs, tally.stage_ms,
+		"translate: %d containers -> %d translated (VS=%d PS=%d CS=%d MS=%d GS=%d), %d validated, %d failed\n",
+		tally.containers, tally.translated, tally.stage_vs, tally.stage_ps, tally.stage_cs, tally.stage_ms, tally.stage_gs,
 		tally.validated, tally.failed,
 	)
 	if tally.failed > 0 {

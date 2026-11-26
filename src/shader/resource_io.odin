@@ -646,8 +646,16 @@ raise_io :: proc(p: ^Program, native: ^Native_Program) -> (Io, Shader_Error) {
 		vs_params = native.io.ms.outputs
 
 	case .Gs, .Hs, .Ls, .Es:
-		destroy_io(&io)
-		return {}, .Unsupported
+		// RDNA2 merged ES-GS / LS-HS stages receive Merged_Wave_Info in s3 and vertex/prim IDs in v0/v2/v3.
+		append(&loaded, Loaded_Entry{reg = reg_s(3), inp = Input{kind = .Merged_Wave_Info}})
+		append(&loaded, Loaded_Entry{reg = reg_v(0), inp = Input{kind = .Vertex_Id}})
+		append(&loaded, Loaded_Entry{reg = reg_v(2), inp = Input{kind = .Primitive_Id}})
+		append(&loaded, Loaded_Entry{reg = reg_v(3), inp = Input{kind = .Instance_Id}})
+		if native.io.kind == .Vs {
+			vs_params = native.io.vs_outputs
+		} else if native.io.kind == .Ms {
+			vs_params = native.io.ms.outputs
+		}
 	}
 
 	for inp in p.inputs {

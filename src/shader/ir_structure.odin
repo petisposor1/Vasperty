@@ -380,7 +380,7 @@ remap_exit :: proc(ex: Exit, copies: ^map[int]int) -> Exit {
 }
 
 split_irreducible :: proc(blocks: ^[dynamic]Block) -> Shader_Error {
-	for _ in 0 ..< 64 {
+	for _ in 0 ..< 256 {
 		order := reverse_postorder(blocks[:])
 		idx_map := make([]int, len(blocks))
 		for i in 0 ..< len(idx_map) {
@@ -410,7 +410,7 @@ split_irreducible :: proc(blocks: ^[dynamic]Block) -> Shader_Error {
 				}
 			}
 		}
-		if len(blocks) > 4096 {
+		if len(blocks) > 16384 {
 			delete(order)
 			delete(idx_map)
 			return .Unsupported
@@ -1096,8 +1096,30 @@ build_ir_bounded :: proc(
 
 	link_blocks(p.blocks[:])
 	if len(p.blocks[0].preds) > 0 {
-		destroy_program(&p)
-		return Program{}, .Unsupported
+		// Prepend a synthetic empty entry preheader so block 0 has zero predecessors.
+		shift_exit :: proc(ex: Exit) -> Exit {
+			out := ex
+			switch out.kind {
+			case .Jump:
+				out.target += 1
+			case .Branch:
+				out.taken += 1
+				out.not_taken += 1
+			case .End, .Indirect:
+			}
+			return out
+		}
+		pre := Block{
+			insts = make([dynamic]Inst),
+			phis  = make([dynamic]Phi),
+			preds = make([dynamic]int),
+			exit  = Exit{kind = .Jump, target = 1},
+		}
+		for &blk in p.blocks {
+			blk.exit = shift_exit(blk.exit)
+		}
+		inject_at(&p.blocks, 0, pre)
+		link_blocks(p.blocks[:])
 	}
 
 	sp_err := split_irreducible(&p.blocks)

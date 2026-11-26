@@ -2359,6 +2359,14 @@ translate_with_diag :: proc(container: []u8, options: Shader_Options) -> (Host_S
 			break
 		}
 	}
+	if target_idx < 0 {
+		for &pr, i in progs {
+			if pr.stage == .Gs || pr.stage == .Es || pr.stage == .Hs || pr.stage == .Ls {
+				target_idx = i
+				break
+			}
+		}
+	}
 	if target_idx < 0 { return {}, .Unsupported, .No_Target_Stage }
 
 	native := &progs[target_idx]
