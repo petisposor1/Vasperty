@@ -326,6 +326,7 @@ Translate_Tally :: struct {
 	err_malformed:   int,
 	err_isa:         int,
 	err_unsupported: int,
+	fail_stages:     [8]int,
 }
 
 @(private)
@@ -369,6 +370,7 @@ tally_merge :: proc(dst: ^Translate_Tally, src: ^Translate_Tally) {
 	dst.err_malformed += src.err_malformed
 	dst.err_isa += src.err_isa
 	dst.err_unsupported += src.err_unsupported
+	for i in 0 ..< 8 { dst.fail_stages[i] += src.fail_stages[i] }
 }
 
 @(private)
@@ -400,7 +402,7 @@ sgd5_stream_worker_proc :: proc(t: ^thread.Thread) {
 			continue
 		}
 		local.containers += 1
-		hs, terr := vasperty_shader.translate_with(
+		hs, terr, fstage := vasperty_shader.translate_with_diag(
 			unpacked,
 			vasperty_shader.Shader_Options{wave_mode = st.wave_mode},
 		)
@@ -408,6 +410,7 @@ sgd5_stream_worker_proc :: proc(t: ^thread.Thread) {
 		if terr != .None {
 			local.failed += 1
 			tally_record_err(&local, terr)
+			local.fail_stages[int(fstage)] += 1
 			continue
 		}
 		local.translated += 1
@@ -654,6 +657,16 @@ app_translate :: proc(
 		fmt.printf(
 			"  failures: unpack=%d not_dxbc=%d malformed=%d isa=%d unsupported=%d\n",
 			tally.err_unpack, tally.err_not_dxbc, tally.err_malformed, tally.err_isa, tally.err_unsupported,
+		)
+		fmt.printf(
+			"  stages  : dxbc=%d native=%d no_stage=%d range_build=%d track_res=%d raise_io=%d emit_lower=%d\n",
+			tally.fail_stages[int(vasperty_shader.Translate_Fail_Stage.Parse_Dxbc)],
+			tally.fail_stages[int(vasperty_shader.Translate_Fail_Stage.Parse_Native)],
+			tally.fail_stages[int(vasperty_shader.Translate_Fail_Stage.No_Target_Stage)],
+			tally.fail_stages[int(vasperty_shader.Translate_Fail_Stage.Range_Build)],
+			tally.fail_stages[int(vasperty_shader.Translate_Fail_Stage.Track_Resources)],
+			tally.fail_stages[int(vasperty_shader.Translate_Fail_Stage.Raise_Io)],
+			tally.fail_stages[int(vasperty_shader.Translate_Fail_Stage.Emit_Lower)],
 		)
 	}
 	return tally, 0

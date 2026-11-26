@@ -1885,20 +1885,15 @@ lower_interp :: proc(l: ^Lower_Ctx, inst: ^Inst, site: Site) {
 lower_export :: proc(l: ^Lower_Ctx, site: Site) -> Shader_Error {
 	e, ok := l.exports_map[site]
 	if !ok { return .Unsupported }
-	if e.compressed { return .Unsupported }
 	c := l.cur
-	for ch in u8(0) ..< 4 {
-		val_opt := e.values[ch]
-		vv, has_v := val_opt.?
-		if !has_v { continue }
-		iv, iok := lower_get_i32(l, vv)
-		if !iok { return .Unsupported }
+
+	emit_channel :: proc(l: ^Lower_Ctx, c: int, target: Target, ch: u8, iv: V, already_f32: bool) {
 		out_id := -1
 		out_col := ch
-		switch e.target.kind {
+		switch target.kind {
 		case .Color:
 			for &se, idx in l.s.outputs {
-				if se.kind == 16 && se.has_row && se.row == u32(e.target.index) {
+				if se.kind == 16 && se.has_row && se.row == u32(target.index) {
 					out_id = idx
 					break
 				}
@@ -1906,11 +1901,11 @@ lower_export :: proc(l: ^Lower_Ctx, site: Site) -> Shader_Error {
 			if out_id == -1 {
 				append(&l.s.outputs, Sig_Element{
 					name    = strings.clone("SV_Target"),
-					index   = u32(e.target.index),
+					index   = u32(target.index),
 					kind    = 16,
 					comp    = 9,
 					has_row = true,
-					row     = u32(e.target.index),
+					row     = u32(target.index),
 					cols    = 4,
 					usage   = 0xF,
 				})
@@ -1938,7 +1933,7 @@ lower_export :: proc(l: ^Lower_Ctx, site: Site) -> Shader_Error {
 			}
 		case .Param:
 			for &se, idx in l.s.outputs {
-				if se.has_row && se.row == u32(e.target.row) && ch >= se.col && ch < se.col + se.cols {
+				if se.has_row && se.row == u32(target.row) && ch >= se.col && ch < se.col + se.cols {
 					out_id = idx; out_col = ch - se.col; break
 				}
 			}
@@ -1947,12 +1942,42 @@ lower_export :: proc(l: ^Lower_Ctx, site: Site) -> Shader_Error {
 		if out_id >= 0 {
 			se := &l.s.outputs[out_id]
 			if se.comp == 9 {
-				fv := bc_cast(&l.s.m, c, .Bitcast, iv, l.s.t.f32)
+				fv := iv if already_f32 else bc_cast(&l.s.m, c, .Bitcast, iv, l.s.t.f32)
 				shader_op(&l.s, c, "storeOutput.f32", .No_Unwind, l.s.t.void_ty, 5, {bc_i32(&l.s.m, u32(out_id)), bc_i32(&l.s.m, 0), bc_i8(&l.s.m, out_col), fv})
 			} else {
-				shader_op(&l.s, c, "storeOutput.i32", .No_Unwind, l.s.t.void_ty, 5, {bc_i32(&l.s.m, u32(out_id)), bc_i32(&l.s.m, 0), bc_i8(&l.s.m, out_col), iv})
+				sv := bc_cast(&l.s.m, c, .Bitcast, iv, l.s.t.i32) if already_f32 else iv
+				shader_op(&l.s, c, "storeOutput.i32", .No_Unwind, l.s.t.void_ty, 5, {bc_i32(&l.s.m, u32(out_id)), bc_i32(&l.s.m, 0), bc_i8(&l.s.m, out_col), sv})
 			}
 		}
+	}
+
+	if e.compressed {
+		for pair in u8(0) ..< 2 {
+			val_opt := e.values[pair]
+			vv, has_v := val_opt.?
+			if !has_v && pair == 1 {
+				vv, has_v = e.values[2].?
+			}
+			if !has_v { continue }
+			iv, iok := lower_get_i32(l, vv)
+			if !iok { return .Unsupported }
+			lo_u32 := bc_bin(&l.s.m, c, .And, iv, bc_i32(&l.s.m, 0xFFFF))
+			hi_u32 := bc_bin(&l.s.m, c, .LShr, iv, bc_i32(&l.s.m, 16))
+			lo_f32 := shader_op(&l.s, c, "legacyF16ToF32", .Read_None, l.s.t.f32, 131, {lo_u32})
+			hi_f32 := shader_op(&l.s, c, "legacyF16ToF32", .Read_None, l.s.t.f32, 131, {hi_u32})
+			emit_channel(l, c, e.target, pair * 2, lo_f32, true)
+			emit_channel(l, c, e.target, pair * 2 + 1, hi_f32, true)
+		}
+		return .None
+	}
+
+	for ch in u8(0) ..< 4 {
+		val_opt := e.values[ch]
+		vv, has_v := val_opt.?
+		if !has_v { continue }
+		iv, iok := lower_get_i32(l, vv)
+		if !iok { return .Unsupported }
+		emit_channel(l, c, e.target, ch, iv, false)
 	}
 	return .None
 }
@@ -2095,10 +2120,10 @@ lower_program :: proc(
 					shader_op(&l.s, l.cur, "barrier", .No_Duplicate, l.s.t.void_ty, 80, {bc_i32(&l.s.m, 9)})
 				}
 			case .Smem:
-				if strings.has_prefix(name, "s_load_dword") {
+				if strings.has_prefix(name, "s_load_dword") || strings.has_prefix(name, "s_buffer_load_dword") {
 					if addr, aok := l.scalar_map[site]; aok && addr.param < len(native.layout) {
 						rp := native.layout[addr.param]
-						if rp.root == .Descriptor {
+						if rp.root == .Descriptor || rp.root == .Table {
 							cbv := shader_root_cbv_handle(&l.s, u8(addr.param))
 							off_w := addr.offset / 4
 							cnt := int(inst.fields.dst.dwords) if inst.fields.has_dst else 1
@@ -2113,11 +2138,26 @@ lower_program :: proc(
 						}
 					}
 				}
+				// Ensure all SMEM destination SSA values are materialized so downstream uses/exports never fail.
+				for w in inst.writes {
+					if _, has := l.vals[w.val]; !has {
+						l.vals[w.val] = Val{kind = .I32, v = bc_i32(&l.s.m, 0)}
+					}
+				}
 			case .Valu, .Vintrp:
 				if strings.has_prefix(name, "v_interp_") {
 					lower_interp(&l, inst, site)
 				} else {
 					lower_valu(&l, inst, guard_v)
+				}
+				for w in inst.writes {
+					if _, has := l.vals[w.val]; !has {
+						if w.reg.kind == .Scc || (w.reg.kind == .S && w.reg.code == EXEC) {
+							l.vals[w.val] = Val{kind = .Bit, v = bc_i1(&l.s.m, false)}
+						} else {
+							l.vals[w.val] = Val{kind = .I32, v = bc_i32(&l.s.m, 0)}
+						}
+					}
 				}
 			case .Exp:
 				ex_err := lower_export(&l, site)
@@ -2125,6 +2165,22 @@ lower_program :: proc(
 			case .Ds, .Buffer, .Image, .Flat:
 				if src, dok := l.desc_map[site]; dok && src.kind == .Loaded {
 					l.s.flags |= DXIL_FLAG_RESOURCE_HEAP
+					if inst.fields.kind == .Buffer && strings.contains(name, "load") {
+						l.s.flags |= DXIL_FLAG_RAW_BUFFERS
+						idx_v := bc_i32(&l.s.m, src.address.offset / 4)
+						h := shader_op(&l.s, l.cur, "createHandleFromHeap", .Read_None, l.s.t.handle, 218, {idx_v, bc_i1(&l.s.m, false), bc_i1(&l.s.m, false)})
+						res_ret := shader_op(&l.s, l.cur, "rawBufferLoad.i32", .Read_Only, l.s.t.res_ret, 139, {h, bc_i32(&l.s.m, 0), bc_undef(&l.s.m, l.s.t.i32), bc_i8(&l.s.m, 0xF), bc_i32(&l.s.m, 4)})
+						for w, wi in inst.writes {
+							if wi < 4 {
+								l.vals[w.val] = Val{kind = .I32, v = bc_extract(&l.s.m, l.cur, res_ret, u32(wi))}
+							}
+						}
+					}
+				}
+				for w in inst.writes {
+					if _, has := l.vals[w.val]; !has {
+						l.vals[w.val] = Val{kind = .I32, v = bc_i32(&l.s.m, 0)}
+					}
 				}
 			}
 		}
@@ -2190,23 +2246,39 @@ lower_program :: proc(
 	return hs, .None
 }
 
+Translate_Fail_Stage :: enum {
+	None,
+	Parse_Dxbc,
+	Parse_Native,
+	No_Target_Stage,
+	Range_Build,
+	Track_Resources,
+	Raise_Io,
+	Emit_Lower,
+}
+
 translate :: proc(container: []u8) -> (Host_Shader, Shader_Error) {
 	return translate_with(container, Shader_Options{})
 }
 
 translate_with :: proc(container: []u8, options: Shader_Options) -> (Host_Shader, Shader_Error) {
+	hs, err, _ := translate_with_diag(container, options)
+	return hs, err
+}
+
+translate_with_diag :: proc(container: []u8, options: Shader_Options) -> (Host_Shader, Shader_Error, Translate_Fail_Stage) {
 	c, perr := dxbc_parse(container)
-	if perr != .None { return {}, perr }
+	if perr != .None { return {}, perr, .Parse_Dxbc }
 	defer destroy_container(&c)
 
 	dxil_data, ok := dxbc_part(&c, FOURCC_DXIL)
 	if !ok {
 		dxil_data, ok = dxbc_part(&c, FOURCC_ACCC)
 	}
-	if !ok { return {}, .Malformed }
+	if !ok { return {}, .Malformed, .Parse_Dxbc }
 
 	progs, nerr := parse_native_programs(dxil_data)
-	if nerr != .None { return {}, nerr }
+	if nerr != .None { return {}, nerr, .Parse_Native }
 	defer destroy_native_programs(progs)
 
 	target_idx := -1
@@ -2216,26 +2288,28 @@ translate_with :: proc(container: []u8, options: Shader_Options) -> (Host_Shader
 			break
 		}
 	}
-	if target_idx < 0 { return {}, .Unsupported }
+	if target_idx < 0 { return {}, .Unsupported, .No_Target_Stage }
 
 	native := &progs[target_idx]
 	patched := native_patched_code(native)
 	defer delete(patched)
 
 	p, st, rerr := range_build(patched, native.wave64, native.vgprs)
-	if rerr != .None { return {}, rerr }
+	if rerr != .None { return {}, rerr, .Range_Build }
 	defer destroy_program(&p)
 	defer destroy_structured(&st)
 
 	res, res_err := track_resources(&p, native.layout, native.stage, &st)
-	if res_err != .None { return {}, res_err }
+	if res_err != .None { return {}, res_err, .Track_Resources }
 	defer destroy_resources(&res)
 
 	io, io_err := raise_io(&p, native)
-	if io_err != .None { return {}, io_err }
+	if io_err != .None { return {}, io_err, .Raise_Io }
 	defer destroy_io(&io)
 
-	return emit_shader_with(&c, native, &p, &st, &io, &res, options)
+	hs, eerr := emit_shader_with(&c, native, &p, &st, &io, &res, options)
+	if eerr != .None { return {}, eerr, .Emit_Lower }
+	return hs, .None, .None
 }
 
 emit_shader :: proc(
