@@ -8,8 +8,6 @@ import "core:path/filepath"
 import "core:strings"
 import "core:sync"
 import win32 "core:sys/windows"
-import "core:thread"
-import "core:time"
 import vasperty_formats "vasperty:formats"
 
 // xg, audio (acphal), dsp (chad), apu (xapu), gameinput, media (mfplat), d3d12x, fidelityfx.
@@ -916,93 +914,7 @@ APU_EXPORTS := [?]Hle_Export {
 	{name = "XApuGetResultCount", address = uintptr(rawptr(XApuGetResultCount))},
 }
 
-// =============================================================================
-// 5. gameinput (#1 GameInputCreate + XInput + keyboard fallback)
-// =============================================================================
-
-GAMEINPUT_READING_NOT_FOUND :: HRESULT(-2088108029) // 0x838A0003
-
-GameInput_Object :: struct {
-	vtable: rawptr,
-	refs:   u32,
-}
-@(private) gi_poll_stop: bool = false
-@(private) gi_thread: ^thread.Thread = nil
-@(private) gi_mu: sync.Mutex
-
-fini_gameinput :: proc() {
-	sync.mutex_lock(&gi_mu)
-	gi_poll_stop = true
-	th := gi_thread
-	gi_thread = nil
-	sync.mutex_unlock(&gi_mu)
-	if th != nil {
-		thread.join(th)
-		thread.destroy(th)
-	}
-	gi_poll_stop = false
-}
-
-@(private) gi_add_ref :: proc "system" (t: ^GameInput_Object) -> u32 { context = hle_context(); return intrinsics.atomic_add(&t.refs, 1) + 1 }
-@(private) gi_release :: proc "system" (t: ^GameInput_Object) -> u32 {
-	context = hle_context()
-	left := intrinsics.atomic_sub(&t.refs, 1) - 1
-	if left == 0 { free(t) }
-	return left
-}
-@(private) gi_get_cur_ts :: proc "system" (_: ^GameInput_Object) -> u64 {
-	context = hle_context()
-	return u64(time.tick_now()._nsec / 1000)
-}
-@(private) gi_get_cur_reading :: proc "system" (_: ^GameInput_Object, _: u32, _: rawptr, _: ^rawptr) -> HRESULT {
-	context = hle_context()
-	return GAMEINPUT_READING_NOT_FOUND
-}
-@(private) gi_next_reading :: proc "system" (_: ^GameInput_Object, _: rawptr, _: u32, _: rawptr, _: ^rawptr) -> HRESULT {
-	context = hle_context()
-	return GAMEINPUT_READING_NOT_FOUND
-}
-@(private) gi_prev_reading :: proc "system" (_: ^GameInput_Object, _: rawptr, _: u32, _: rawptr, _: ^rawptr) -> HRESULT {
-	context = hle_context()
-	return GAMEINPUT_READING_NOT_FOUND
-}
-@(private) gi_reg_reading_cb :: proc "system" (_: ^GameInput_Object, _: rawptr, _: u32, _: u64, _: u32, _: rawptr, _: rawptr, tok: ^u64) -> HRESULT {
-	context = hle_context()
-	if uintptr(tok) > 0x10000 { tok^ = next_token() }
-	return S_OK
-}
-@(private) gi_reg_dev_cb :: proc "system" (_: ^GameInput_Object, _: rawptr, _: u32, _: u32, _: u32, _: rawptr, _: rawptr, tok: ^u64) -> HRESULT {
-	context = hle_context()
-	if uintptr(tok) > 0x10000 { tok^ = next_token() }
-	return S_OK
-}
-@(private) gi_reg_other_cb :: proc "system" (_: ^GameInput_Object, _: rawptr, _: rawptr, _: rawptr, tok: ^u64) -> HRESULT {
-	context = hle_context()
-	if uintptr(tok) > 0x10000 { tok^ = next_token() }
-	return S_OK
-}
-@(private) gi_unreg_cb :: proc "system" (_: ^GameInput_Object, _: u64, _: u64) -> bool { context = hle_context(); return true }
-
-@(private) gi_stop_cb :: proc "system" (_: ^GameInput_Object, _: u64) { context = hle_context() }
-
-GAMEINPUT_VTABLE := [18]rawptr{
-	rawptr(rt_missing), rawptr(gi_add_ref), rawptr(gi_release),
-	rawptr(gi_get_cur_ts), rawptr(gi_get_cur_reading), rawptr(gi_next_reading), rawptr(gi_prev_reading),
-	rawptr(rt_missing), rawptr(gi_reg_reading_cb), rawptr(gi_reg_dev_cb), rawptr(gi_reg_other_cb),
-	rawptr(gi_reg_other_cb), rawptr(gi_stop_cb), rawptr(gi_unreg_cb), rawptr(rt_missing), rawptr(rt_missing), rawptr(rt_missing), rawptr(rt_missing),
-}
-
-GameInputCreate :: proc "system" (out: ^^GameInput_Object) -> HRESULT {
-	context = hle_context()
-	if out == nil { return E_INVALIDARG }
-	obj := new(GameInput_Object)
-	obj^ = GameInput_Object{vtable = raw_data(GAMEINPUT_VTABLE[:]), refs = 1}
-	out^ = obj
-	return S_OK
-}
-
-GAMEINPUT_DLLS := [?]string{"gameinput.dll"}
-GAMEINPUT_EXPORTS := [?]Hle_Export{{name = "#1", address = uintptr(rawptr(GameInputCreate))}}
+// GameInput is implemented in gameinput.odin.
 
 // =============================================================================
 // 6. media (mfplat MFCreateSourceResolver local-file filter)

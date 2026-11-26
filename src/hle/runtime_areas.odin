@@ -174,9 +174,9 @@ XUSER_LOCAL_ID :: u64(1)
 	context = hle_context()
 	return true
 }
-@(private) xuser_find_device :: proc "system" (_: ^Runtime_Object, _: rawptr, _: ^rawptr) -> HRESULT {
+@(private) xuser_find_device :: proc "system" (_: ^Runtime_Object, _: rawptr, out: ^rawptr) -> HRESULT {
 	context = hle_context()
-	return XUSER_NOT_FOUND
+	return put_ptr(out, xuser_handle())
 }
 
 XUSER_VTABLE := [35]rawptr {
@@ -1272,8 +1272,10 @@ Save_Blob_Callback :: #type proc "system" (info: ^Save_Blob_Info, ctx: rawptr) -
 	_ = total_needed
 	return S_OK
 }
-@(private) xgs_read_blobs :: proc "system" (_: ^Runtime_Object, c: ^Save_Container, names: [^]cstring, count: ^u32, out_blobs: [^]Save_Blob_Data) -> HRESULT {
+@(private) xgs_read_blobs :: proc "system" (_: ^Runtime_Object, c: ^Save_Container, names: [^]cstring, count: ^u32, blobs_size: uint, out_blobs: [^]Save_Blob_Data) -> HRESULT {
 	context = hle_context()
+	if uintptr(out_blobs) < 0x10000 { return E_INVALIDARG }
+	_ = blobs_size
 	return xgs_read_blobs_sync(c, names, count, out_blobs)
 }
 @(private) xgs_read_async :: proc "system" (_: ^Runtime_Object, c: ^Save_Container, names: [^]cstring, count: u32, b: ^Async_Block) -> HRESULT {

@@ -509,7 +509,7 @@ ensure_readback_buffer :: proc(wp: ^Window_Presenter, w, h: u32) -> bool {
 
 @(private)
 should_capture_screenshot :: proc(frame_num: u64) -> (path: string, allocated: bool, ok: bool) {
-	if frame_num != 1 && frame_num != 10 && frame_num != 60 && frame_num != 150 && frame_num != 300 && frame_num != 600 && frame_num != 1000 && frame_num != 1500 {
+	if frame_num != 1500 && frame_num != 1800 && frame_num != 3200 && frame_num != 3600 && frame_num != 4000 && frame_num != 4500 && frame_num != 5000 && frame_num != 5500 && frame_num != 6000 && frame_num != 7000 {
 		return "", false, false
 	}
 	raw_path, found := os.lookup_env("VASPERTY_SCREENSHOT_PATH", context.allocator)

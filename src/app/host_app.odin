@@ -780,7 +780,12 @@ VEH_CONTEXT_X64 :: struct {
 	R14:    u64, // 0xE8
 	R15:    u64, // 0xF0
 	Rip:    u64, // 0xF8
+	_pad1:  [0xA0]u8,
+	Xmm:    [16][2]u64, // 0x1A0
 }
+
+#assert(offset_of(VEH_CONTEXT_X64, Rip) == 0xF8)
+#assert(offset_of(VEH_CONTEXT_X64, Xmm) == 0x1A0)
 
 @(private)
 VEH_EXCEPTION_POINTERS :: struct {
@@ -803,6 +808,34 @@ boot_veh_handler :: proc "system" (info: ^VEH_EXCEPTION_POINTERS) -> i32 {
 		return 0
 	}
 	code := info.ExceptionRecord.ExceptionCode
+	// Demand-commit uncommitted MEM_RESERVE title memory pages (>= 4 GiB) on access fault.
+	if code == 0xC0000005 && info.ContextRecord != nil {
+		fault_va := info.ExceptionRecord.ExceptionInformation[1]
+		if fault_va >= 0x1_0000_0000 {
+			mbi: win32.MEMORY_BASIC_INFORMATION
+			if win32.VirtualQuery(rawptr(fault_va), &mbi, size_of(mbi)) != 0 &&
+			   mbi.State == win32.MEM_RESERVE && mbi.Type == 0x20000 && uintptr(mbi.AllocationBase) >= 0x1_0000_0000 {
+				page_base := fault_va & ~uintptr(0xFFFF)
+				if win32.VirtualAlloc(rawptr(page_base), 0x10000, win32.MEM_COMMIT, win32.PAGE_READWRITE) != nil {
+					return -1 // EXCEPTION_CONTINUE_EXECUTION
+				}
+				// Placeholder fallback: split and replace 64 KiB placeholder with committed RW memory.
+				_ = win32.VirtualFree(rawptr(page_base), 0x10000, win32.MEM_RELEASE | 0x2)
+				if vasperty_hle.XMemVirtualAlloc(rawptr(page_base), 0x10000, win32.MEM_COMMIT, 0, win32.PAGE_READWRITE) != nil {
+					return -1 // EXCEPTION_CONTINUE_EXECUTION
+				}
+			}
+		}
+	}
+	// Continue past soft __debugbreak() (0xCC) assertions in console builds.
+	if code == 0x80000003 && info.ContextRecord != nil {
+		ctx := info.ContextRecord
+		ip := cast([^]u8)uintptr(ctx.Rip)
+		if ip != nil && ip[0] == 0xCC {
+			ctx.Rip += 1
+			return -1 // EXCEPTION_CONTINUE_EXECUTION
+		}
+	}
 	// Emulate AMD Zen 2 `clzero` (0F 01 FC), `monitorx` (0F 01 FA), `mwaitx` (0F 01 FB) on Intel CPUs.
 	if code == 0xC000001D && info.ContextRecord != nil {
 		ctx := info.ContextRecord
@@ -837,6 +870,62 @@ boot_veh_handler :: proc "system" (info: ^VEH_EXCEPTION_POINTERS) -> i32 {
 				}
 				ctx.Rip += 3
 				return -1 // EXCEPTION_CONTINUE_EXECUTION
+			}
+		}
+		// Emulate AMD SSE4a `insertq` (F2 [REX] 0F 78/79) and `extrq` (66 [REX] 0F 78/79).
+		if ip != nil && (ip[0] == 0xF2 || ip[0] == 0x66) {
+			pfx := ip[0]
+			off := u64(1)
+			rex := u8(0)
+			if (ip[off] & 0xF0) == 0x40 {
+				rex = ip[off]
+				off += 1
+			}
+			if ip[off] == 0x0F && (ip[off + 1] == 0x78 || ip[off + 1] == 0x79) {
+				op := ip[off + 1]
+				modrm := ip[off + 2]
+				reg := ((modrm >> 3) & 7) | ((rex & 4) << 1)
+				rm := (modrm & 7) | ((rex & 1) << 3)
+				if pfx == 0xF2 { // insertq
+					length: u32
+					index: u32
+					inst_len: u64
+					if op == 0x78 {
+						length = u32(ip[off + 3] & 0x3F)
+						index = u32(ip[off + 4] & 0x3F)
+						inst_len = off + 5
+					} else {
+						length = u32(ctx.Xmm[rm][1] & 0x3F)
+						index = u32((ctx.Xmm[rm][1] >> 8) & 0x3F)
+						inst_len = off + 3
+					}
+					mask := ~u64(0) if (length == 0 || length >= 64) else ((u64(1) << length) - 1)
+					if index < 64 {
+						ctx.Xmm[reg][0] = (ctx.Xmm[reg][0] & ~(mask << index)) | ((ctx.Xmm[rm][0] & mask) << index)
+					}
+					ctx.Rip += inst_len
+					return -1 // EXCEPTION_CONTINUE_EXECUTION
+				} else { // 0x66 extrq
+					dst: u8
+					length: u32
+					index: u32
+					inst_len: u64
+					if op == 0x78 {
+						dst = rm
+						length = u32(ip[off + 3] & 0x3F)
+						index = u32(ip[off + 4] & 0x3F)
+						inst_len = off + 5
+					} else {
+						dst = reg
+						length = u32(ctx.Xmm[rm][0] & 0x3F)
+						index = u32((ctx.Xmm[rm][0] >> 8) & 0x3F)
+						inst_len = off + 3
+					}
+					mask := ~u64(0) if (length == 0 || length >= 64) else ((u64(1) << length) - 1)
+					ctx.Xmm[dst][0] = ((ctx.Xmm[dst][0] >> index) & mask) if index < 64 else 0
+					ctx.Rip += inst_len
+					return -1 // EXCEPTION_CONTINUE_EXECUTION
+				}
 			}
 		}
 	}
@@ -874,6 +963,13 @@ boot_veh_handler :: proc "system" (info: ^VEH_EXCEPTION_POINTERS) -> i32 {
 			g_boot_stage, code, addr, mod_name, mod_off, op_str, fault_va)
 	}
 	if info.ContextRecord != nil {
+		if code == 0xC0000005 && fault_va >= 0x10000 {
+			mbi: win32.MEMORY_BASIC_INFORMATION
+			if win32.VirtualQuery(rawptr(fault_va), &mbi, size_of(mbi)) != 0 {
+				fmt.eprintf("  [mbi] base=0x%X alloc=0x%X sz=0x%X state=0x%X prot=0x%X type=0x%X\n",
+					uintptr(mbi.BaseAddress), uintptr(mbi.AllocationBase), mbi.RegionSize, mbi.State, mbi.Protect, mbi.Type)
+			}
+		}
 		ctx := info.ContextRecord
 		fmt.eprintf("  RAX=0x%X RCX=0x%X RDX=0x%X R8=0x%X R9=0x%X RSP=0x%X\n",
 			ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9, ctx.Rsp)

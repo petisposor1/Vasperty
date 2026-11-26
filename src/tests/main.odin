@@ -1017,7 +1017,7 @@ test_hle_phase4 :: proc() {
 	GS_Upd :: #type proc "system" (rawptr, ^vasperty_hle.Save_Container, cstring, ^^vasperty_hle.Save_Update) -> vasperty_hle.HRESULT
 	GS_Wb :: #type proc "system" (rawptr, ^vasperty_hle.Save_Update, cstring, [^]u8, uint) -> vasperty_hle.HRESULT
 	GS_Sub :: #type proc "system" (rawptr, ^vasperty_hle.Save_Update, ^vasperty_hle.Async_Block) -> vasperty_hle.HRESULT
-	GS_Rd :: #type proc "system" (rawptr, ^vasperty_hle.Save_Container, [^]cstring, ^u32, [^]vasperty_hle.Save_Blob_Data) -> vasperty_hle.HRESULT
+	GS_Rd :: #type proc "system" (rawptr, ^vasperty_hle.Save_Container, [^]cstring, ^u32, uint, [^]vasperty_hle.Save_Blob_Data) -> vasperty_hle.HRESULT
 	GS_CloseP :: #type proc "system" (rawptr, ^vasperty_hle.Save_Provider)
 	GS_CloseC :: #type proc "system" (rawptr, ^vasperty_hle.Save_Container)
 	GS_CloseU :: #type proc "system" (rawptr, ^vasperty_hle.Save_Update)
@@ -1040,7 +1040,7 @@ test_hle_phase4 :: proc() {
 	req_cnt: u32 = 1
 	rd_buf: [256]u8
 	out_blobs := cast([^]vasperty_hle.Save_Blob_Data)raw_data(rd_buf[:])
-	assert(hle_vslot(gsobj, 0xa0, GS_Rd)(gsobj, scont, raw_data(req_name[:]), &req_cnt, out_blobs) == vasperty_hle.S_OK)
+	assert(hle_vslot(gsobj, 0xa0, GS_Rd)(gsobj, scont, raw_data(req_name[:]), &req_cnt, size_of(rd_buf), out_blobs) == vasperty_hle.S_OK)
 	assert(out_blobs[0].info.size == 5 && out_blobs[0].data[4] == 5)
 	hle_vslot(gsobj, 0xc0, GS_CloseU)(gsobj, supd)
 	hle_vslot(gsobj, 0x88, GS_CloseC)(gsobj, scont)

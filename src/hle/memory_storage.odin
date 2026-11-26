@@ -29,6 +29,7 @@ XMEM_ADDRESS_32BIT :: u64(4)
 XMEM_MEM_WRITE_WATCH :: u32(0x00200000)
 XMEM_MEM_RESERVE_PLACEHOLDER :: u32(0x00040000)
 XMEM_MEM_REPLACE_PLACEHOLDER :: u32(0x00004000)
+XMEM_MEM_COALESCE_PLACEHOLDERS :: u32(0x00000001)
 XMEM_MEM_PRESERVE_PLACEHOLDER :: u32(0x00000002)
 
 MEM_ADDRESS_REQUIREMENTS :: struct {
@@ -150,11 +151,24 @@ XMemVirtualAlloc :: proc "system" (base: rawptr, size: uint, kind: u32, flags: u
 	}
 
 	if valloc2, ok := kb_fn("VirtualAlloc2", proc "system" (win32.HANDLE, rawptr, uint, u32, u32, ^MEM_EXTENDED_PARAMETER, u32) -> rawptr); ok {
-	context = hle_context()
 		param := MEM_EXTENDED_PARAMETER{type_reserved = 1, pointer = &req}
 		pptr: ^MEM_EXTENDED_PARAMETER = &param if constrained else nil
 		pcnt: u32 = 1 if constrained else 0
-		return valloc2(win32.GetCurrentProcess(), base, size, k, prot, pptr, pcnt)
+		res := valloc2(win32.GetCurrentProcess(), base, size, k, prot, pptr, pcnt)
+		if res != nil {
+			return res
+		}
+		// If committing inside a placeholder reservation, split/coalesce and replace the placeholder.
+		if base != nil && (k & win32.MEM_COMMIT) != 0 {
+			_ = win32.VirtualFree(base, size, win32.MEM_RELEASE | XMEM_MEM_COALESCE_PLACEHOLDERS)
+			_ = win32.VirtualFree(base, size, win32.MEM_RELEASE | XMEM_MEM_PRESERVE_PLACEHOLDER)
+			rep_k := (k & ~XMEM_MEM_RESERVE_PLACEHOLDER) | win32.MEM_RESERVE | win32.MEM_COMMIT | XMEM_MEM_REPLACE_PLACEHOLDER
+			res = valloc2(win32.GetCurrentProcess(), base, size, rep_k, prot, nil, 0)
+			if res != nil {
+				return res
+			}
+		}
+		return nil
 	}
 	return win32.VirtualAlloc(base, size, k & ~XMEM_MEM_RESERVE_PLACEHOLDER, prot)
 }
@@ -322,6 +336,61 @@ xmem_find_section_locked :: proc(pg: uint) -> (sec: ^Physical_Section, idx: uint
 	return nil, 0
 }
 
+@(private)
+xmem_unmap_overlapping_locked :: proc(
+	range_start: uintptr,
+	range_end: uintptr,
+	umv2: proc "system" (win32.HANDLE, rawptr, u32) -> win32.BOOL,
+	has_umv: bool,
+	mv3: proc "system" (win32.HANDLE, win32.HANDLE, rawptr, u64, uint, u32, u32, rawptr, u32) -> rawptr,
+	has_mv3: bool,
+) -> bool {
+	unmapped := false
+	Removed :: struct {
+		addr: uintptr,
+		view: Physical_View,
+	}
+	to_remove := make([dynamic]Removed, 0, 8, context.temp_allocator)
+	for v_addr, v in xmem_state.views {
+		v_end := v_addr + uintptr(v.size)
+		if v_addr < range_end && v_end > range_start {
+			append(&to_remove, Removed{addr = v_addr, view = v})
+		}
+	}
+	for rem in to_remove {
+		if has_umv {
+			_ = umv2(win32.GetCurrentProcess(), rawptr(rem.addr), XMEM_MEM_PRESERVE_PLACEHOLDER)
+		}
+		delete_key(&xmem_state.views, rem.addr)
+		unmapped = true
+		// Re-map any non-overlapping prefix [rem.addr, range_start) and suffix [range_end, rem_end)
+		if has_mv3 && rem.view.slice.section != nil {
+			rem_end := rem.addr + uintptr(rem.view.size)
+			if rem.addr < range_start {
+				pre_bytes := uint(range_start - rem.addr)
+				_ = win32.VirtualFree(rawptr(rem.addr), pre_bytes, win32.MEM_RELEASE | XMEM_MEM_PRESERVE_PLACEHOLDER)
+				pv := mv3(rem.view.slice.section.handle, win32.GetCurrentProcess(), rawptr(rem.addr), u64(rem.view.slice.index * XMEM_PAGE), pre_bytes, XMEM_MEM_REPLACE_PLACEHOLDER, win32.PAGE_READWRITE, nil, 0)
+				if pv == rawptr(rem.addr) {
+					_ = win32.VirtualAlloc(rawptr(rem.addr), pre_bytes, win32.MEM_COMMIT, win32.PAGE_READWRITE)
+					xmem_state.views[rem.addr] = Physical_View{size = pre_bytes, slice = rem.view.slice}
+				}
+			}
+			if rem_end > range_end {
+				suf_bytes := uint(rem_end - range_end)
+				suf_off_pages := uint(range_end - rem.addr) / XMEM_PAGE
+				suf_idx := rem.view.slice.index + suf_off_pages
+				_ = win32.VirtualFree(rawptr(range_end), suf_bytes, win32.MEM_RELEASE | XMEM_MEM_PRESERVE_PLACEHOLDER)
+				pv := mv3(rem.view.slice.section.handle, win32.GetCurrentProcess(), rawptr(range_end), u64(suf_idx * XMEM_PAGE), suf_bytes, XMEM_MEM_REPLACE_PLACEHOLDER, win32.PAGE_READWRITE, nil, 0)
+				if pv == rawptr(range_end) {
+					_ = win32.VirtualAlloc(rawptr(range_end), suf_bytes, win32.MEM_COMMIT, win32.PAGE_READWRITE)
+					xmem_state.views[range_end] = Physical_View{size = suf_bytes, slice = {section = rem.view.slice.section, index = suf_idx}}
+				}
+			}
+		}
+	}
+	return unmapped
+}
+
 XMemMapPhysicalPages :: proc "system" (base: rawptr, page_count: uint, pages: [^]uint) -> rawptr {
 	context = hle_context()
 	if base == nil { return nil }
@@ -329,22 +398,18 @@ XMemMapPhysicalPages :: proc "system" (base: rawptr, page_count: uint, pages: [^
 	sync.mutex_lock(&xmem_state.mu)
 	defer sync.mutex_unlock(&xmem_state.mu)
 	umv2, has_umv := kb_fn("UnmapViewOfFile2", proc "system" (win32.HANDLE, rawptr, u32) -> win32.BOOL)
+	mv3, has_mv3 := kb_fn("MapViewOfFile3", proc "system" (win32.HANDLE, win32.HANDLE, rawptr, u64, uint, u32, u32, rawptr, u32) -> rawptr)
+	total_bytes := page_count * XMEM_PAGE
+	range_start := uintptr(base)
+	range_end := range_start + uintptr(total_bytes)
+
 	// pages == nil means unmap the range back to placeholders
 	if pages == nil {
-		for off := uint(0); off < page_count * XMEM_PAGE; off += XMEM_PAGE {
-			addr := uintptr(base) + uintptr(off)
-			if prev, ok := xmem_state.views[addr]; ok {
-				if has_umv {
-					_ = umv2(win32.GetCurrentProcess(), rawptr(addr), XMEM_MEM_PRESERVE_PLACEHOLDER)
-				}
-				delete_key(&xmem_state.views, addr)
-				_ = prev
-			}
-		}
+		_ = xmem_unmap_overlapping_locked(range_start, range_end, umv2, has_umv, mv3, has_mv3)
+		_ = win32.VirtualFree(base, total_bytes, win32.MEM_RELEASE | XMEM_MEM_COALESCE_PLACEHOLDERS)
 		return base
 	}
-	mv3, ok := kb_fn("MapViewOfFile3", proc "system" (win32.HANDLE, win32.HANDLE, rawptr, u64, uint, u32, u32, rawptr, u32) -> rawptr)
-	if !ok { return nil }
+	if !has_mv3 { return nil }
 
 	// Map contiguous runs of physical pages so non-contiguous page lists map accurately.
 	i := uint(0)
@@ -359,31 +424,36 @@ XMemMapPhysicalPages :: proc "system" (base: rawptr, page_count: uint, pages: [^
 				break
 			}
 		}
-		run_addr := uintptr(base) + uintptr(i * XMEM_PAGE)
+		run_addr := range_start + uintptr(i * XMEM_PAGE)
 		run_bytes := run * XMEM_PAGE
-		// Unmap any previous view overlapping this run, else split surrounding placeholder
-		unmapped := false
-		for r := uint(0); r < run; r += 1 {
-			a := run_addr + uintptr(r * XMEM_PAGE)
-			if _, had := xmem_state.views[a]; had {
-				if has_umv {
-					_ = umv2(win32.GetCurrentProcess(), rawptr(a), XMEM_MEM_PRESERVE_PLACEHOLDER)
+		// Unmap any overlapping previous views (preserving non-overlapping prefix/suffix), then coalesce & split placeholders.
+		_ = xmem_unmap_overlapping_locked(run_addr, run_addr + uintptr(run_bytes), umv2, has_umv, mv3, has_mv3)
+		_ = win32.VirtualFree(rawptr(run_addr), run_bytes, win32.MEM_RELEASE | XMEM_MEM_COALESCE_PLACEHOLDERS)
+		_ = win32.VirtualFree(rawptr(run_addr), run_bytes, win32.MEM_RELEASE | XMEM_MEM_PRESERVE_PLACEHOLDER)
+		view := mv3(sec.handle, win32.GetCurrentProcess(), rawptr(run_addr), u64(start_idx * XMEM_PAGE), run_bytes, XMEM_MEM_REPLACE_PLACEHOLDER, win32.PAGE_READWRITE, nil, 0)
+		if view == rawptr(run_addr) {
+			_ = win32.VirtualAlloc(rawptr(run_addr), run_bytes, win32.MEM_COMMIT, win32.PAGE_READWRITE)
+			xmem_state.views[run_addr] = Physical_View{size = run_bytes, slice = {section = sec, index = start_idx}}
+		} else {
+			// Fallback: map page-by-page (handles fragmented placeholders or non-placeholder reserved ranges).
+			for p_idx in uint(0) ..< run {
+				pa := run_addr + uintptr(p_idx * XMEM_PAGE)
+				_ = win32.VirtualFree(rawptr(pa), XMEM_PAGE, win32.MEM_RELEASE | XMEM_MEM_PRESERVE_PLACEHOLDER)
+				pv := mv3(sec.handle, win32.GetCurrentProcess(), rawptr(pa), u64((start_idx + p_idx) * XMEM_PAGE), XMEM_PAGE, XMEM_MEM_REPLACE_PLACEHOLDER, win32.PAGE_READWRITE, nil, 0)
+				if pv == rawptr(pa) {
+					_ = win32.VirtualAlloc(rawptr(pa), XMEM_PAGE, win32.MEM_COMMIT, win32.PAGE_READWRITE)
+					xmem_state.views[pa] = Physical_View{size = XMEM_PAGE, slice = {section = sec, index = start_idx + p_idx}}
+				} else {
+					if win32.VirtualAlloc(rawptr(pa), XMEM_PAGE, win32.MEM_COMMIT, win32.PAGE_READWRITE) == nil {
+						return nil
+					}
 				}
-				delete_key(&xmem_state.views, a)
-				unmapped = true
 			}
 		}
-		if !unmapped {
-			_ = win32.VirtualFree(rawptr(run_addr), run_bytes, win32.MEM_RELEASE | XMEM_MEM_PRESERVE_PLACEHOLDER)
-		}
-		view := mv3(sec.handle, win32.GetCurrentProcess(), rawptr(run_addr), u64(start_idx * XMEM_PAGE), run_bytes, XMEM_MEM_REPLACE_PLACEHOLDER, win32.PAGE_READWRITE, nil, 0)
-		if view != rawptr(run_addr) { return nil }
-		_ = win32.VirtualAlloc(rawptr(run_addr), run_bytes, win32.MEM_COMMIT, win32.PAGE_READWRITE)
-		xmem_state.views[run_addr] = Physical_View{size = run_bytes, slice = {section = sec, index = start_idx}}
 		i += run
 	}
 	hooks := get_gpu_hooks()
-	if hooks.title_memory_remapped != nil { hooks.title_memory_remapped(uintptr(base), page_count * XMEM_PAGE) }
+	if hooks.title_memory_remapped != nil { hooks.title_memory_remapped(uintptr(base), total_bytes) }
 	return base
 }
 

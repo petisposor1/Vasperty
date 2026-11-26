@@ -11,6 +11,7 @@ import win32 "core:sys/windows"
 USER_DATA_SPACE :: u32(0)
 SAMPLER_SPACE :: u32(0)
 ROOT_CBV_SPACE :: u32(1)
+TEX_SRV_SPACE :: u32(3)
 VIEW_STRIDES :: u8(255)
 VIEW_STRIDE_BITS :: u32((1 << 30) - 1)
 VIEW_INTEGER :: u32(1) << 31
@@ -298,8 +299,9 @@ Dxil_Types :: struct {
 	handle:   Ty,
 	props:    Ty,
 	bind:     Ty,
-	cbuf_ret: Ty,
-	res_ret:  Ty,
+	cbuf_ret:    Ty,
+	res_ret:     Ty,
+	res_ret_f32: Ty,
 }
 
 Dxil_Shader :: struct {
@@ -330,6 +332,14 @@ Dxil_Shader :: struct {
 	root_uavs:      [dynamic]struct {
 		slot: u8,
 		h:    V,
+	},
+	tex_srvs:       [dynamic]struct {
+		slot: u8,
+		h:    V,
+	},
+	sampler_handles: [dynamic]struct {
+		idx: u32,
+		h:   V,
 	},
 	memory:         Maybe(V),
 	memory_dirty:   Maybe(V),
@@ -371,6 +381,14 @@ shader_create :: proc(pixel: bool) -> Dxil_Shader {
 		slot: u8,
 		h:    V,
 	})
+	s.tex_srvs = make([dynamic]struct {
+		slot: u8,
+		h:    V,
+	})
+	s.sampler_handles = make([dynamic]struct {
+		idx: u32,
+		h:   V,
+	})
 
 	s.t.void_ty = bc_void(&s.m)
 	s.t.i1 = bc_int_ty(&s.m, 1)
@@ -383,6 +401,7 @@ shader_create :: proc(pixel: bool) -> Dxil_Shader {
 	s.t.bind = bc_named_struct(&s.m, "dx.types.ResBind", {s.t.i32, s.t.i32, s.t.i32, s.t.i8})
 	s.t.cbuf_ret = bc_named_struct(&s.m, "dx.types.CBufRet.i32", {s.t.i32, s.t.i32, s.t.i32, s.t.i32})
 	s.t.res_ret = bc_named_struct(&s.m, "dx.types.ResRet.i32", {s.t.i32, s.t.i32, s.t.i32, s.t.i32, s.t.i32})
+	s.t.res_ret_f32 = bc_named_struct(&s.m, "dx.types.ResRet.f32", {s.t.f32, s.t.f32, s.t.f32, s.t.f32, s.t.i32})
 
 	fty := bc_func_ty(&s.m, s.t.void_ty, {})
 	s.main_fn = bc_function(&s.m, "main", fty, .None, true)
@@ -398,6 +417,8 @@ shader_destroy :: proc(s: ^Dxil_Shader) {
 	delete(s.root_cbvs)
 	delete(s.root_srvs)
 	delete(s.root_uavs)
+	delete(s.tex_srvs)
+	delete(s.sampler_handles)
 }
 
 shader_op :: proc(s: ^Dxil_Shader, blk: int, name: string, attr: Attr_Kind, ret: Ty, opcode: u32, args: []V) -> V {
@@ -485,6 +506,44 @@ shader_root_uav_handle :: proc(s: ^Dxil_Shader, slot: u8) -> V {
 		slot: u8,
 		h:    V,
 	}{slot = slot, h = ah})
+	return ah
+}
+
+shader_tex_srv_handle :: proc(s: ^Dxil_Shader, slot: u8) -> V {
+	for r in s.tex_srvs {
+		if r.slot == slot {
+			return r.h
+		}
+	}
+	rv := bc_i32(&s.m, u32(slot))
+	bind := bc_aggregate(&s.m, s.t.bind, {rv, rv, bc_i32(&s.m, TEX_SRV_SPACE), bc_i8(&s.m, 0)})
+	h := shader_op(s, s.entry, "createHandleFromBinding", .Read_None, s.t.handle, 217, {bind, rv, bc_i1(&s.m, false)})
+	// ResourceProperties: kind = 2 (Texture2D), extra = 0x00000409 (4 components, f32 = 9)
+	ah := shader_annotate(s, s.entry, h, 2, 0x00000409)
+	append(&s.tex_srvs, struct {
+		slot: u8,
+		h:    V,
+	}{slot = slot, h = ah})
+	return ah
+}
+
+shader_sampler_handle :: proc(s: ^Dxil_Shader, idx: u32) -> V {
+	for r in s.sampler_handles {
+		if r.idx == idx {
+			return r.h
+		}
+	}
+	if idx + 1 > s.samplers {
+		s.samplers = idx + 1
+	}
+	iv := bc_i32(&s.m, idx)
+	bind := bc_aggregate(&s.m, s.t.bind, {iv, iv, bc_i32(&s.m, SAMPLER_SPACE), bc_i8(&s.m, 3)})
+	h := shader_op(s, s.entry, "createHandleFromBinding", .Read_None, s.t.handle, 217, {bind, iv, bc_i1(&s.m, false)})
+	ah := shader_annotate(s, s.entry, h, 14, 0)
+	append(&s.sampler_handles, struct {
+		idx: u32,
+		h:   V,
+	}{idx = idx, h = ah})
 	return ah
 }
 
@@ -579,7 +638,7 @@ shader_finish :: proc(s: ^Dxil_Shader) -> [dynamic]u8 {
 	}
 
 	resources_op := Md_Op{}
-	if s.user_data > 0 || s.samplers > 0 || len(s.root_cbvs) > 0 || len(s.root_srvs) > 0 || len(s.root_uavs) > 0 {
+	if s.user_data > 0 || s.samplers > 0 || len(s.root_cbvs) > 0 || len(s.root_srvs) > 0 || len(s.root_uavs) > 0 || len(s.tex_srvs) > 0 {
 		empty := Md_Op{present = true, id = bc_md_str(&s.m, "")}
 		cbv_list := make([dynamic]Md_Op, context.temp_allocator)
 		if s.user_data > 0 {
@@ -625,24 +684,49 @@ shader_finish :: proc(s: ^Dxil_Shader) -> [dynamic]u8 {
 		}
 
 		srvs_op := Md_Op{}
-		if len(s.root_srvs) > 0 {
-			ty := bc_named_struct(&s.m, "struct.ByteAddressBuffer", {s.t.i32})
-			u := bc_undef(&s.m, bc_ptr(&s.m, ty))
+		if len(s.root_srvs) > 0 || len(s.tex_srvs) > 0 {
 			srv_list := make([dynamic]Md_Op, context.temp_allocator)
-			for r, idx in s.root_srvs {
-				node := bc_md_node(&s.m, {
-					i32op(s, u32(idx)),
-					Md_Op{present = true, id = bc_md_val(&s.m, u)},
-					empty,
-					i32op(s, ROOT_CBV_SPACE),
-					i32op(s, u32(r.slot)),
-					i32op(s, 1),
-					i32op(s, 11),
-					i32op(s, 0),
-					Md_Op{},
-				})
-				append(&srv_list, Md_Op{present = true, id = node})
-				append(&bindings, Psv_Binding{kind = 4, space = ROOT_CBV_SPACE, register = u32(r.slot), dxil_kind = 11})
+			srv_id := u32(0)
+			if len(s.root_srvs) > 0 {
+				ty := bc_named_struct(&s.m, "struct.ByteAddressBuffer", {s.t.i32})
+				u := bc_undef(&s.m, bc_ptr(&s.m, ty))
+				for r in s.root_srvs {
+					node := bc_md_node(&s.m, {
+						i32op(s, srv_id),
+						Md_Op{present = true, id = bc_md_val(&s.m, u)},
+						empty,
+						i32op(s, ROOT_CBV_SPACE),
+						i32op(s, u32(r.slot)),
+						i32op(s, 1),
+						i32op(s, 11),
+						i32op(s, 0),
+						Md_Op{},
+					})
+					append(&srv_list, Md_Op{present = true, id = node})
+					append(&bindings, Psv_Binding{kind = 4, space = ROOT_CBV_SPACE, register = u32(r.slot), dxil_kind = 11})
+					srv_id += 1
+				}
+			}
+			if len(s.tex_srvs) > 0 {
+				ty := bc_named_struct(&s.m, "struct.Texture2D", {s.t.f32})
+				u := bc_undef(&s.m, bc_ptr(&s.m, ty))
+				elem_tag := bc_md_node(&s.m, {i32op(s, 0), i32op(s, 9)}) // tag 0 = element type, 9 = f32
+				for r in s.tex_srvs {
+					node := bc_md_node(&s.m, {
+						i32op(s, srv_id),
+						Md_Op{present = true, id = bc_md_val(&s.m, u)},
+						empty,
+						i32op(s, TEX_SRV_SPACE),
+						i32op(s, u32(r.slot)),
+						i32op(s, 1),
+						i32op(s, 2), // Texture2D
+						i32op(s, 0),
+						Md_Op{present = true, id = elem_tag},
+					})
+					append(&srv_list, Md_Op{present = true, id = node})
+					append(&bindings, Psv_Binding{kind = 3, space = TEX_SRV_SPACE, register = u32(r.slot), dxil_kind = 2})
+					srv_id += 1
+				}
 			}
 			srvs_op = Md_Op{present = true, id = bc_md_node(&s.m, srv_list[:])}
 		}
@@ -1090,6 +1174,7 @@ Host_Shader :: struct {
 	root_cbvs:        [dynamic]u8,
 	root_srvs:        [dynamic]u8,
 	root_uavs:        [dynamic]u8,
+	tex_srvs:         [dynamic]u8,
 	memory:           bool,
 	memory_writes:    bool,
 	view_addresses:   bool,
@@ -1117,6 +1202,7 @@ destroy_host_shader :: proc(hs: ^Host_Shader) {
 	delete(hs.root_cbvs)
 	delete(hs.root_srvs)
 	delete(hs.root_uavs)
+	delete(hs.tex_srvs)
 }
 
 Target_Wave_Mode :: enum {
@@ -1767,6 +1853,11 @@ lower_valu :: proc(l: ^Lower_Ctx, inst: ^Inst, guard: Maybe(V)) {
 		if wv, wok := inst_write(inst, out_reg); wok {
 			l.vals[wv] = Val{kind = .Bit, v = res}
 		}
+		if strings.has_prefix(name, "v_cmpx_") {
+			if ew, eok := inst_write(inst, reg_s(EXEC)); eok {
+				l.vals[ew] = Val{kind = .Bit, v = res}
+			}
+		}
 		return
 	}
 
@@ -2333,7 +2424,38 @@ lower_program :: proc(
 				ex_err := lower_export(&l, site)
 				if ex_err != .None { return {}, ex_err }
 			case .Ds, .Buffer, .Image, .Flat:
-				if src, dok := l.desc_map[site]; dok && (src.kind == .Loaded || src.kind == .Built) && src.address.param < len(native.layout) {
+				if inst.fields.kind == .Image && strings.has_prefix(name, "image_sample") && inst.fields.has_base {
+					slot := u8(0)
+					if src, dok := l.desc_map[site]; dok && src.address.param < len(native.layout) {
+						slot = native.layout[src.address.param].slot
+					}
+					uop := inst.fields.base; uop.dwords = 1
+					vop := inst.fields.base; vop.code += 1; vop.dwords = 1
+					uv, uok := lower_operand(&l, inst, uop)
+					vv, vok := lower_operand(&l, inst, vop)
+					if uok && vok {
+						uf := bc_cast(&l.s.m, l.cur, .Bitcast, uv, l.s.t.f32)
+						vf := bc_cast(&l.s.m, l.cur, .Bitcast, vv, l.s.t.f32)
+						tex_h := shader_tex_srv_handle(&l.s, slot)
+						smp_h := shader_sampler_handle(&l.s, 0)
+						uf_u := bc_undef(&l.s.m, l.s.t.f32)
+						ui_u := bc_undef(&l.s.m, l.s.t.i32)
+						res_ret: V
+						if strings.contains(name, "_lz") || strings.contains(name, "_l") {
+							res_ret = shader_op(&l.s, l.cur, "sampleLevel.f32", .Read_Only, l.s.t.res_ret_f32, 62,
+								{tex_h, smp_h, uf, vf, uf_u, uf_u, ui_u, ui_u, ui_u, bc_f32_bits(&l.s.m, 0)})
+						} else {
+							res_ret = shader_op(&l.s, l.cur, "sample.f32", .Read_Only, l.s.t.res_ret_f32, 60,
+								{tex_h, smp_h, uf, vf, uf_u, uf_u, ui_u, ui_u, ui_u, uf_u})
+						}
+						for w, wi in inst.writes {
+							if wi < 4 {
+								ch := bc_extract(&l.s.m, l.cur, res_ret, u32(wi))
+								l.vals[w.val] = Val{kind = .I32, v = bc_cast(&l.s.m, l.cur, .Bitcast, ch, l.s.t.i32)}
+							}
+						}
+					}
+				} else if src, dok := l.desc_map[site]; dok && (src.kind == .Loaded || src.kind == .Built) && src.address.param < len(native.layout) {
 					if inst.fields.kind == .Buffer && strings.contains(name, "load") {
 						rp := native.layout[src.address.param]
 						h := shader_root_srv_handle(&l.s, rp.slot)
@@ -2432,6 +2554,8 @@ lower_program :: proc(
 	for rs, i in l.s.root_srvs { hs.root_srvs[i] = rs.slot }
 	hs.root_uavs = make([dynamic]u8, len(l.s.root_uavs))
 	for ru, i in l.s.root_uavs { hs.root_uavs[i] = ru.slot }
+	hs.tex_srvs = make([dynamic]u8, len(l.s.tex_srvs))
+	for ts, i in l.s.tex_srvs { hs.tex_srvs[i] = ts.slot }
 	hs.memory = l.s.memory != nil
 	hs.memory_writes = l.s.memory_dirty != nil
 	hs.view_addresses = l.s.view_addresses != nil
