@@ -1516,6 +1516,49 @@ test_vendor_and_ring :: proc() {
 	_, has_pt_dxil := vasperty_shader.dxbc_part(&pt_c, vasperty_shader.FOURCC_DXIL)
 	assert(has_pt_dxil && vasperty_shader.dxbc_hash(pt_vs.dxil[20:]) == pt_c.hash)
 	vasperty_shader.destroy_container(&pt_c)
+
+	// Swapchain_Engine (PresentX multi-plane + HDR10 + Frame_Pacer)
+	sc_cfg := vasperty_gpu.swapchain_config_for_host(1920, 1080, &nv, &t, true)
+	assert(sc_cfg.format == vasperty_gpu.DXGI_FORMAT_R10G10B10A2_UNORM && sc_cfg.color_space == .Hdr10_Pq)
+	pb := vasperty_gpu.present_batch_init(true, false)
+	assert(vasperty_gpu.present_batch_add_plane(&pb, vasperty_gpu.Present_Plane{width = 1920, height = 1080}))
+	assert(!vasperty_gpu.present_batch_needs_composite(&pb))
+	assert(vasperty_gpu.present_batch_add_plane(&pb, vasperty_gpu.Present_Plane{width = 1920, height = 1080, alpha_blend = true, is_ui_layer = true}))
+	assert(vasperty_gpu.present_batch_needs_composite(&pb))
+	pacer: vasperty_gpu.Frame_Pacer
+	for i in 0 ..< 16 { vasperty_gpu.frame_pacer_record(&pacer, 8.0 + f64(i % 4)) }
+	pstats := vasperty_gpu.frame_pacer_stats(&pacer)
+	assert(pstats.samples == 16 && pstats.p95_ms >= pstats.p50_ms && pstats.fps > 50.0)
+
+	// Bvh_Rt_Manager (NVIDIA DXR hardware vs Intel UMA compute fallback)
+	nv_caps := vasperty_gpu.Host_Capabilities{vendor_id = 0x10DE, dedicated_video_memory = 8 << 30, raytracing_tier = 11}
+	nv_tune := vasperty_gpu.classify_vendor(&nv_caps)
+	bvh := vasperty_gpu.bvh_rt_init(&nv_tune)
+	defer vasperty_gpu.bvh_rt_destroy(&bvh)
+	assert(bvh.backend == .Hardware_Dxr)
+	bid, bok := vasperty_gpu.bvh_rt_register(&bvh, .Blas, 4096, true)
+	assert(bok && bid > 0)
+	refit1, ok_b1 := vasperty_gpu.bvh_rt_build_or_refit(&bvh, bid)
+	refit2, ok_b2 := vasperty_gpu.bvh_rt_build_or_refit(&bvh, bid)
+	assert(ok_b1 && !refit1 && ok_b2 && refit2 && bvh.builds_total == 1 && bvh.refits_total == 1)
+	vasperty_gpu.bvh_rt_remove(&bvh, bid)
+	assert(bvh.used_bytes == 0)
+
+	// Frame_Telemetry + shader math precision (#682, #1259)
+	tel: vasperty_core.Frame_Telemetry
+	tel.frames_presented = 10
+	tel.pso_cache_hits = 9
+	tel.pso_cache_misses = 1
+	assert(vasperty_core.telemetry_pso_hit_rate(&tel) == 90.0)
+	tsum := vasperty_core.telemetry_format_summary(&tel)
+	assert(len(tsum) > 0)
+	delete(tsum)
+	assert(vasperty_shader.mul_legacy_f32_safe(0.0, math.inf_f32(1)) == 0.0)
+	neg_zero := transmute(f32)u32(0x8000_0000)
+	pos_zero := f32(0.0)
+	med := vasperty_shader.med3_f32_ordered(1.0, pos_zero, neg_zero)
+	assert(transmute(u32)med == 0) // pos_zero is median between neg_zero and 1.0
+	assert(vasperty_app.app_doctor(false, true) == 0)
 	fmt.println("ok")
 }
 

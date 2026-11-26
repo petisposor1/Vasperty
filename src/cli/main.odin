@@ -12,7 +12,7 @@ usage :: proc() {
 	fmt.println("Usage:")
 	fmt.println("  vasperty.exe status")
 	fmt.println("  vasperty.exe config")
-	fmt.println("  vasperty.exe doctor [--prune-cache]")
+	fmt.println("  vasperty.exe doctor [--prune-cache] [--json]")
 	fmt.println("  vasperty.exe inspect <pe-path> [--imports] [--exports]")
 	fmt.println("  vasperty.exe census <paths...> [--strict] [--missing]")
 	fmt.println("  vasperty.exe translate <paths...> [--validate] [--wave16|--wave32|--wave64] [--jobs N] [--limit N]")
@@ -37,11 +37,12 @@ main :: proc() {
 		os.exit(vasperty_app.app_config())
 
 	case "doctor":
-		prune := false
+		prune, as_json := false, false
 		for a in rest {
 			if a == "--prune-cache" { prune = true }
+			else if a == "--json" { as_json = true }
 		}
-		os.exit(vasperty_app.app_doctor(prune))
+		os.exit(vasperty_app.app_doctor(prune, as_json))
 
 	case "inspect":
 		show_imp, show_exp := false, false

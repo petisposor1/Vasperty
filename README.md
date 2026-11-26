@@ -61,7 +61,7 @@
 ```text
 vasperty.exe status
 vasperty.exe config
-vasperty.exe doctor [--prune-cache]
+vasperty.exe doctor [--prune-cache] [--json]
 vasperty.exe inspect <pe-path> [--imports] [--exports]
 vasperty.exe census <paths...> [--strict] [--missing]
 vasperty.exe translate <paths...> [--validate] [--wave16|--wave32|--wave64] [--jobs N] [--limit N]

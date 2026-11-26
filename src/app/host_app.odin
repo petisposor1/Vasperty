@@ -94,7 +94,7 @@ app_config :: proc() -> int {
 	return 0 if policy_ok else 1
 }
 
-app_doctor :: proc(prune_cache := false) -> int {
+app_doctor :: proc(prune_cache := false, as_json := false) -> int {
 	cfg, cfg_err := vasperty_core.load_config()
 	if cfg_err != .None {
 		fmt.eprintf("doctor: config/policy error: %v\n", cfg_err)
@@ -103,6 +103,53 @@ app_doctor :: proc(prune_cache := false) -> int {
 	defer vasperty_core.destroy_config(&cfg)
 
 	cores := os.get_processor_core_count()
+	caps := vasperty_gpu.probe_capabilities(true)
+	defer vasperty_gpu.destroy_host_capabilities(&caps)
+	tune := vasperty_gpu.classify_vendor(&caps)
+
+	cache_entries := 0
+	cache_bytes := u64(0)
+	stale_temps := 0
+	stale_bytes := u64(0)
+	if cache, c_err := vasperty_pipeline.cache_open(cfg.cache_dir); c_err == .None {
+		defer vasperty_pipeline.cache_destroy(&cache)
+		if prune_cache {
+			if rem, freed, pr_err := vasperty_pipeline.cache_prune_stale_temps(&cache); pr_err == .None && rem > 0 && !as_json {
+				fmt.printf("Cache pruned    : %d stale temp files (%d bytes)\n", rem, freed)
+			}
+		}
+		if stats, s_err := vasperty_pipeline.cache_stats(&cache); s_err == .None {
+			cache_entries = stats.entries
+			cache_bytes = stats.total_bytes
+			stale_temps = stats.stale_temps
+			stale_bytes = stats.stale_temp_bytes
+		}
+	} else {
+		fmt.eprintf("doctor: cache open error: %v\n", c_err)
+		return 1
+	}
+
+	bcpack_ok := false
+	if tbl, b_err := vasperty_formats.bcpack_builtin_tables(); b_err == .None {
+		vasperty_formats.bcpack_destroy_tables(tbl)
+		bcpack_ok = true
+	} else {
+		fmt.eprintf("doctor: bcpack tables error: %v\n", b_err)
+		return 1
+	}
+
+	if as_json {
+		fmt.printf(
+			"{{\"cpu_cores\":%d,\"adapter\":\"%s\",\"vendor_id\":\"0x%04X\",\"device_id\":\"0x%04X\",\"shader_model\":\"%s\",\"profile\":\"%v\",\"uma\":%v,\"cache_coherent_uma\":%v,\"wave_size\":%d,\"mesh_shaders\":%v,\"mesh_fallback\":%v,\"depth_bounds\":%v,\"typed_uav_additional\":%v,\"raytracing_tier\":%d,\"tearing\":%v,\"in_flight\":%d,\"pool_budget_mib\":%d,\"cache_entries\":%d,\"bcpack_ok\":%v}}\n",
+			cores, caps.adapter_name, caps.vendor_id, caps.device_id, caps.highest_shader_model,
+			tune.tier, tune.is_uma, tune.cache_coherent_uma, tune.target_wave_size,
+			caps.mesh_shaders, tune.emulate_mesh_shaders, caps.depth_bounds, caps.typed_uav_additional,
+			caps.raytracing_tier, caps.allow_tearing, tune.max_frames_in_flight,
+			tune.buffer_pool_budget_bytes >> 20, cache_entries, bcpack_ok,
+		)
+		return 0
+	}
+
 	fmt.println("=== Vasperty Doctor ===")
 	fmt.printf("CPU cores       : %d\n", cores)
 	fmt.printf("Config source   : %s\n", cfg.source if cfg.has_source else "<defaults/env>")
@@ -110,9 +157,6 @@ app_doctor :: proc(prune_cache := false) -> int {
 	fmt.printf("Cache dir       : %s (policy OK)\n", cfg.cache_dir)
 	fmt.printf("Data dir        : %s (policy OK)\n", cfg.data_dir)
 	fmt.printf("FidelityFX dir  : %s\n", cfg.fidelityfx_dir if cfg.has_fidelityfx_dir else "<unset>")
-
-	caps := vasperty_gpu.probe_capabilities(true)
-	defer vasperty_gpu.destroy_host_capabilities(&caps)
 	fmt.printf(
 		"D3D12 Adapter   : %s (vendor=0x%04X device=0x%04X %s mesh=%v wave=%v %d..%d)\n",
 		caps.adapter_name,
@@ -126,41 +170,16 @@ app_doctor :: proc(prune_cache := false) -> int {
 	)
 	fmt.printf("Display         : %d modes, max %d Hz, tearing=%v\n",
 		caps.display_mode_count, caps.max_refresh_hz, caps.allow_tearing)
-	tune := vasperty_gpu.classify_vendor(&caps)
 	fmt.printf("GPU profile     : %s [%v]\n", tune.profile_name, tune.tier)
 	fmt.printf("  uma=%v coherent=%v wave=%d emulate_wave64=%v mesh_fallback=%v in_flight=%d pool=%d MiB async=%v dxr=%v depth_bounds=%v typed_uav=%v\n",
 		tune.is_uma, tune.cache_coherent_uma, tune.target_wave_size, tune.emulate_wave64, tune.emulate_mesh_shaders,
 		tune.max_frames_in_flight, tune.buffer_pool_budget_bytes >> 20, tune.prefer_async_compute, tune.enable_dxr_bvh,
 		caps.depth_bounds, caps.typed_uav_additional)
-
-	if cache, c_err := vasperty_pipeline.cache_open(cfg.cache_dir); c_err == .None {
-		defer vasperty_pipeline.cache_destroy(&cache)
-		if prune_cache {
-			if rem, freed, pr_err := vasperty_pipeline.cache_prune_stale_temps(&cache); pr_err == .None && rem > 0 {
-				fmt.printf("Cache pruned    : %d stale temp files (%d bytes)\n", rem, freed)
-			}
-		}
-		if stats, s_err := vasperty_pipeline.cache_stats(&cache); s_err == .None {
-			fmt.printf(
-				"Pipeline cache  : %d entries (%d bytes), %d stale temps (%d bytes)\n",
-				stats.entries,
-				stats.total_bytes,
-				stats.stale_temps,
-				stats.stale_temp_bytes,
-			)
-		}
-	} else {
-		fmt.eprintf("doctor: cache open error: %v\n", c_err)
-		return 1
-	}
-
-	if tbl, b_err := vasperty_formats.bcpack_builtin_tables(); b_err == .None {
-		vasperty_formats.bcpack_destroy_tables(tbl)
-		fmt.println("BCPack tables   : loaded cleanly (128 rANS models, 6 dictionaries)")
-	} else {
-		fmt.eprintf("doctor: bcpack tables error: %v\n", b_err)
-		return 1
-	}
+	fmt.printf(
+		"Pipeline cache  : %d entries (%d bytes), %d stale temps (%d bytes)\n",
+		cache_entries, cache_bytes, stale_temps, stale_bytes,
+	)
+	fmt.println("BCPack tables   : loaded cleanly (128 rANS models, 6 dictionaries)")
 	return 0
 }
 

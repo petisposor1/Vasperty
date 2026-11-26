@@ -1172,6 +1172,45 @@ cmp_i64_dwords_safe :: proc "contextless" (a, b: u64, signed: bool) -> i32 {
 	return -1 if a_lo < b_lo else 1
 }
 
+// Flushes f32 denormals to signed zero (used by v_mul_legacy_f32 #682 & cubemap coords #1766).
+flush_denorm_f32 :: proc "contextless" (x: f32) -> f32 {
+	bits := transmute(u32)x
+	if (bits & 0x7F80_0000) == 0 {
+		return transmute(f32)(bits & 0x8000_0000)
+	}
+	return x
+}
+
+// RDNA2 v_mul_legacy_f32: flushes denormals to zero and yields +0.0 when either operand is 0 (#682).
+mul_legacy_f32_safe :: proc "contextless" (a, b: f32) -> f32 {
+	fa := flush_denorm_f32(a)
+	fb := flush_denorm_f32(b)
+	if fa == 0 || fb == 0 {
+		return 0.0
+	}
+	return fa * fb
+}
+
+// RDNA2 v_med3_f32 with -0.0 ordered strictly below +0.0 (#1259).
+@(private)
+f32_lt_signed_zero :: proc "contextless" (a, b: f32) -> bool {
+	if a != b {
+		return a < b
+	}
+	if a == 0 {
+		return (transmute(u32)a >> 31) > (transmute(u32)b >> 31)
+	}
+	return false
+}
+
+med3_f32_ordered :: proc "contextless" (a, b, c: f32) -> f32 {
+	x, y, z := a, b, c
+	if f32_lt_signed_zero(y, x) { x, y = y, x }
+	if f32_lt_signed_zero(z, y) { y, z = z, y }
+	if f32_lt_signed_zero(y, x) { x, y = y, x }
+	return y
+}
+
 Shader_Options :: struct {
 	view_marks: bool,
 	loop_limit: u32,
