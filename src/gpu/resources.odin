@@ -1,5 +1,7 @@
 package vasperty_gpu
 
+import "core:os"
+
 import "base:intrinsics"
 import "core:fmt"
 import "core:sync"
@@ -54,6 +56,18 @@ ensure_host_device :: proc() -> rawptr {
 	D3D_FEATURE_LEVEL_12_0 :: u32(0xC000)
 	// Enable D3D12ExperimentalShaderModels so translated DXIL shaders work even if dxil.dll is unavailable.
 	if dlls.d3d12_mod != nil {
+		if dbg_env, has_dbg := os.lookup_env("VASPERTY_D3D12_DEBUG", context.temp_allocator); has_dbg && dbg_env == "1" {
+			if dbg_sym := win32.GetProcAddress(dlls.d3d12_mod, "D3D12GetDebugInterface"); dbg_sym != nil {
+				dbg_fn := cast(proc "system" (^Iid, ^rawptr) -> HRESULT)dbg_sym
+				IID_ID3D12Debug := guid(0x344488b7, 0x6846, 0x474b, {0xb9, 0x89, 0xf0, 0x27, 0x44, 0x82, 0x45, 0xe0})
+				dbg_obj: rawptr
+				if dbg_fn(&IID_ID3D12Debug, &dbg_obj) >= 0 && dbg_obj != nil {
+					Dbg_Vtbl :: struct { _pad: [3]rawptr, EnableDebugLayer: proc "system" (rawptr) }
+					(cast(^^Dbg_Vtbl)dbg_obj)^.EnableDebugLayer(dbg_obj)
+					com_release(dbg_obj)
+				}
+			}
+		}
 		if exp_sym := win32.GetProcAddress(dlls.d3d12_mod, "D3D12EnableExperimentalFeatures"); exp_sym != nil {
 			exp_fn := cast(proc "system" (u32, ^Iid, rawptr, ^u32) -> HRESULT)exp_sym
 			D3D12_EXP_SHADER_MODELS := guid(0x76f5573e, 0xf13a, 0x40f5, {0xb2, 0x97, 0x81, 0xce, 0x9e, 0x18, 0x93, 0x3f})

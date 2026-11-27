@@ -1,6 +1,7 @@
 package vasperty_hle
 
 import "base:intrinsics"
+import "core:fmt"
 import "core:mem"
 import "core:path/filepath"
 import "core:strings"
@@ -631,10 +632,7 @@ HLE_GetProcAddress :: proc "system" (mod: rawptr, name: [^]u8) -> rawptr {
 		if b, ok := main_image(); ok { mptr = rawptr(b) }
 	}
 	if m, ok := find_module_by_handle(mptr); ok {
-		if uintptr(name) < 0x10000 {
-			return nil
-		}
-		sname := string(cstring(name))
+		sname := fmt.tprintf("#%d", uintptr(name)) if uintptr(name) < 0x10000 else string(cstring(name))
 		for e in m.exports {
 			if e.name == sname {
 				return rawptr(e.address)
@@ -651,14 +649,7 @@ HLE_GetProcAddress :: proc "system" (mod: rawptr, name: [^]u8) -> rawptr {
 				path_s, _ := win32.utf16_to_utf8(var_buf[:min(int(n), 260)], context.temp_allocator)
 				sidx := strings.last_index_byte(path_s, '\\')
 				dll_name := path_s if sidx < 0 else path_s[sidx + 1:]
-				sym := strings.clone_to_cstring("", context.temp_allocator)
-				_ = sym
-				sym_name := ""
-				if uintptr(name) < 0x10000 {
-					sym_name = string(win32.utf16_to_utf8_alloc(nil) or_else "")
-					_ = sym_name
-				}
-				key := strings.clone(string(cstring(name)), context.temp_allocator) if uintptr(name) >= 0x10000 else strings.concatenate({"#", ""}, context.temp_allocator)
+				key := fmt.tprintf("#%d", uintptr(name)) if uintptr(name) < 0x10000 else strings.clone(string(cstring(name)), context.temp_allocator)
 				if addr, hok := registry_lookup(dll_name, key); hok {
 					return rawptr(addr)
 				}

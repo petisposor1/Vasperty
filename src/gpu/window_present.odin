@@ -194,6 +194,7 @@ Window_Presenter :: struct {
 	closed:           bool,
 	class_registered: bool,
 	owns_device_ref:  bool,
+	no_vsync:         bool,
 	owner_thread:     win32.DWORD,
 	hwnd:             win32.HWND,
 	device:           rawptr,
@@ -373,7 +374,9 @@ init_window_presenter :: proc(wp: ^Window_Presenter, host_queue: rawptr) -> bool
 		Flags       = 0,
 	}
 	sc1: rawptr
-	if fvt.CreateSwapChainForHwnd(fac, host_queue, wp.hwnd, &sc_desc, nil, nil, &sc1) < 0 || sc1 == nil {
+	hr_sc := fvt.CreateSwapChainForHwnd(fac, host_queue, wp.hwnd, &sc_desc, nil, nil, &sc1)
+	if hr_sc < 0 || sc1 == nil {
+		fmt.printf("[win] CreateSwapChainForHwnd(%dx%d) FAILED hr=0x%08X\n", sc_desc.Width, sc_desc.Height, u32(hr_sc))
 		return false
 	}
 	sc3_iid := IID_IDXGISwapChain3_G
@@ -429,6 +432,12 @@ init_window_presenter :: proc(wp: ^Window_Presenter, host_queue: rawptr) -> bool
 	wp.fence_event = win32.CreateEventW(nil, false, false, nil)
 	if wp.fence_event == nil {
 		return false
+	}
+
+	if v, ok := os.lookup_env("VASPERTY_NO_VSYNC", context.temp_allocator); ok && (v == "1" || v == "true") {
+		wp.no_vsync = true
+	} else {
+		wp.no_vsync = false
 	}
 
 	wp.initialized = true
@@ -511,7 +520,9 @@ ensure_readback_buffer :: proc(wp: ^Window_Presenter, w, h: u32) -> bool {
 
 @(private)
 should_capture_screenshot :: proc(frame_num: u64) -> (path: string, allocated: bool, ok: bool) {
-	if frame_num != 1500 && frame_num != 1800 && frame_num != 3200 && frame_num != 3600 && frame_num != 4000 && frame_num != 4500 && frame_num != 5000 && frame_num != 5500 && frame_num != 6000 && frame_num != 7000 {
+	switch frame_num {
+	case 2200, 3600, 4200, 4600, 5000, 6500, 8000, 10000, 12000, 15000, 20000:
+	case:
 		return "", false, false
 	}
 	raw_path, found := os.lookup_env("VASPERTY_SCREENSHOT_PATH", context.allocator)
@@ -830,7 +841,8 @@ present_window_frame :: proc(host_queue: rawptr, frame_num: u64, plane_res: rawp
 		}
 	}
 
-	_ = scvt.Present(g_win.swapchain, 1, 0)
+	sync_interval := u32(0) if g_win.no_vsync else u32(1)
+	_ = scvt.Present(g_win.swapchain, sync_interval, 0)
 
 	g_win.fence_value += 1
 	if qvt.Signal(host_queue, g_win.fence, g_win.fence_value) >= 0 {

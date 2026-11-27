@@ -1211,7 +1211,7 @@ Save_Blob_Callback :: #type proc "system" (info: ^Save_Blob_Info, ctx: rawptr) -
 	}
 	return S_OK
 }
-@(private) xgs_read_blobs_sync :: proc(c: ^Save_Container, names: [^]cstring, count: ^u32, out_blobs: [^]Save_Blob_Data) -> HRESULT {
+@(private) xgs_read_blobs_sync :: proc(c: ^Save_Container, names: [^]cstring, count: ^u32, blobs_size: uint, out_blobs: [^]Save_Blob_Data) -> HRESULT {
 	if c == nil || names == nil || count == nil || out_blobs == nil { return E_INVALIDARG }
 	n := int(count^)
 	if n == 0 { return E_INVALIDARG }
@@ -1250,6 +1250,9 @@ Save_Blob_Callback :: #type proc "system" (info: ^Save_Blob_Info, ctx: rawptr) -
 		blob_bytes[i] = bytes
 		total_needed += len(bn) + 1 + len(bytes)
 	}
+	if blobs_size > 0 && uint(total_needed) > blobs_size {
+		return XGS_BUFFER_TOO_SMALL
+	}
 	cursor := data_off
 	for i in 0 ..< n {
 		bn := string(names[i])
@@ -1269,14 +1272,12 @@ Save_Blob_Callback :: #type proc "system" (info: ^Save_Blob_Info, ctx: rawptr) -
 			data = data_ptr,
 		}
 	}
-	_ = total_needed
 	return S_OK
 }
 @(private) xgs_read_blobs :: proc "system" (_: ^Runtime_Object, c: ^Save_Container, names: [^]cstring, count: ^u32, blobs_size: uint, out_blobs: [^]Save_Blob_Data) -> HRESULT {
 	context = hle_context()
 	if uintptr(out_blobs) < 0x10000 { return E_INVALIDARG }
-	_ = blobs_size
-	return xgs_read_blobs_sync(c, names, count, out_blobs)
+	return xgs_read_blobs_sync(c, names, count, blobs_size, out_blobs)
 }
 @(private) xgs_read_async :: proc "system" (_: ^Runtime_Object, c: ^Save_Container, names: [^]cstring, count: u32, b: ^Async_Block) -> HRESULT {
 	context = hle_context()

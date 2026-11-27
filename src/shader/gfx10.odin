@@ -601,7 +601,40 @@ decode_fields :: proc(inst: ^Instruction, wave64: bool, allocator := context.all
 		if f.d16 { dn = (dn + 1) / 2 }
 		f.has_dst = true; f.dst = op_vector((w1 >> 8) & 0xFF, dn + (1 if (f.tfe || f.lwe) else 0))
 		f.has_base = true; f.base = op_scalar(u8(((w1 >> 16) & 0x1F) << 2), 4 if f.r128 else 8)
-		append(&f.src, op_vector(w1 & 0xFF, 2)) // coord base
+		nsize := int((w0 >> 1) & 3)
+		coords := 2
+		switch f.dim {
+		case 0: coords = 1
+		case 1, 4: coords = 2
+		case 2, 3, 5, 6: coords = 3
+		case 7: coords = 4
+		}
+		if f.a16 { coords = (coords + 1) / 2 }
+		if strings.contains(name, "_mip") { coords += 1 }
+		if strings.has_prefix(name, "image_sample") || strings.has_prefix(name, "image_gather4") {
+			if strings.has_suffix(name, "_o") || strings.contains(name, "_o_") { coords += 1 }
+			if strings.has_suffix(name, "_b") || strings.contains(name, "_b_") { coords += 1 }
+			if strings.has_suffix(name, "_c") || strings.contains(name, "_c_") || strings.contains(name, "_cd") { coords += 1 }
+			if strings.has_suffix(name, "_l") || strings.contains(name, "_l_") { coords += 1 }
+			if strings.has_suffix(name, "_cl") || strings.contains(name, "_cl_") { coords += 1 }
+			if strings.has_suffix(name, "_d") || strings.contains(name, "_d_") || strings.contains(name, "_cd") {
+				coords += 2 if f.dim == 0 else 4
+			}
+		} else if strings.has_prefix(name, "image_get_resinfo") {
+			coords = 1
+		}
+		if nsize > 0 && inst.word_len >= 3 {
+			if coords < 2 { coords = 2 }
+			append(&f.src, op_vector(w1 & 0xFF, 1))
+			for ci in 1 ..< coords {
+				wi := 2 + (ci - 1) / 4
+				if wi >= inst.word_len { break }
+				sh := uint(((ci - 1) % 4) * 8)
+				append(&f.src, op_vector((inst.words[wi] >> sh) & 0xFF, 1))
+			}
+		} else {
+			append(&f.src, op_vector(w1 & 0xFF, u8(max(coords, 1)))) // coord base
+		}
 		if strings.has_prefix(name, "image_sample") || strings.has_prefix(name, "image_gather4") || strings.has_prefix(name, "image_get_lod") {
 			f.has_sampler = true; f.sampler = op_scalar(u8(((w1 >> 21) & 0x1F) << 2), 4)
 		}

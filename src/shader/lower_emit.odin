@@ -8,9 +8,21 @@ import "core:strings"
 import "core:sync"
 import win32 "core:sys/windows"
 
+Tex_Srv_Ref :: struct {
+	slot:        u8,
+	byte_offset: u32,
+}
+
+Tex_Uav_Ref :: struct {
+	slot:        u8,
+	byte_offset: u32,
+}
+
 USER_DATA_SPACE :: u32(0)
 SAMPLER_SPACE :: u32(0)
 ROOT_CBV_SPACE :: u32(1)
+TEX_SRV_SPACE :: u32(3)
+TEX_UAV_SPACE :: u32(4)
 VIEW_STRIDES :: u8(255)
 VIEW_STRIDE_BITS :: u32((1 << 30) - 1)
 VIEW_INTEGER :: u32(1) << 31
@@ -298,8 +310,10 @@ Dxil_Types :: struct {
 	handle:   Ty,
 	props:    Ty,
 	bind:     Ty,
-	cbuf_ret: Ty,
-	res_ret:  Ty,
+	cbuf_ret:    Ty,
+	res_ret:     Ty,
+	res_ret_f32: Ty,
+	dims:        Ty,
 }
 
 Dxil_Shader :: struct {
@@ -331,6 +345,22 @@ Dxil_Shader :: struct {
 		slot: u8,
 		h:    V,
 	},
+	tex_srvs:       [dynamic]struct {
+		slot:        u8,
+		byte_offset: u32,
+		reg:         u32,
+		h:           V,
+	},
+	tex_uavs:       [dynamic]struct {
+		slot:        u8,
+		byte_offset: u32,
+		reg:         u32,
+		h:           V,
+	},
+	sampler_handles: [dynamic]struct {
+		idx: u32,
+		h:   V,
+	},
 	memory:         Maybe(V),
 	memory_dirty:   Maybe(V),
 	view_addresses: Maybe(V),
@@ -344,6 +374,7 @@ Dxil_Shader :: struct {
 	main_fn:        V,
 	entry:          int,
 	ud_prop_val:    V,
+	ud_ann_inst:    V,
 }
 
 sig_list_destroy :: proc(els: ^[dynamic]Sig_Element) {
@@ -371,6 +402,22 @@ shader_create :: proc(pixel: bool) -> Dxil_Shader {
 		slot: u8,
 		h:    V,
 	})
+	s.tex_srvs = make([dynamic]struct {
+		slot:        u8,
+		byte_offset: u32,
+		reg:         u32,
+		h:           V,
+	})
+	s.tex_uavs = make([dynamic]struct {
+		slot:        u8,
+		byte_offset: u32,
+		reg:         u32,
+		h:           V,
+	})
+	s.sampler_handles = make([dynamic]struct {
+		idx: u32,
+		h:   V,
+	})
 
 	s.t.void_ty = bc_void(&s.m)
 	s.t.i1 = bc_int_ty(&s.m, 1)
@@ -383,6 +430,8 @@ shader_create :: proc(pixel: bool) -> Dxil_Shader {
 	s.t.bind = bc_named_struct(&s.m, "dx.types.ResBind", {s.t.i32, s.t.i32, s.t.i32, s.t.i8})
 	s.t.cbuf_ret = bc_named_struct(&s.m, "dx.types.CBufRet.i32", {s.t.i32, s.t.i32, s.t.i32, s.t.i32})
 	s.t.res_ret = bc_named_struct(&s.m, "dx.types.ResRet.i32", {s.t.i32, s.t.i32, s.t.i32, s.t.i32, s.t.i32})
+	s.t.res_ret_f32 = bc_named_struct(&s.m, "dx.types.ResRet.f32", {s.t.f32, s.t.f32, s.t.f32, s.t.f32, s.t.i32})
+	s.t.dims = bc_named_struct(&s.m, "dx.types.Dimensions", {s.t.i32, s.t.i32, s.t.i32, s.t.i32})
 
 	fty := bc_func_ty(&s.m, s.t.void_ty, {})
 	s.main_fn = bc_function(&s.m, "main", fty, .None, true)
@@ -398,6 +447,9 @@ shader_destroy :: proc(s: ^Dxil_Shader) {
 	delete(s.root_cbvs)
 	delete(s.root_srvs)
 	delete(s.root_uavs)
+	delete(s.tex_srvs)
+	delete(s.tex_uavs)
+	delete(s.sampler_handles)
 }
 
 shader_op :: proc(s: ^Dxil_Shader, blk: int, name: string, attr: Attr_Kind, ret: Ty, opcode: u32, args: []V) -> V {
@@ -431,6 +483,7 @@ shader_user_data_handle :: proc(s: ^Dxil_Shader) -> V {
 	h := shader_op(s, s.entry, "createHandleFromBinding", .Read_None, s.t.handle, 217, {bind, bc_i32(&s.m, 0), bc_i1(&s.m, false)})
 	s.ud_prop_val = bc_aggregate(&s.m, s.t.props, {bc_i32(&s.m, 13), bc_i32(&s.m, 0xFFFF_FFFF)})
 	ah := shader_op(s, s.entry, "annotateHandle", .Read_None, s.t.handle, 216, {h, s.ud_prop_val})
+	s.ud_ann_inst = ah
 	s.user_handle = ah
 	return ah
 }
@@ -485,6 +538,95 @@ shader_root_uav_handle :: proc(s: ^Dxil_Shader, slot: u8) -> V {
 		slot: u8,
 		h:    V,
 	}{slot = slot, h = ah})
+	return ah
+}
+
+shader_tex_srv_handle :: proc(s: ^Dxil_Shader, slot: u8, byte_offset: u32) -> V {
+	for r in s.tex_srvs {
+		if r.slot == slot && r.byte_offset == byte_offset {
+			return r.h
+		}
+	}
+	reg := u32(len(s.tex_srvs))
+	if reg >= 16 {
+		return s.tex_srvs[15].h
+	}
+	rv := bc_i32(&s.m, reg)
+	bind := bc_aggregate(&s.m, s.t.bind, {rv, rv, bc_i32(&s.m, TEX_SRV_SPACE), bc_i8(&s.m, 0)})
+	h := shader_op(s, s.entry, "createHandleFromBinding", .Read_None, s.t.handle, 217, {bind, rv, bc_i1(&s.m, false)})
+	ah := shader_annotate(s, s.entry, h, 2, 0x00000409)
+	append(&s.tex_srvs, struct {
+		slot:        u8,
+		byte_offset: u32,
+		reg:         u32,
+		h:           V,
+	}{slot = slot, byte_offset = byte_offset, reg = reg, h = ah})
+	return ah
+}
+
+shader_tex_uav_handle :: proc(s: ^Dxil_Shader, slot: u8, byte_offset: u32) -> V {
+	for r in s.tex_uavs {
+		if r.slot == slot && r.byte_offset == byte_offset {
+			return r.h
+		}
+	}
+	reg := u32(len(s.tex_uavs))
+	if reg >= 16 {
+		return s.tex_uavs[15].h
+	}
+	rv := bc_i32(&s.m, reg)
+	bind := bc_aggregate(&s.m, s.t.bind, {rv, rv, bc_i32(&s.m, TEX_UAV_SPACE), bc_i8(&s.m, 1)})
+	h := shader_op(s, s.entry, "createHandleFromBinding", .Read_None, s.t.handle, 217, {bind, rv, bc_i1(&s.m, false)})
+	ah := shader_annotate(s, s.entry, h, 2 | 0x1000, 0x00000409)
+	append(&s.tex_uavs, struct {
+		slot:        u8,
+		byte_offset: u32,
+		reg:         u32,
+		h:           V,
+	}{slot = slot, byte_offset = byte_offset, reg = reg, h = ah})
+	return ah
+}
+
+shader_sampler_handle :: proc(s: ^Dxil_Shader, idx: u32) -> V {
+	for r in s.sampler_handles {
+		if r.idx == idx {
+			return r.h
+		}
+	}
+	if idx + 1 > s.samplers {
+		s.samplers = idx + 1
+	}
+	iv := bc_i32(&s.m, idx)
+	bind := bc_aggregate(&s.m, s.t.bind, {iv, iv, bc_i32(&s.m, SAMPLER_SPACE), bc_i8(&s.m, 3)})
+	h := shader_op(s, s.entry, "createHandleFromBinding", .Read_None, s.t.handle, 217, {bind, iv, bc_i1(&s.m, false)})
+	ah := shader_annotate(s, s.entry, h, 14, 0)
+	append(&s.sampler_handles, struct {
+		idx: u32,
+		h:   V,
+	}{idx = idx, h = ah})
+	return ah
+}
+
+shader_cmp_sampler_handle :: proc(s: ^Dxil_Shader, idx: u32) -> V {
+	for r in s.sampler_handles {
+		if r.idx == idx {
+			return r.h
+		}
+	}
+	if idx + 1 > s.samplers {
+		s.samplers = idx + 1
+	}
+	if idx < 64 {
+		s.cmp_samplers |= u64(1) << u64(idx)
+	}
+	iv := bc_i32(&s.m, idx)
+	bind := bc_aggregate(&s.m, s.t.bind, {iv, iv, bc_i32(&s.m, SAMPLER_SPACE), bc_i8(&s.m, 3)})
+	h := shader_op(s, s.entry, "createHandleFromBinding", .Read_None, s.t.handle, 217, {bind, iv, bc_i1(&s.m, false)})
+	ah := shader_annotate(s, s.entry, h, 14 | 0x8000, 0)
+	append(&s.sampler_handles, struct {
+		idx: u32,
+		h:   V,
+	}{idx = idx, h = ah})
 	return ah
 }
 
@@ -558,7 +700,9 @@ shader_finish :: proc(s: ^Dxil_Shader) -> [dynamic]u8 {
 	}
 	if _, has_ud := s.user_handle.?; has_ud {
 		new_props := bc_aggregate(&s.m, s.t.props, {bc_i32(&s.m, 13), bc_i32(&s.m, ud_size)})
-		bc_replace_const(&s.m, s.ud_prop_val, new_props)
+		if s.ud_ann_inst.kind == .Inst && int(s.ud_ann_inst.id) < len(s.m.insts) && len(s.m.insts[s.ud_ann_inst.id].args) >= 3 {
+			s.m.insts[s.ud_ann_inst.id].args[2] = new_props
+		}
 	}
 
 	heap, smp_heap, wave, i64_u := bc_module_uses(&s.m)
@@ -568,7 +712,7 @@ shader_finish :: proc(s: ^Dxil_Shader) -> [dynamic]u8 {
 	if i64_u { s.flags |= DXIL_FLAG_INT64 } else { s.flags &= ~DXIL_FLAG_INT64 }
 
 	is_compute := s.has_threads && !s.has_mesh && !s.has_gs
-	declared_uavs := len(s.root_uavs) > 0 || s.memory_dirty != nil || s.view_writes != nil
+	declared_uavs := len(s.root_uavs) > 0 || len(s.tex_uavs) > 0 || s.memory_dirty != nil || s.view_writes != nil
 	if declared_uavs && !s.pixel && !is_compute {
 		s.flags |= DXIL_FLAG_UAVS_EVERY_STAGE
 	}
@@ -579,7 +723,7 @@ shader_finish :: proc(s: ^Dxil_Shader) -> [dynamic]u8 {
 	}
 
 	resources_op := Md_Op{}
-	if s.user_data > 0 || s.samplers > 0 || len(s.root_cbvs) > 0 || len(s.root_srvs) > 0 || len(s.root_uavs) > 0 {
+	if s.user_data > 0 || s.samplers > 0 || len(s.root_cbvs) > 0 || len(s.root_srvs) > 0 || len(s.root_uavs) > 0 || len(s.tex_srvs) > 0 || len(s.tex_uavs) > 0 {
 		empty := Md_Op{present = true, id = bc_md_str(&s.m, "")}
 		cbv_list := make([dynamic]Md_Op, context.temp_allocator)
 		if s.user_data > 0 {
@@ -625,47 +769,97 @@ shader_finish :: proc(s: ^Dxil_Shader) -> [dynamic]u8 {
 		}
 
 		srvs_op := Md_Op{}
-		if len(s.root_srvs) > 0 {
-			ty := bc_named_struct(&s.m, "struct.ByteAddressBuffer", {s.t.i32})
-			u := bc_undef(&s.m, bc_ptr(&s.m, ty))
+		if len(s.root_srvs) > 0 || len(s.tex_srvs) > 0 {
 			srv_list := make([dynamic]Md_Op, context.temp_allocator)
-			for r, idx in s.root_srvs {
-				node := bc_md_node(&s.m, {
-					i32op(s, u32(idx)),
-					Md_Op{present = true, id = bc_md_val(&s.m, u)},
-					empty,
-					i32op(s, ROOT_CBV_SPACE),
-					i32op(s, u32(r.slot)),
-					i32op(s, 1),
-					i32op(s, 11),
-					i32op(s, 0),
-					Md_Op{},
-				})
-				append(&srv_list, Md_Op{present = true, id = node})
-				append(&bindings, Psv_Binding{kind = 4, space = ROOT_CBV_SPACE, register = u32(r.slot), dxil_kind = 11})
+			srv_id := u32(0)
+			if len(s.root_srvs) > 0 {
+				ty := bc_named_struct(&s.m, "struct.ByteAddressBuffer", {s.t.i32})
+				u := bc_undef(&s.m, bc_ptr(&s.m, ty))
+				for r in s.root_srvs {
+					node := bc_md_node(&s.m, {
+						i32op(s, srv_id),
+						Md_Op{present = true, id = bc_md_val(&s.m, u)},
+						empty,
+						i32op(s, ROOT_CBV_SPACE),
+						i32op(s, u32(r.slot)),
+						i32op(s, 1),
+						i32op(s, 11),
+						i32op(s, 0),
+						Md_Op{},
+					})
+					append(&srv_list, Md_Op{present = true, id = node})
+					append(&bindings, Psv_Binding{kind = 4, space = ROOT_CBV_SPACE, register = u32(r.slot), dxil_kind = 11})
+					srv_id += 1
+				}
+			}
+			if len(s.tex_srvs) > 0 {
+				ty := bc_named_struct(&s.m, "struct.Texture2D", {s.t.f32})
+				u := bc_undef(&s.m, bc_ptr(&s.m, ty))
+				elem_tag := bc_md_node(&s.m, {i32op(s, 0), i32op(s, 9)})
+				for r in s.tex_srvs {
+					node := bc_md_node(&s.m, {
+						i32op(s, srv_id),
+						Md_Op{present = true, id = bc_md_val(&s.m, u)},
+						empty,
+						i32op(s, TEX_SRV_SPACE),
+						i32op(s, r.reg),
+						i32op(s, 1),
+						i32op(s, 2),
+						i32op(s, 0),
+						Md_Op{present = true, id = elem_tag},
+					})
+					append(&srv_list, Md_Op{present = true, id = node})
+					append(&bindings, Psv_Binding{kind = 3, space = TEX_SRV_SPACE, register = r.reg, dxil_kind = 2})
+					srv_id += 1
+				}
 			}
 			srvs_op = Md_Op{present = true, id = bc_md_node(&s.m, srv_list[:])}
 		}
 
 		uavs_op := Md_Op{}
-		if len(s.root_uavs) > 0 {
-			ty := bc_named_struct(&s.m, "struct.RWByteAddressBuffer", {s.t.i32})
-			u := bc_undef(&s.m, bc_ptr(&s.m, ty))
+		if len(s.root_uavs) > 0 || len(s.tex_uavs) > 0 {
 			no := Md_Op{present = true, id = bc_md_val(&s.m, bc_i1(&s.m, false))}
 			uav_list := make([dynamic]Md_Op, context.temp_allocator)
-			for r, idx in s.root_uavs {
-				node := bc_md_node(&s.m, {
-					i32op(s, u32(idx)),
-					Md_Op{present = true, id = bc_md_val(&s.m, u)},
-					empty,
-					i32op(s, ROOT_CBV_SPACE),
-					i32op(s, u32(r.slot)),
-					i32op(s, 1),
-					i32op(s, 11),
-					no, no, no, Md_Op{},
-				})
-				append(&uav_list, Md_Op{present = true, id = node})
-				append(&bindings, Psv_Binding{kind = 7, space = ROOT_CBV_SPACE, register = u32(r.slot), dxil_kind = 11})
+			uav_id := u32(0)
+			if len(s.root_uavs) > 0 {
+				ty := bc_named_struct(&s.m, "struct.RWByteAddressBuffer", {s.t.i32})
+				u := bc_undef(&s.m, bc_ptr(&s.m, ty))
+				for r in s.root_uavs {
+					node := bc_md_node(&s.m, {
+						i32op(s, uav_id),
+						Md_Op{present = true, id = bc_md_val(&s.m, u)},
+						empty,
+						i32op(s, ROOT_CBV_SPACE),
+						i32op(s, u32(r.slot)),
+						i32op(s, 1),
+						i32op(s, 11),
+						no, no, no, Md_Op{},
+					})
+					append(&uav_list, Md_Op{present = true, id = node})
+					append(&bindings, Psv_Binding{kind = 7, space = ROOT_CBV_SPACE, register = u32(r.slot), dxil_kind = 11})
+					uav_id += 1
+				}
+			}
+			if len(s.tex_uavs) > 0 {
+				ty := bc_named_struct(&s.m, "struct.RWTexture2D", {s.t.f32})
+				u := bc_undef(&s.m, bc_ptr(&s.m, ty))
+				elem_tag := bc_md_node(&s.m, {i32op(s, 0), i32op(s, 9)})
+				for r in s.tex_uavs {
+					node := bc_md_node(&s.m, {
+						i32op(s, uav_id),
+						Md_Op{present = true, id = bc_md_val(&s.m, u)},
+						empty,
+						i32op(s, TEX_UAV_SPACE),
+						i32op(s, r.reg),
+						i32op(s, 1),
+						i32op(s, 2),
+						no, no, no,
+						Md_Op{present = true, id = elem_tag},
+					})
+					append(&uav_list, Md_Op{present = true, id = node})
+					append(&bindings, Psv_Binding{kind = 6, space = TEX_UAV_SPACE, register = r.reg, dxil_kind = 2})
+					uav_id += 1
+				}
 			}
 			uavs_op = Md_Op{present = true, id = bc_md_node(&s.m, uav_list[:])}
 		}
@@ -1090,6 +1284,8 @@ Host_Shader :: struct {
 	root_cbvs:        [dynamic]u8,
 	root_srvs:        [dynamic]u8,
 	root_uavs:        [dynamic]u8,
+	tex_srvs:         [dynamic]Tex_Srv_Ref,
+	tex_uavs:         [dynamic]Tex_Uav_Ref,
 	memory:           bool,
 	memory_writes:    bool,
 	view_addresses:   bool,
@@ -1117,6 +1313,8 @@ destroy_host_shader :: proc(hs: ^Host_Shader) {
 	delete(hs.root_cbvs)
 	delete(hs.root_srvs)
 	delete(hs.root_uavs)
+	delete(hs.tex_srvs)
+	delete(hs.tex_uavs)
 }
 
 Target_Wave_Mode :: enum {
@@ -1505,9 +1703,9 @@ lower_inputs :: proc(l: ^Lower_Ctx) {
 		case .Mesh_Group:
 			iv := shader_op(&l.s, entry, "groupId.i32", .Read_None, l.s.t.i32, 94, {bc_i32(&l.s.m, 0)})
 			val = Val{kind = .I32, v = iv}
-		case .Merged_Wave_Info:
+		case .Merged_Wave_Info, .Group_Info:
 			val = Val{kind = .I32, v = bc_i32(&l.s.m, 0)}
-		case .Barycentric, .Primitive_Id, .Line_Stipple, .Ancillary, .Sample_Coverage, .Fixed_Position, .Group_Info:
+		case .Barycentric, .Primitive_Id, .Line_Stipple, .Ancillary, .Sample_Coverage, .Fixed_Position:
 		}
 		l.vals[inp.val] = val
 	}
@@ -1657,6 +1855,111 @@ lower_sop :: proc(l: ^Lower_Ctx, inst: ^Inst) {
 		}
 		return
 	}
+
+	if name == "s_min_i32" || name == "s_max_i32" || name == "s_min_u32" || name == "s_max_u32" {
+		a, oka := lower_operand(l, inst, s0)
+		b, okb := lower_operand(l, inst, s1)
+		if !oka || !okb { return }
+		op_id := u32(38)
+		switch name {
+		case "s_max_i32": op_id = 37
+		case "s_min_i32": op_id = 38
+		case "s_max_u32": op_id = 39
+		case "s_min_u32": op_id = 40
+		}
+		r := shader_op(&l.s, c, "binary.i32", .Read_None, l.s.t.i32, op_id, {a, b})
+		set_i32(l, has_dst, dst_w, r)
+		set_bit(l, has_scc, scc_w, bc_cmp(&l.s.m, c, PRED_EQ, r, a))
+		return
+	}
+
+	if name == "s_lshl1_add_u32" || name == "s_lshl2_add_u32" || name == "s_lshl3_add_u32" || name == "s_lshl4_add_u32" {
+		a, oka := lower_operand(l, inst, s0)
+		b, okb := lower_operand(l, inst, s1)
+		if !oka || !okb { return }
+		sh := u32(1)
+		switch name {
+		case "s_lshl2_add_u32": sh = 2
+		case "s_lshl3_add_u32": sh = 3
+		case "s_lshl4_add_u32": sh = 4
+		}
+		sa := bc_bin(&l.s.m, c, .Shl, a, bc_i32(&l.s.m, sh))
+		r := bc_bin(&l.s.m, c, .Add, sa, b)
+		set_i32(l, has_dst, dst_w, r)
+		set_bit(l, has_scc, scc_w, bc_cmp(&l.s.m, c, PRED_IULT, r, sa))
+		return
+	}
+
+	if name == "s_bfe_u32" || name == "s_bfe_i32" {
+		a, oka := lower_operand(l, inst, s0)
+		b, okb := lower_operand(l, inst, s1)
+		if !oka || !okb { return }
+		off := bc_bin(&l.s.m, c, .And, b, bc_i32(&l.s.m, 0x1F))
+		w_sh := bc_bin(&l.s.m, c, .LShr, b, bc_i32(&l.s.m, 16))
+		wid := bc_bin(&l.s.m, c, .And, w_sh, bc_i32(&l.s.m, 0x7F))
+		op_id := u32(52) if name == "s_bfe_u32" else u32(51)
+		r := shader_op(&l.s, c, "tertiary.i32", .Read_None, l.s.t.i32, op_id, {wid, off, a})
+		set_i32(l, has_dst, dst_w, r)
+		set_bit(l, has_scc, scc_w, bc_cmp(&l.s.m, c, PRED_NE, r, bc_i32(&l.s.m, 0)))
+		return
+	}
+
+	if name == "s_abs_i32" {
+		if a, oka := lower_operand(l, inst, s0); oka {
+			neg := bc_bin(&l.s.m, c, .Sub, bc_i32(&l.s.m, 0), a)
+			is_neg := bc_cmp(&l.s.m, c, PRED_SLT, a, bc_i32(&l.s.m, 0))
+			r := bc_select(&l.s.m, c, is_neg, neg, a)
+			set_i32(l, has_dst, dst_w, r)
+			set_bit(l, has_scc, scc_w, bc_cmp(&l.s.m, c, PRED_NE, r, bc_i32(&l.s.m, 0)))
+		}
+		return
+	}
+
+	if name == "s_brev_b32" || name == "s_flbit_i32_b32" || name == "s_ff1_i32_b32" {
+		if a, oka := lower_operand(l, inst, s0); oka {
+			op_id := u32(30)
+			if name == "s_flbit_i32_b32" { op_id = 33 }
+			else if name == "s_ff1_i32_b32" { op_id = 32 }
+			r := shader_op(&l.s, c, "unaryBits.i32", .Read_None, l.s.t.i32, op_id, {a})
+			set_i32(l, has_dst, dst_w, r)
+		}
+		return
+	}
+
+	if name == "s_cmov_b32" {
+		scc_r, has_sr := inst_read(inst, reg_scc())
+		a, oka := lower_operand(l, inst, s0)
+		old_v, oko := lower_operand(l, inst, inst.fields.dst)
+		if has_sr && oka && oko {
+			if cond, okc := lower_get_bit(l, scc_r); okc {
+				set_i32(l, has_dst, dst_w, bc_select(&l.s.m, c, cond, a, old_v))
+			}
+		}
+		return
+	}
+
+	if name == "s_addc_u32" {
+		scc_r, has_sr := inst_read(inst, reg_scc())
+		a, oka := lower_operand(l, inst, s0)
+		b, okb := lower_operand(l, inst, s1)
+		if oka && okb {
+			carry := bc_i32(&l.s.m, 0)
+			if has_sr {
+				if cond, okc := lower_get_bit(l, scc_r); okc {
+					carry = bc_cast(&l.s.m, c, .ZExt, cond, l.s.t.i32)
+				}
+			}
+			s := bc_bin(&l.s.m, c, .Add, a, b)
+			r := bc_bin(&l.s.m, c, .Add, s, carry)
+			set_i32(l, has_dst, dst_w, r)
+			if has_scc {
+				c1 := bc_cmp(&l.s.m, c, PRED_IULT, s, a)
+				c2 := bc_cmp(&l.s.m, c, PRED_IULT, r, s)
+				set_bit(l, true, scc_w, bc_bin(&l.s.m, c, .Or, c1, c2))
+			}
+		}
+		return
+	}
 }
 
 lower_valu :: proc(l: ^Lower_Ctx, inst: ^Inst, guard: Maybe(V)) {
@@ -1680,7 +1983,16 @@ lower_valu :: proc(l: ^Lower_Ctx, inst: ^Inst, guard: Maybe(V)) {
 	}
 
 	write_f :: proc(lx: ^Lower_Ctx, inst: ^Inst, g: Maybe(V), fval: V) {
-		iv := bc_cast(&lx.s.m, lx.cur, .Bitcast, fval, lx.s.t.i32)
+		fv := fval
+		switch inst.fields.valu.omod {
+		case 1: fv = bc_bin(&lx.s.m, lx.cur, .Mul, fv, bc_f32_bits(&lx.s.m, 0x4000_0000)) // * 2.0
+		case 2: fv = bc_bin(&lx.s.m, lx.cur, .Mul, fv, bc_f32_bits(&lx.s.m, 0x4080_0000)) // * 4.0
+		case 3: fv = bc_bin(&lx.s.m, lx.cur, .Mul, fv, bc_f32_bits(&lx.s.m, 0x3F00_0000)) // * 0.5
+		}
+		if inst.fields.valu.clamp {
+			fv = shader_op(&lx.s, lx.cur, "unary.f32", .Read_None, lx.s.t.f32, 7, {fv})
+		}
+		iv := bc_cast(&lx.s.m, lx.cur, .Bitcast, fv, lx.s.t.i32)
 		write_v(lx, inst, g, iv)
 	}
 
@@ -1767,6 +2079,11 @@ lower_valu :: proc(l: ^Lower_Ctx, inst: ^Inst, guard: Maybe(V)) {
 		if wv, wok := inst_write(inst, out_reg); wok {
 			l.vals[wv] = Val{kind = .Bit, v = res}
 		}
+		if strings.has_prefix(name, "v_cmpx_") {
+			if ew, eok := inst_write(inst, reg_s(EXEC)); eok {
+				l.vals[ew] = Val{kind = .Bit, v = res}
+			}
+		}
 		return
 	}
 
@@ -1795,11 +2112,9 @@ lower_valu :: proc(l: ^Lower_Ctx, inst: ^Inst, guard: Maybe(V)) {
 		if !ok { return }
 		r: V
 		switch name {
-		case "v_rcp_f32":  r = bc_bin(&l.s.m, c, .UDiv, bc_f32_bits(&l.s.m, 0x3f80_0000), fa) // wait, fallback below
+		case "v_rcp_f32":  r = bc_bin(&l.s.m, c, .SDiv, bc_f32_bits(&l.s.m, 0x3f80_0000), fa)
 		case "v_sqrt_f32": r = shader_op(&l.s, c, "unary.f32", .Read_None, l.s.t.f32, 24, {fa})
-		case "v_rsq_f32":
-			sq := shader_op(&l.s, c, "unary.f32", .Read_None, l.s.t.f32, 24, {fa})
-			r = shader_op(&l.s, c, "unary.f32", .Read_None, l.s.t.f32, 25, {sq})
+		case "v_rsq_f32":  r = shader_op(&l.s, c, "unary.f32", .Read_None, l.s.t.f32, 25, {fa})
 		case "v_sin_f32":
 			twopi := bc_f32_bits(&l.s.m, transmute(u32)f32(2.0 * math.PI))
 			r = shader_op(&l.s, c, "unary.f32", .Read_None, l.s.t.f32, 13, {bc_bin(&l.s.m, c, .Mul, fa, twopi)})
@@ -1815,9 +2130,6 @@ lower_valu :: proc(l: ^Lower_Ctx, inst: ^Inst, guard: Maybe(V)) {
 		case "v_fract_f32":
 			fl := shader_op(&l.s, c, "unary.f32", .Read_None, l.s.t.f32, 27, {fa})
 			r = bc_bin(&l.s.m, c, .Sub, fa, fl)
-		}
-		if name == "v_rcp_f32" {
-			r = shader_op(&l.s, c, "unary.f32", .Read_None, l.s.t.f32, 25, {fa})
 		}
 		write_f(l, inst, guard, r)
 		return
@@ -1860,6 +2172,24 @@ lower_valu :: proc(l: ^Lower_Ctx, inst: ^Inst, guard: Maybe(V)) {
 			lo_m := bc_bin(&l.s.m, c, .And, ia, bc_i32(&l.s.m, 0xFFFF))
 			hi_s := bc_bin(&l.s.m, c, .Shl, ib, bc_i32(&l.s.m, 16))
 			write_v(l, inst, guard, bc_bin(&l.s.m, c, .Or, lo_m, hi_s))
+		}
+		return
+	}
+
+	if name == "v_cvt_f32_ubyte0" || name == "v_cvt_f32_ubyte1" || name == "v_cvt_f32_ubyte2" || name == "v_cvt_f32_ubyte3" {
+		if ia, ok := lower_operand(l, inst, inst.fields.valu.src[0]); ok {
+			sh := u32(0)
+			switch name {
+			case "v_cvt_f32_ubyte1": sh = 8
+			case "v_cvt_f32_ubyte2": sh = 16
+			case "v_cvt_f32_ubyte3": sh = 24
+			}
+			v := ia
+			if sh > 0 {
+				v = bc_bin(&l.s.m, c, .LShr, ia, bc_i32(&l.s.m, sh))
+			}
+			b := bc_bin(&l.s.m, c, .And, v, bc_i32(&l.s.m, 0xFF))
+			write_f(l, inst, guard, bc_cast(&l.s.m, c, .UiToFp, b, l.s.t.f32))
 		}
 		return
 	}
@@ -1927,7 +2257,41 @@ lower_valu :: proc(l: ^Lower_Ctx, inst: ^Inst, guard: Maybe(V)) {
 		return
 	}
 
-	if name == "v_fma_f32" || name == "v_mad_f32" || name == "v_fmac_f32" || name == "v_mac_f32" {
+	if (name == "v_min3_f32" || name == "v_max3_f32") && len(inst.fields.valu.src) >= 3 {
+		fa, oka := lower_foperand(l, inst, 0, inst.fields.valu.src[0])
+		fb, okb := lower_foperand(l, inst, 1, inst.fields.valu.src[1])
+		fc, okc := lower_foperand(l, inst, 2, inst.fields.valu.src[2])
+		if oka && okb && okc {
+			op_id := u32(36) if name == "v_min3_f32" else u32(35)
+			m1 := shader_op(&l.s, c, "binary.f32", .Read_None, l.s.t.f32, op_id, {fa, fb})
+			r := shader_op(&l.s, c, "binary.f32", .Read_None, l.s.t.f32, op_id, {m1, fc})
+			write_f(l, inst, guard, r)
+		}
+		return
+	}
+
+	if (name == "v_min3_i32" || name == "v_max3_i32" || name == "v_min3_u32" || name == "v_max3_u32") && len(inst.fields.valu.src) >= 3 {
+		ia, oka := lower_operand(l, inst, inst.fields.valu.src[0])
+		ib, okb := lower_operand(l, inst, inst.fields.valu.src[1])
+		ic, okc := lower_operand(l, inst, inst.fields.valu.src[2])
+		if oka && okb && okc {
+			op_id := u32(38)
+			switch name {
+			case "v_max3_i32": op_id = 37
+			case "v_min3_i32": op_id = 38
+			case "v_max3_u32": op_id = 39
+			case "v_min3_u32": op_id = 40
+			}
+			m1 := shader_op(&l.s, c, "binary.i32", .Read_None, l.s.t.i32, op_id, {ia, ib})
+			r := shader_op(&l.s, c, "binary.i32", .Read_None, l.s.t.i32, op_id, {m1, ic})
+			write_v(l, inst, guard, r)
+		}
+		return
+	}
+
+	if name == "v_fma_f32" || name == "v_mad_f32" || name == "v_fmac_f32" || name == "v_mac_f32" ||
+	   name == "v_fmamk_f32" || name == "v_fmaak_f32" || name == "v_madmk_f32" || name == "v_madak_f32" ||
+	   name == "v_fma_legacy_f32" || name == "v_mad_legacy_f32" || name == "v_fmac_legacy_f32" {
 		if len(inst.fields.valu.src) < 2 { return }
 		fa, oka := lower_foperand(l, inst, 0, inst.fields.valu.src[0])
 		fb, okb := lower_foperand(l, inst, 1, inst.fields.valu.src[1])
@@ -1989,6 +2353,19 @@ lower_valu :: proc(l: ^Lower_Ctx, inst: ^Inst, guard: Maybe(V)) {
 		return
 	}
 
+	if name == "v_bfi_b32" && len(inst.fields.valu.src) >= 3 {
+		ia, oka := lower_operand(l, inst, inst.fields.valu.src[0])
+		ib, okb := lower_operand(l, inst, inst.fields.valu.src[1])
+		ic, okc := lower_operand(l, inst, inst.fields.valu.src[2])
+		if oka && okb && okc {
+			ab := bc_bin(&l.s.m, c, .And, ia, ib)
+			na := bc_bin(&l.s.m, c, .Xor, ia, bc_i32(&l.s.m, 0xFFFF_FFFF))
+			nac := bc_bin(&l.s.m, c, .And, na, ic)
+			write_v(l, inst, guard, bc_bin(&l.s.m, c, .Or, ab, nac))
+		}
+		return
+	}
+
 	if (name == "v_mad_u32_u24" || name == "v_mad_i32_i24") && len(inst.fields.valu.src) >= 3 {
 		ia, oka := lower_operand(l, inst, inst.fields.valu.src[0])
 		ib, okb := lower_operand(l, inst, inst.fields.valu.src[1])
@@ -2000,7 +2377,125 @@ lower_valu :: proc(l: ^Lower_Ctx, inst: ^Inst, guard: Maybe(V)) {
 		return
 	}
 
+	if name == "v_not_b32" {
+		if ia, oka := lower_operand(l, inst, inst.fields.valu.src[0]); oka {
+			write_v(l, inst, guard, bc_bin(&l.s.m, c, .Xor, ia, bc_i32(&l.s.m, 0xFFFF_FFFF)))
+		}
+		return
+	}
+
+	if name == "v_bfrev_b32" || name == "v_ffbh_u32" || name == "v_ffbl_b32" || name == "v_ffbh_i32" {
+		if ia, oka := lower_operand(l, inst, inst.fields.valu.src[0]); oka {
+			op_id := u32(30)
+			switch name {
+			case "v_bfrev_b32": op_id = 30
+			case "v_ffbl_b32":  op_id = 32
+			case "v_ffbh_u32":  op_id = 33
+			case "v_ffbh_i32":  op_id = 34
+			}
+			write_v(l, inst, guard, shader_op(&l.s, c, "unaryBits.i32", .Read_None, l.s.t.i32, op_id, {ia}))
+		}
+		return
+	}
+
+	if name == "v_bcnt_u32_b32" && len(inst.fields.valu.src) >= 2 {
+		ia, oka := lower_operand(l, inst, inst.fields.valu.src[0])
+		ib, okb := lower_operand(l, inst, inst.fields.valu.src[1])
+		if oka && okb {
+			cnt := shader_op(&l.s, c, "unaryBits.i32", .Read_None, l.s.t.i32, 31, {ia})
+			write_v(l, inst, guard, bc_bin(&l.s.m, c, .Add, cnt, ib))
+		}
+		return
+	}
+
+	if (name == "v_bfe_u32" || name == "v_bfe_i32") && len(inst.fields.valu.src) >= 3 {
+		ia, oka := lower_operand(l, inst, inst.fields.valu.src[0])
+		ib, okb := lower_operand(l, inst, inst.fields.valu.src[1])
+		ic, okc := lower_operand(l, inst, inst.fields.valu.src[2])
+		if oka && okb && okc {
+			op_id := u32(52) if name == "v_bfe_u32" else u32(51)
+			// DXIL Ubfe/Ibfe takes (width, offset, value); RDNA2 takes (value, offset, width).
+			write_v(l, inst, guard, shader_op(&l.s, c, "tertiary.i32", .Read_None, l.s.t.i32, op_id, {ic, ib, ia}))
+		}
+		return
+	}
+
+	if (name == "v_alignbit_b32" || name == "v_alignbyte_b32") && len(inst.fields.valu.src) >= 3 {
+		hi, oka := lower_operand(l, inst, inst.fields.valu.src[0])
+		lo, okb := lower_operand(l, inst, inst.fields.valu.src[1])
+		sh_raw, okc := lower_operand(l, inst, inst.fields.valu.src[2])
+		if oka && okb && okc {
+			sh: V
+			if name == "v_alignbyte_b32" {
+				sh = bc_bin(&l.s.m, c, .Shl, bc_bin(&l.s.m, c, .And, sh_raw, bc_i32(&l.s.m, 3)), bc_i32(&l.s.m, 3))
+			} else {
+				sh = bc_bin(&l.s.m, c, .And, sh_raw, bc_i32(&l.s.m, 31))
+			}
+			is_zero := bc_cmp(&l.s.m, c, PRED_EQ, sh, bc_i32(&l.s.m, 0))
+			lo_part := bc_bin(&l.s.m, c, .LShr, lo, sh)
+			inv_sh := bc_bin(&l.s.m, c, .Sub, bc_i32(&l.s.m, 32), sh)
+			hi_part := bc_bin(&l.s.m, c, .Shl, hi, inv_sh)
+			comb := bc_bin(&l.s.m, c, .Or, lo_part, hi_part)
+			write_v(l, inst, guard, bc_select(&l.s.m, c, is_zero, lo, comb))
+		}
+		return
+	}
+
+	if (name == "v_add3_u32" || name == "v_lshl_add_u32" || name == "v_add_lshl_u32" || name == "v_lshl_or_b32" || name == "v_and_or_b32") && len(inst.fields.valu.src) >= 3 {
+		ia, oka := lower_operand(l, inst, inst.fields.valu.src[0])
+		ib, okb := lower_operand(l, inst, inst.fields.valu.src[1])
+		ic, okc := lower_operand(l, inst, inst.fields.valu.src[2])
+		if oka && okb && okc {
+			r: V
+			switch name {
+			case "v_add3_u32":
+				r = bc_bin(&l.s.m, c, .Add, bc_bin(&l.s.m, c, .Add, ia, ib), ic)
+			case "v_lshl_add_u32":
+				s := bc_bin(&l.s.m, c, .Shl, ia, bc_bin(&l.s.m, c, .And, ib, bc_i32(&l.s.m, 31)))
+				r = bc_bin(&l.s.m, c, .Add, s, ic)
+			case "v_add_lshl_u32":
+				s := bc_bin(&l.s.m, c, .Add, ia, ib)
+				r = bc_bin(&l.s.m, c, .Shl, s, bc_bin(&l.s.m, c, .And, ic, bc_i32(&l.s.m, 31)))
+			case "v_lshl_or_b32":
+				s := bc_bin(&l.s.m, c, .Shl, ia, bc_bin(&l.s.m, c, .And, ib, bc_i32(&l.s.m, 31)))
+				r = bc_bin(&l.s.m, c, .Or, s, ic)
+			case "v_and_or_b32":
+				r = bc_bin(&l.s.m, c, .Or, bc_bin(&l.s.m, c, .And, ia, ib), ic)
+			}
+			write_v(l, inst, guard, r)
+		}
+		return
+	}
+
+	if (name == "v_sub_co_u32" || name == "v_subrev_co_u32") && len(inst.fields.valu.src) >= 2 {
+		ia, oka := lower_operand(l, inst, inst.fields.valu.src[0])
+		ib, okb := lower_operand(l, inst, inst.fields.valu.src[1])
+		if oka && okb {
+			r := bc_bin(&l.s.m, c, .Sub, ia, ib) if name == "v_sub_co_u32" else bc_bin(&l.s.m, c, .Sub, ib, ia)
+			ca_reg := reg_s(VCC)
+			if inst.fields.valu.has_carry && inst.fields.valu.carry.kind == .Scalar {
+				ca_reg = reg_s(inst.fields.valu.carry.code)
+			}
+			if cw, cwok := inst_write(inst, ca_reg); cwok {
+				borrow := bc_cmp(&l.s.m, c, PRED_IUGT, r, ia) if name == "v_sub_co_u32" else bc_cmp(&l.s.m, c, PRED_IUGT, r, ib)
+				l.vals[cw] = Val{kind = .Bit, v = borrow}
+			}
+			write_v(l, inst, guard, r)
+		}
+		return
+	}
+
 	if name == "v_mbcnt_lo_u32_b32" || name == "v_mbcnt_hi_u32_b32" {
+		if name == "v_mbcnt_hi_u32_b32" && !l.p.wave64 {
+			if len(inst.fields.valu.src) >= 2 {
+				if ic, okc := lower_operand(l, inst, inst.fields.valu.src[1]); okc {
+					write_v(l, inst, guard, ic)
+					return
+				}
+			}
+			write_v(l, inst, guard, bc_i32(&l.s.m, 0))
+			return
+		}
 		li := shader_op(&l.s, c, "waveGetLaneIndex", .Read_None, l.s.t.i32, 111, {})
 		if len(inst.fields.valu.src) >= 2 {
 			if ic, okc := lower_operand(l, inst, inst.fields.valu.src[1]); okc {
@@ -2178,13 +2673,17 @@ lower_program :: proc(
 	l.samplers = make([dynamic][4]u32)
 	defer lower_destroy(&l)
 
-	if p.wave64 && (native.stage == .Cs || native.stage == .Ms) {
+	if p.wave64 && options.wave_mode == .Wave64 && (native.stage == .Cs || native.stage == .Ms) {
 		l.s.has_wave = true
 		l.s.wave_size = 64
 	}
 	if native.stage == .Cs && native.io.kind == .Cs {
 		l.s.has_threads = true
-		l.s.threads = native.io.cs.threads
+		l.s.threads = {
+			max(native.io.cs.threads[0], u32(1)),
+			max(native.io.cs.threads[1], u32(1)),
+			max(native.io.cs.threads[2], u32(1)),
+		}
 	} else if native.stage == .Ms && native.io.kind == .Ms {
 		ms := native.io.ms
 		l.s.has_threads = true
@@ -2333,10 +2832,282 @@ lower_program :: proc(
 				ex_err := lower_export(&l, site)
 				if ex_err != .None { return {}, ex_err }
 			case .Ds, .Buffer, .Image, .Flat:
-				if src, dok := l.desc_map[site]; dok && (src.kind == .Loaded || src.kind == .Built) && src.address.param < len(native.layout) {
-					if inst.fields.kind == .Buffer && strings.contains(name, "load") {
-						rp := native.layout[src.address.param]
-						h := shader_root_srv_handle(&l.s, rp.slot)
+				resolve_desc_slot :: proc(lx: ^Lower_Ctx, site: Site) -> (slot: u8, byte_off: u32, ok: bool) {
+					src, dok := lx.desc_map[site]
+					if !dok { return 0, 0, false }
+					addr := src.address
+					if src.kind == .Loaded {
+						if la, lok := lx.scalar_map[src.load]; lok {
+							addr = la
+						}
+					}
+					if addr.param >= 0 && addr.param < len(lx.native.layout) {
+						rp := lx.native.layout[addr.param]
+						return rp.slot, rp.table_offset_dwords * 4 + addr.offset + u32(src.first) * 4, true
+					}
+					return 0, 0, false
+				}
+				img_coord :: proc(lx: ^Lower_Ctx, inst: ^Inst, idx: int) -> (V, bool) {
+					if len(inst.fields.src) == 0 { return {}, false }
+					op: Operand
+					if idx < len(inst.fields.src) {
+						op = inst.fields.src[idx]
+					} else {
+						op = inst.fields.src[0]
+						op.code += u8(idx)
+					}
+					op.dwords = 1
+					return lower_operand(lx, inst, op)
+				}
+				if inst.fields.kind == .Image && strings.has_prefix(name, "image_store") && len(inst.fields.src) > 0 {
+					slot, byte_off, _ := resolve_desc_slot(&l, site)
+					xv, xok := img_coord(&l, inst, 0)
+					yv: V
+					yok := true
+					if inst.fields.a16 && xok {
+						yv = bc_bin(&l.s.m, l.cur, .LShr, xv, bc_i32(&l.s.m, 16))
+						xv = bc_bin(&l.s.m, l.cur, .And, xv, bc_i32(&l.s.m, 0xFFFF))
+					} else if xok {
+						if inst.fields.dim == 0 {
+							yv = bc_i32(&l.s.m, 0)
+						} else {
+							yv, yok = img_coord(&l, inst, 1)
+						}
+					}
+					if xok && yok {
+						uav_h := shader_tex_uav_handle(&l.s, slot, byte_off)
+						ui_u := bc_undef(&l.s.m, l.s.t.i32)
+						dmask := inst.fields.dmask
+						if dmask == 0 { dmask = 0xF }
+						ch_vals: [4]V
+						data_i := 0
+						for ch_idx in u32(0) ..< 4 {
+							if ((dmask >> ch_idx) & 1) != 0 && inst.fields.has_dst {
+								if inst.fields.d16 {
+									dop := inst.fields.dst
+									dop.code += u8(data_i / 2)
+									dop.dwords = 1
+									if dv, dok := lower_operand(&l, inst, dop); dok {
+										half := bc_bin(&l.s.m, l.cur, .LShr, dv, bc_i32(&l.s.m, 16)) if (data_i & 1) != 0 else bc_bin(&l.s.m, l.cur, .And, dv, bc_i32(&l.s.m, 0xFFFF))
+										ch_vals[ch_idx] = shader_op(&l.s, l.cur, "legacyF16ToF32", .Read_None, l.s.t.f32, 131, {half})
+									} else {
+										ch_vals[ch_idx] = bc_f32_bits(&l.s.m, 0)
+									}
+								} else {
+									dop := inst.fields.dst
+									dop.code += u8(data_i)
+									dop.dwords = 1
+									if dv, dok := lower_operand(&l, inst, dop); dok {
+										ch_vals[ch_idx] = bc_cast(&l.s.m, l.cur, .Bitcast, dv, l.s.t.f32)
+									} else {
+										ch_vals[ch_idx] = bc_f32_bits(&l.s.m, 0)
+									}
+								}
+								data_i += 1
+							} else {
+								ch_vals[ch_idx] = bc_f32_bits(&l.s.m, 0)
+							}
+						}
+						shader_op(&l.s, l.cur, "textureStore.f32", .No_Unwind, l.s.t.void_ty, 67,
+							{uav_h, xv, yv, ui_u, ch_vals[0], ch_vals[1], ch_vals[2], ch_vals[3], bc_i8(&l.s.m, dmask)})
+					}
+				} else if inst.fields.kind == .Image && strings.has_prefix(name, "image_get_resinfo") {
+					slot, byte_off, _ := resolve_desc_slot(&l, site)
+					mip := bc_i32(&l.s.m, 0)
+					if mv, mok := img_coord(&l, inst, 0); mok {
+						mip = mv
+					}
+					tex_h := shader_tex_srv_handle(&l.s, slot, byte_off)
+					dims_ret := shader_op(&l.s, l.cur, "getDimensions", .Read_None, l.s.t.dims, 72, {tex_h, mip})
+					dmask := inst.fields.dmask
+					if dmask == 0 { dmask = 0xF }
+					wi := 0
+					for ch_idx in u32(0) ..< 4 {
+						if ((dmask >> ch_idx) & 1) == 0 { continue }
+						if wi < len(inst.writes) {
+							l.vals[inst.writes[wi].val] = Val{kind = .I32, v = bc_extract(&l.s.m, l.cur, dims_ret, ch_idx)}
+							wi += 1
+						}
+					}
+				} else if inst.fields.kind == .Image && (strings.has_prefix(name, "image_sample") || strings.has_prefix(name, "image_load") || strings.has_prefix(name, "image_gather4")) && len(inst.fields.src) > 0 {
+					slot, byte_off, _ := resolve_desc_slot(&l, site)
+					is_load := strings.has_prefix(name, "image_load")
+					is_gather := strings.has_prefix(name, "image_gather4")
+					has_o := !is_load && (strings.has_suffix(name, "_o") || strings.contains(name, "_o_"))
+					has_b := !is_load && (strings.has_suffix(name, "_b") || strings.contains(name, "_b_"))
+					has_c := !is_load && (strings.has_suffix(name, "_c") || strings.contains(name, "_c_") || strings.contains(name, "_cd"))
+					has_d := !is_load && (strings.has_suffix(name, "_d") || strings.contains(name, "_d_") || strings.contains(name, "_cd"))
+					has_l := !is_load && (strings.has_suffix(name, "_l") || strings.contains(name, "_l_"))
+					has_lz := !is_load && (strings.has_suffix(name, "_lz") || strings.contains(name, "_lz_"))
+
+					cur_idx := 0
+					if has_o { cur_idx += 1 }
+					bias_idx := -1
+					if has_b { bias_idx = cur_idx; cur_idx += 1 }
+					ref_idx := -1
+					if has_c { ref_idx = cur_idx; cur_idx += 1 }
+					deriv_idx := -1
+					if has_d {
+						deriv_idx = cur_idx
+						cur_idx += 2 if inst.fields.dim == 0 else 4
+					}
+					u_idx := cur_idx
+					uv, uok := img_coord(&l, inst, u_idx)
+					uf, vf: V
+					vok := true
+					if is_load {
+						vv: V
+						if inst.fields.a16 && uok {
+							vv = bc_bin(&l.s.m, l.cur, .LShr, uv, bc_i32(&l.s.m, 16))
+							uv = bc_bin(&l.s.m, l.cur, .And, uv, bc_i32(&l.s.m, 0xFFFF))
+						} else if uok {
+							if inst.fields.dim == 0 {
+								vv = bc_i32(&l.s.m, 0)
+							} else {
+								vv, vok = img_coord(&l, inst, u_idx + 1)
+							}
+						}
+						if uok && vok {
+							mip_v := bc_i32(&l.s.m, 0)
+							if strings.contains(name, "_mip") {
+								mip_idx := u_idx + (1 if (inst.fields.dim == 0 || inst.fields.a16) else 2)
+								if mv, mok := img_coord(&l, inst, mip_idx); mok {
+									mip_v = mv
+								}
+							}
+							tex_h := shader_tex_srv_handle(&l.s, slot, byte_off)
+							ui_u := bc_undef(&l.s.m, l.s.t.i32)
+							res_ret := shader_op(&l.s, l.cur, "textureLoad.f32", .Read_Only, l.s.t.res_ret_f32, 66,
+								{tex_h, mip_v, uv, vv, ui_u, ui_u, ui_u, ui_u})
+							dmask := inst.fields.dmask
+							if dmask == 0 { dmask = 0xF }
+							wi := 0
+							for ch_idx in u32(0) ..< 4 {
+								if ((dmask >> ch_idx) & 1) == 0 { continue }
+								if wi < len(inst.writes) {
+									ch := bc_extract(&l.s.m, l.cur, res_ret, ch_idx)
+									l.vals[inst.writes[wi].val] = Val{kind = .I32, v = bc_cast(&l.s.m, l.cur, .Bitcast, ch, l.s.t.i32)}
+									wi += 1
+								}
+							}
+						}
+					} else {
+						if inst.fields.a16 && uok {
+							u16_v := bc_bin(&l.s.m, l.cur, .And, uv, bc_i32(&l.s.m, 0xFFFF))
+							v16_v := bc_bin(&l.s.m, l.cur, .LShr, uv, bc_i32(&l.s.m, 16))
+							uf = shader_op(&l.s, l.cur, "legacyF16ToF32", .Read_None, l.s.t.f32, 131, {u16_v})
+							vf = shader_op(&l.s, l.cur, "legacyF16ToF32", .Read_None, l.s.t.f32, 131, {v16_v})
+						} else if uok {
+							uf = bc_cast(&l.s.m, l.cur, .Bitcast, uv, l.s.t.f32)
+							if inst.fields.dim == 0 {
+								vf = bc_f32_bits(&l.s.m, 0x3F000000)
+							} else {
+								vv: V
+								vv, vok = img_coord(&l, inst, u_idx + 1)
+								if vok {
+									vf = bc_cast(&l.s.m, l.cur, .Bitcast, vv, l.s.t.f32)
+								}
+							}
+						}
+						if uok && vok {
+							tex_h := shader_tex_srv_handle(&l.s, slot, byte_off)
+							uf_u := bc_undef(&l.s.m, l.s.t.f32)
+							ui_u := bc_undef(&l.s.m, l.s.t.i32)
+							res_ret: V
+							if is_gather {
+								gather_ch := u32(0)
+								for b_i in u32(0) ..< 4 {
+									if ((inst.fields.dmask >> b_i) & 1) != 0 {
+										gather_ch = b_i
+										break
+									}
+								}
+								if has_c {
+									cmp_h := shader_cmp_sampler_handle(&l.s, 1)
+									ref_f := bc_f32_bits(&l.s.m, 0)
+									if rv, rok := img_coord(&l, inst, ref_idx); rok {
+										ref_f = bc_cast(&l.s.m, l.cur, .Bitcast, rv, l.s.t.f32)
+									}
+									res_ret = shader_op(&l.s, l.cur, "textureGatherCmp.f32", .Read_Only, l.s.t.res_ret_f32, 74,
+										{tex_h, cmp_h, uf, vf, uf_u, uf_u, ui_u, ui_u, bc_i32(&l.s.m, gather_ch), ref_f})
+								} else {
+									smp_h := shader_sampler_handle(&l.s, 0)
+									res_ret = shader_op(&l.s, l.cur, "textureGather.f32", .Read_Only, l.s.t.res_ret_f32, 73,
+										{tex_h, smp_h, uf, vf, uf_u, uf_u, ui_u, ui_u, bc_i32(&l.s.m, gather_ch)})
+								}
+								for ch_idx in u32(0) ..< 4 {
+									if int(ch_idx) < len(inst.writes) {
+										ch := bc_extract(&l.s.m, l.cur, res_ret, ch_idx)
+										l.vals[inst.writes[ch_idx].val] = Val{kind = .I32, v = bc_cast(&l.s.m, l.cur, .Bitcast, ch, l.s.t.i32)}
+									}
+								}
+							} else {
+								if has_c {
+									cmp_h := shader_cmp_sampler_handle(&l.s, 1)
+									ref_f := bc_f32_bits(&l.s.m, 0)
+									if rv, rok := img_coord(&l, inst, ref_idx); rok {
+										ref_f = bc_cast(&l.s.m, l.cur, .Bitcast, rv, l.s.t.f32)
+									}
+									if has_lz || has_l {
+										res_ret = shader_op(&l.s, l.cur, "sampleCmpLevelZero.f32", .Read_Only, l.s.t.res_ret_f32, 65,
+											{tex_h, cmp_h, uf, vf, uf_u, uf_u, ui_u, ui_u, ui_u, ref_f})
+									} else {
+										res_ret = shader_op(&l.s, l.cur, "sampleCmp.f32", .Read_Only, l.s.t.res_ret_f32, 64,
+											{tex_h, cmp_h, uf, vf, uf_u, uf_u, ui_u, ui_u, ui_u, ref_f, uf_u})
+									}
+								} else if has_d {
+									smp_h := shader_sampler_handle(&l.s, 0)
+									ddx_u, ddx_v, ddy_u, ddy_v := bc_f32_bits(&l.s.m, 0), bc_f32_bits(&l.s.m, 0), bc_f32_bits(&l.s.m, 0), bc_f32_bits(&l.s.m, 0)
+									if dv0, ok0 := img_coord(&l, inst, deriv_idx); ok0 { ddx_u = bc_cast(&l.s.m, l.cur, .Bitcast, dv0, l.s.t.f32) }
+									if inst.fields.dim == 0 {
+										if dv1, ok1 := img_coord(&l, inst, deriv_idx + 1); ok1 { ddy_u = bc_cast(&l.s.m, l.cur, .Bitcast, dv1, l.s.t.f32) }
+									} else {
+										if dv1, ok1 := img_coord(&l, inst, deriv_idx + 1); ok1 { ddx_v = bc_cast(&l.s.m, l.cur, .Bitcast, dv1, l.s.t.f32) }
+										if dv2, ok2 := img_coord(&l, inst, deriv_idx + 2); ok2 { ddy_u = bc_cast(&l.s.m, l.cur, .Bitcast, dv2, l.s.t.f32) }
+										if dv3, ok3 := img_coord(&l, inst, deriv_idx + 3); ok3 { ddy_v = bc_cast(&l.s.m, l.cur, .Bitcast, dv3, l.s.t.f32) }
+									}
+									res_ret = shader_op(&l.s, l.cur, "sampleGrad.f32", .Read_Only, l.s.t.res_ret_f32, 63,
+										{tex_h, smp_h, uf, vf, uf_u, uf_u, ui_u, ui_u, ui_u, ddx_u, ddx_v, uf_u, ddy_u, ddy_v, uf_u, uf_u})
+								} else if has_b {
+									smp_h := shader_sampler_handle(&l.s, 0)
+									bias_f := bc_f32_bits(&l.s.m, 0)
+									if bv, bok := img_coord(&l, inst, bias_idx); bok {
+										bias_f = bc_cast(&l.s.m, l.cur, .Bitcast, bv, l.s.t.f32)
+									}
+									res_ret = shader_op(&l.s, l.cur, "sampleBias.f32", .Read_Only, l.s.t.res_ret_f32, 61,
+										{tex_h, smp_h, uf, vf, uf_u, uf_u, ui_u, ui_u, ui_u, bias_f, uf_u})
+								} else if has_lz || has_l {
+									smp_h := shader_sampler_handle(&l.s, 0)
+									lod_f := bc_f32_bits(&l.s.m, 0)
+									if has_l {
+										lod_idx := u_idx + (1 if (inst.fields.dim == 0 || inst.fields.a16) else 2)
+										if lv, lok := img_coord(&l, inst, lod_idx); lok {
+											lod_f = bc_cast(&l.s.m, l.cur, .Bitcast, lv, l.s.t.f32)
+										}
+									}
+									res_ret = shader_op(&l.s, l.cur, "sampleLevel.f32", .Read_Only, l.s.t.res_ret_f32, 62,
+										{tex_h, smp_h, uf, vf, uf_u, uf_u, ui_u, ui_u, ui_u, lod_f})
+								} else {
+									smp_h := shader_sampler_handle(&l.s, 0)
+									res_ret = shader_op(&l.s, l.cur, "sample.f32", .Read_Only, l.s.t.res_ret_f32, 60,
+										{tex_h, smp_h, uf, vf, uf_u, uf_u, ui_u, ui_u, ui_u, uf_u})
+								}
+								dmask := inst.fields.dmask
+								if dmask == 0 { dmask = 0xF }
+								wi := 0
+								for ch_idx in u32(0) ..< 4 {
+									if ((dmask >> ch_idx) & 1) == 0 { continue }
+									if wi < len(inst.writes) {
+										ch := bc_extract(&l.s.m, l.cur, res_ret, ch_idx)
+										l.vals[inst.writes[wi].val] = Val{kind = .I32, v = bc_cast(&l.s.m, l.cur, .Bitcast, ch, l.s.t.i32)}
+										wi += 1
+									}
+								}
+							}
+						}
+					}
+				} else if inst.fields.kind == .Buffer && (strings.contains(name, "load") || strings.contains(name, "store")) {
+					if slot, _, dok := resolve_desc_slot(&l, site); dok {
 						byte_off := bc_i32(&l.s.m, u32(inst.fields.offset0))
 						if inst.fields.idxen && inst.fields.has_base {
 							iop := inst.fields.base
@@ -2365,10 +3136,36 @@ lower_program :: proc(
 								byte_off = bc_bin(&l.s.m, l.cur, .Add, byte_off, sv)
 							}
 						}
-						res_ret := shader_op(&l.s, l.cur, "rawBufferLoad.i32", .Read_Only, l.s.t.res_ret, 139, {h, byte_off, bc_undef(&l.s.m, l.s.t.i32), bc_i8(&l.s.m, 0xF), bc_i32(&l.s.m, 4)})
-						for w, wi in inst.writes {
-							if wi < 4 {
-								l.vals[w.val] = Val{kind = .I32, v = bc_extract(&l.s.m, l.cur, res_ret, u32(wi))}
+						if strings.contains(name, "store") {
+							h := shader_root_uav_handle(&l.s, slot)
+							cnt := int(inst.fields.dst.dwords) if inst.fields.has_dst else 1
+							if cnt < 1 { cnt = 1 }
+							if cnt > 4 { cnt = 4 }
+							mask := u8((u32(1) << u32(cnt)) - 1)
+							svals: [4]V
+							for k in 0 ..< 4 {
+								if k < cnt && inst.fields.has_dst {
+									dop := inst.fields.dst
+									dop.code += u8(k)
+									dop.dwords = 1
+									if dv, ok_d := lower_operand(&l, inst, dop); ok_d {
+										svals[k] = dv
+									} else {
+										svals[k] = bc_i32(&l.s.m, 0)
+									}
+								} else {
+									svals[k] = bc_undef(&l.s.m, l.s.t.i32)
+								}
+							}
+							shader_op(&l.s, l.cur, "rawBufferStore.i32", .No_Unwind, l.s.t.void_ty, 140,
+								{h, byte_off, bc_undef(&l.s.m, l.s.t.i32), svals[0], svals[1], svals[2], svals[3], bc_i8(&l.s.m, mask), bc_i32(&l.s.m, 4)})
+						} else {
+							h := shader_root_srv_handle(&l.s, slot)
+							res_ret := shader_op(&l.s, l.cur, "rawBufferLoad.i32", .Read_Only, l.s.t.res_ret, 139, {h, byte_off, bc_undef(&l.s.m, l.s.t.i32), bc_i8(&l.s.m, 0xF), bc_i32(&l.s.m, 4)})
+							for w, wi in inst.writes {
+								if wi < 4 {
+									l.vals[w.val] = Val{kind = .I32, v = bc_extract(&l.s.m, l.cur, res_ret, u32(wi))}
+								}
 							}
 						}
 					}
@@ -2400,6 +3197,7 @@ lower_program :: proc(
 		pairs := make([dynamic]struct { val: V, blk: int }, 0, len(blk.preds), context.temp_allocator)
 		for pred_b, k in blk.preds {
 			if l.block_map[pred_b] < 0 { continue }
+			l.cur = l.block_map[pred_b]
 			av := phi.args[k]
 			val_v: V
 			if is_bit {
@@ -2432,6 +3230,10 @@ lower_program :: proc(
 	for rs, i in l.s.root_srvs { hs.root_srvs[i] = rs.slot }
 	hs.root_uavs = make([dynamic]u8, len(l.s.root_uavs))
 	for ru, i in l.s.root_uavs { hs.root_uavs[i] = ru.slot }
+	hs.tex_srvs = make([dynamic]Tex_Srv_Ref, len(l.s.tex_srvs))
+	for ts, i in l.s.tex_srvs { hs.tex_srvs[i] = Tex_Srv_Ref{slot = ts.slot, byte_offset = ts.byte_offset} }
+	hs.tex_uavs = make([dynamic]Tex_Uav_Ref, len(l.s.tex_uavs))
+	for tu, i in l.s.tex_uavs { hs.tex_uavs[i] = Tex_Uav_Ref{slot = tu.slot, byte_offset = tu.byte_offset} }
 	hs.memory = l.s.memory != nil
 	hs.memory_writes = l.s.memory_dirty != nil
 	hs.view_addresses = l.s.view_addresses != nil

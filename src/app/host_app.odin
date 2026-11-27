@@ -801,6 +801,8 @@ g_boot_main_base: uintptr
 g_boot_main_size: uintptr
 @(private)
 g_boot_stage: string
+@(private)
+g_veh_commit_lock: i32
 
 @(private)
 boot_veh_handler :: proc "system" (info: ^VEH_EXCEPTION_POINTERS) -> i32 {
@@ -810,18 +812,41 @@ boot_veh_handler :: proc "system" (info: ^VEH_EXCEPTION_POINTERS) -> i32 {
 	code := info.ExceptionRecord.ExceptionCode
 	// Demand-commit uncommitted MEM_RESERVE title memory pages (>= 4 GiB) on access fault.
 	if code == 0xC0000005 && info.ContextRecord != nil {
+		// Recover from NULL callback/vtable calls from title code by returning 0 to caller.
+		if info.ExceptionRecord.ExceptionInformation[0] == 8 && info.ContextRecord.Rip == 0 && info.ContextRecord.Rsp >= 0x10000 {
+			ret_addr := (cast(^u64)uintptr(info.ContextRecord.Rsp))^
+			if g_boot_main_base != 0 && uintptr(ret_addr) >= g_boot_main_base && uintptr(ret_addr) < g_boot_main_base + g_boot_main_size {
+				info.ContextRecord.Rsp += 8
+				info.ContextRecord.Rip = ret_addr
+				info.ContextRecord.Rax = 0
+				return -1 // EXCEPTION_CONTINUE_EXECUTION
+			}
+		}
 		fault_va := info.ExceptionRecord.ExceptionInformation[1]
 		if fault_va >= 0x1_0000_0000 {
+			for sync.atomic_exchange(&g_veh_commit_lock, 1) != 0 {
+				win32.SwitchToThread()
+			}
+			defer sync.atomic_store(&g_veh_commit_lock, 0)
 			mbi: win32.MEMORY_BASIC_INFORMATION
 			if win32.VirtualQuery(rawptr(fault_va), &mbi, size_of(mbi)) != 0 &&
-			   mbi.State == win32.MEM_RESERVE && mbi.Type == 0x20000 && uintptr(mbi.AllocationBase) >= 0x1_0000_0000 {
-				page_base := fault_va & ~uintptr(0xFFFF)
-				if win32.VirtualAlloc(rawptr(page_base), 0x10000, win32.MEM_COMMIT, win32.PAGE_READWRITE) != nil {
-					return -1 // EXCEPTION_CONTINUE_EXECUTION
-				}
-				// Placeholder fallback: split and replace 64 KiB placeholder with committed RW memory.
-				_ = win32.VirtualFree(rawptr(page_base), 0x10000, win32.MEM_RELEASE | 0x2)
-				if vasperty_hle.XMemVirtualAlloc(rawptr(page_base), 0x10000, win32.MEM_COMMIT, 0, win32.PAGE_READWRITE) != nil {
+			   mbi.Type == 0x20000 && uintptr(mbi.AllocationBase) >= 0x1_0000_0000 {
+				if mbi.State == win32.MEM_RESERVE {
+					page_base := fault_va & ~uintptr(0xFFFF)
+					if win32.VirtualAlloc(rawptr(page_base), 0x10000, win32.MEM_COMMIT, win32.PAGE_READWRITE) != nil {
+						return -1 // EXCEPTION_CONTINUE_EXECUTION
+					}
+					// Placeholder fallback: split and replace 64 KiB placeholder with committed RW memory.
+					_ = win32.VirtualFree(rawptr(page_base), 0x10000, win32.MEM_RELEASE | 0x2)
+					if vasperty_hle.XMemVirtualAlloc(rawptr(page_base), 0x10000, win32.MEM_COMMIT, 0, win32.PAGE_READWRITE) != nil {
+						return -1 // EXCEPTION_CONTINUE_EXECUTION
+					}
+					if win32.VirtualQuery(rawptr(fault_va), &mbi, size_of(mbi)) != 0 &&
+					   mbi.State == win32.MEM_COMMIT && (mbi.Protect == win32.PAGE_READWRITE || mbi.Protect == win32.PAGE_EXECUTE_READWRITE) {
+						return -1 // EXCEPTION_CONTINUE_EXECUTION
+					}
+				} else if mbi.State == win32.MEM_COMMIT && (mbi.Protect == win32.PAGE_READWRITE || mbi.Protect == win32.PAGE_EXECUTE_READWRITE) {
+					// Another thread committed this MEM_RESERVE page concurrently while this thread entered VEH.
 					return -1 // EXCEPTION_CONTINUE_EXECUTION
 				}
 			}
@@ -971,8 +996,14 @@ boot_veh_handler :: proc "system" (info: ^VEH_EXCEPTION_POINTERS) -> i32 {
 			}
 		}
 		ctx := info.ContextRecord
-		fmt.eprintf("  RAX=0x%X RCX=0x%X RDX=0x%X R8=0x%X R9=0x%X RSP=0x%X\n",
-			ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.R8, ctx.R9, ctx.Rsp)
+		if code == 0xC0000005 && g_boot_main_base != 0 && uintptr(ctx.Rip) >= g_boot_main_base + 16 && uintptr(ctx.Rip) + 16 <= g_boot_main_base + g_boot_main_size {
+			cb := cast([^]u8)uintptr(ctx.Rip - 16)
+			fmt.eprintf("  [code-16..+16]")
+			for i in 0 ..< 32 { fmt.eprintf(" %02X", cb[i]) }
+			fmt.eprintf("\n")
+		}
+		fmt.eprintf("  RAX=0x%X RCX=0x%X RDX=0x%X RBX=0x%X R8=0x%X R9=0x%X R11=0x%X RSP=0x%X\n",
+			ctx.Rax, ctx.Rcx, ctx.Rdx, ctx.Rbx, ctx.R8, ctx.R9, ctx.R11, ctx.Rsp)
 		if ctx.Rsp != 0 {
 			sp := cast([^]uintptr)uintptr(ctx.Rsp)
 			for i in 0 ..< 48 {
@@ -1136,16 +1167,61 @@ app_run :: proc(
 			exp_names = make([dynamic]string, 0, len(s_prep.info.exports)),
 		}
 		exps := make([dynamic]vasperty_hle.Hle_Export, 0, len(s_prep.info.exports), context.temp_allocator)
+		// Bink2 fast-forward stubs: only BinkNextFrame advances FrameNum (hdr[3]);
+		// BinkDoFrame* only records LastFrameNum (hdr[4] = hdr[3]), and BinkDoFrameAsyncWait
+		// returns 1 (done) without mutating header fields so polling/close cannot race.
+		bink_mark_decoded :: proc "system" (bnk: rawptr, advance: u32) {
+			if uintptr(bnk) >= 0x10000 {
+				hdr := cast([^]u32)bnk
+				frames := hdr[2]
+				cur := hdr[3]
+				if frames > 0 && frames < 1_000_000 {
+					hdr[4] = cur
+					if advance > 0 && cur < frames {
+						hdr[3] = cur + advance if cur + advance <= frames else frames
+					}
+				}
+			}
+		}
+		bink_do_frame :: proc "system" (bnk: rawptr) -> i32 {
+			bink_mark_decoded(bnk, 0)
+			return 0
+		}
+		bink_do_frame_async :: proc "system" (bnk: rawptr) -> i32 {
+			bink_mark_decoded(bnk, 3)
+			return 1
+		}
+		bink_async_wait :: proc "system" (_bnk: rawptr) -> i32 { return 1 }
+		bink_wait_zero :: proc "system" (_bnk: rawptr) -> i32 { return 0 }
+		bink_next_frame :: proc "system" (bnk: rawptr) {
+			bink_mark_decoded(bnk, 2)
+		}
+		is_bink_dll := strings.contains(low, "bink")
 		for &exp in s_prep.info.exports {
 			if !exp.has_rva { continue }
+			addr := s_base + uintptr(exp.rva)
+			if is_bink_dll {
+				switch exp.name {
+				case "BinkDoFrame", "BinkDoFramePlane":
+					addr = uintptr(rawptr(bink_do_frame))
+				case "BinkWait":
+					addr = uintptr(rawptr(bink_wait_zero))
+				case "BinkNextFrame":
+					addr = uintptr(rawptr(bink_next_frame))
+				case "BinkDoFrameAsync", "BinkDoFrameAsyncMulti":
+					addr = uintptr(rawptr(bink_do_frame_async))
+				case "BinkDoFrameAsyncWait":
+					addr = uintptr(rawptr(bink_async_wait))
+				}
+			}
 			if len(exp.name) > 0 {
 				nm := strings.clone(exp.name)
 				append(&sib_rec.exp_names, nm)
-				append(&exps, vasperty_hle.Hle_Export{name = nm, address = s_base + uintptr(exp.rva)})
+				append(&exps, vasperty_hle.Hle_Export{name = nm, address = addr})
 			}
 			ord_nm := fmt.aprintf("#%d", exp.ordinal)
 			append(&sib_rec.exp_names, ord_nm)
-			append(&exps, vasperty_hle.Hle_Export{name = ord_nm, address = s_base + uintptr(exp.rva)})
+			append(&exps, vasperty_hle.Hle_Export{name = ord_nm, address = addr})
 		}
 		dll_arr := [1]string{sib_rec.dll_name}
 		vasperty_hle.register_module(sib_rec.dll_name, dll_arr[:], exps[:])

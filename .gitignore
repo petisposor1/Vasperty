@@ -76,3 +76,9 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# Debug logs & local dumps
+*.log
+*.bmp
+*.raw
+*.tmp

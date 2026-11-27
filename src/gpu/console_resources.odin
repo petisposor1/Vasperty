@@ -241,9 +241,12 @@ Console_Resource :: struct {
 	owns_mem:    bool,
 	mem_attrs:   u64,
 	parent_heap: This,
-	host_tex:    rawptr,
-	host_state:  u32,
-	was_drawn:   bool,
+	host_tex:       rawptr,
+	host_state:     u32,
+	was_drawn:      bool,
+	gpu_written:    bool, // target of a texture copy; CPU memory is not authoritative
+	cpu_uploaded:   bool,
+	cpu_upload_sig: u64,
 }
 
 @(private)
@@ -351,6 +354,10 @@ ensure_host_texture :: proc(r: ^Console_Resource) -> (rawptr, u32) {
 	sample_quality := r.desc.SampleQuality if sample_count > 1 else u32(0)
 	mip_levels := u16(1) if sample_count > 1 else r.desc.MipLevels
 	height := u32(1) if r.desc.Dimension == 2 else max(r.desc.Height, u32(1))
+	host_fmt := map_host_texture_format(r.desc.Format)
+	if r.desc.Dimension == 3 && (flags & 0x2) == 0 && sample_count == 1 && format_supports_typed_uav_store(host_fmt, true) {
+		flags |= 0x4 // D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+	}
 
 	pc_desc := D3D12_RESOURCE_DESC{
 		Dimension        = r.desc.Dimension,
@@ -359,7 +366,7 @@ ensure_host_texture :: proc(r: ^Console_Resource) -> (rawptr, u32) {
 		Height           = height,
 		DepthOrArraySize = max(r.desc.DepthOrArraySize, u16(1)),
 		MipLevels        = mip_levels,
-		Format           = map_host_texture_format(r.desc.Format),
+		Format           = host_fmt,
 		SampleCount      = sample_count,
 		SampleQuality    = sample_quality,
 		Layout           = 0,
@@ -375,8 +382,14 @@ ensure_host_texture :: proc(r: ^Console_Resource) -> (rawptr, u32) {
 	res_iid := IID_ID3D12Resource_G
 	tex: rawptr
 	hr := dvt.CreateCommittedResource(hdev, &heap_props, 0, &pc_desc, 0, nil, &res_iid, &tex)
+	if (hr < 0 || tex == nil) && (pc_desc.Flags & 0x4) != 0 && (pc_desc.Flags & 0x2) == 0 {
+		// Retry without ALLOW_UNORDERED_ACCESS (e.g. A8_UNORM or other non-UAV formats) while preserving ALLOW_RENDER_TARGET.
+		pc_desc.Flags &= ~u32(0x4)
+		tex = nil
+		hr = dvt.CreateCommittedResource(hdev, &heap_props, 0, &pc_desc, 0, nil, &res_iid, &tex)
+	}
 	if (hr < 0 || tex == nil) && pc_desc.Flags != 0 && (pc_desc.Flags & 0x2) == 0 {
-		// Fallback for non-depth formats that reject ALLOW_RENDER_TARGET or ALLOW_UNORDERED_ACCESS.
+		// Fallback for non-depth formats that reject ALLOW_RENDER_TARGET.
 		pc_desc.Flags = 0
 		tex = nil
 		hr = dvt.CreateCommittedResource(hdev, &heap_props, 0, &pc_desc, 0, nil, &res_iid, &tex)
@@ -744,20 +757,74 @@ device_create_cbv :: proc "system" (this: This, desc: rawptr, handle: u64) {
 	}
 }
 
+SRV_RECORD_TAG :: u32(0x56525376) // "vSRV"
+
+Srv_Record :: struct {
+	tag:      u32,
+	format:   u32,
+	resource: This,
+	view_dim: u32,
+	comp_map: u32,
+}
+
+#assert(size_of(Srv_Record) == 24)
+
 device_create_srv :: proc "system" (this: This, resource: This, desc: rawptr, handle: u64) {
 	_ = this
 	if handle < 0x10000 { return }
-	dst := cast(^[4]u64)rawptr(uintptr(handle))
-	dst[0] = u64(uintptr(resource))
-	dst[1] = u64(uintptr(desc))
+	rec := cast(^Srv_Record)rawptr(uintptr(handle))
+	fmt_val: u32 = 0
+	dim_val: u32 = 0
+	cmap_val: u32 = 5768 // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
+	if uintptr(desc) >= 0x10000 {
+		d := cast([^]u32)desc
+		fmt_val = d[0]
+		dim_val = d[1]
+		if d[2] != 0 {
+			cmap_val = d[2]
+		}
+	}
+	rec^ = Srv_Record{
+		tag      = SRV_RECORD_TAG,
+		format   = fmt_val,
+		resource = resource,
+		view_dim = dim_val,
+		comp_map = cmap_val,
+	}
 }
+
+UAV_RECORD_TAG :: u32(0x56415576) // "vUAV"
+
+Uav_Record :: struct {
+	tag:       u32,
+	format:    u32,
+	resource:  This,
+	view_dim:  u32,
+	mip_slice: u32,
+}
+
+#assert(size_of(Uav_Record) == 24)
 
 device_create_uav :: proc "system" (this: This, resource: This, counter: This, desc: rawptr, handle: u64) {
 	_ = this; _ = counter
 	if handle < 0x10000 { return }
-	dst := cast(^[4]u64)rawptr(uintptr(handle))
-	dst[0] = u64(uintptr(resource))
-	dst[1] = u64(uintptr(desc))
+	rec := cast(^Uav_Record)rawptr(uintptr(handle))
+	fmt_val: u32 = 0
+	dim_val: u32 = 0
+	mip_val: u32 = 0
+	if uintptr(desc) >= 0x10000 {
+		d := cast([^]u32)desc
+		fmt_val = d[0]
+		dim_val = d[1]
+		mip_val = d[2]
+	}
+	rec^ = Uav_Record{
+		tag       = UAV_RECORD_TAG,
+		format    = fmt_val,
+		resource  = resource,
+		view_dim  = dim_val,
+		mip_slice = mip_val,
+	}
 }
 
 RTV_RECORD_TAG :: u32(0x56545276) // "vRTV"
@@ -815,12 +882,83 @@ device_create_sampler_x :: proc "system" (this: This, desc: rawptr, handle: u64)
 	}
 }
 
-device_create_placed_view :: proc "system" (this: This, res_desc: rawptr, view_desc: rawptr, handle: u64) {
+device_create_placed_view :: proc "system" (this: This, res_desc: rawptr, view_desc: rawptr, handle: u64, x5: u64, x6: u64) {
 	_ = this
 	if handle < 0x10000 { return }
+	_ = x6
+	vslot := decode_vtable_slot(intrinsics.return_address()) / 8
+	context = gpu_context()
+	if uintptr(res_desc) > 0x10000 && x5 > 0x10000 {
+		rd := cast(^D3D12_RESOURCE_DESC)res_desc
+		if vslot == 71 {
+			// Texture2D UAV placed directly over game memory at address x5 (vtable slot 71).
+			fmt_val: u32 = 0
+			dim_val: u32 = 4
+			mip_val: u32 = 0
+			if uintptr(view_desc) > 0x10000 {
+				vd := cast([^]u32)view_desc
+				fmt_val = vd[0]
+				dim_val = vd[1]
+				mip_val = vd[2]
+			}
+			if rd.Dimension == 3 && dim_val == 4 && rd.Width > 0 && rd.Height > 0 {
+				cr := placed_view_resource(x5, rd^)
+				if cr != nil {
+					rec := cast(^Uav_Record)rawptr(uintptr(handle))
+					rec^ = Uav_Record{
+						tag       = UAV_RECORD_TAG,
+						format    = fmt_val,
+						resource  = This(cr),
+						view_dim  = dim_val,
+						mip_slice = mip_val,
+					}
+					return
+				}
+			}
+		} else if uintptr(view_desc) > 0x10000 {
+			vd := cast([^]u32)view_desc
+			// Texture2D SRV placed directly over game memory at address x5 (vtable slot 70).
+			if rd.Dimension == 3 && vd[1] == 4 && rd.Width > 0 && rd.Height > 0 {
+				cr := placed_view_resource(x5, rd^)
+				if cr != nil {
+					rec := cast(^Srv_Record)rawptr(uintptr(handle))
+					rec^ = Srv_Record{
+						tag      = SRV_RECORD_TAG,
+						format   = vd[0],
+						resource = This(cr),
+						view_dim = vd[1],
+						comp_map = vd[2] if vd[2] != 0 else 5768,
+					}
+					return
+				}
+			}
+		}
+	}
 	dst := cast(^[4]u64)rawptr(uintptr(handle))
 	dst[0] = u64(uintptr(res_desc))
 	dst[1] = u64(uintptr(view_desc))
+}
+
+@(private="file") g_placed_mu: sync.Mutex
+@(private="file") g_placed_cache: map[u64]^Console_Resource
+
+placed_view_resource :: proc(addr: u64, desc: D3D12_RESOURCE_DESC) -> ^Console_Resource {
+	sync.mutex_lock(&g_placed_mu)
+	defer sync.mutex_unlock(&g_placed_mu)
+	if cr, ok := g_placed_cache[addr]; ok && cr != nil {
+		d := cr.desc
+		if d.Width == desc.Width && d.Height == desc.Height && d.Format == desc.Format && d.Layout == desc.Layout && d.MipLevels == desc.MipLevels {
+			return cr
+		}
+	}
+	props := D3D12_HEAP_PROPERTIES{Type = 4, CPUPageProperty = 3, MemoryPoolPreference = 1, CreationNodeMask = 1, VisibleNodeMask = 1}
+	out: rawptr
+	if make_console_resource(desc, props, 0, addr, false, nil, &out) < 0 || out == nil {
+		return nil
+	}
+	cr := cast(^Console_Resource)out
+	g_placed_cache[addr] = cr
+	return cr
 }
 
 device_copy_descriptors_simple :: proc "system" (this: This, count: u32, dst: u64, src: u64, kind: u32) {
@@ -894,6 +1032,7 @@ Console_Pipeline :: struct #align(16) {
 	rt_formats:     [8]u32,
 	num_rts:        u32,
 	dsv_format:     u32,
+	ib_strip_cut:   u32,
 	topology_type:  u32,
 	has_blend:      bool,
 	blend_desc:     D3D12_BLEND_DESC,
@@ -903,15 +1042,19 @@ Console_Pipeline :: struct #align(16) {
 	rast_desc:      D3D12_RASTERIZER_DESC,
 	vs_ud_param:    i32,
 	vs_ud_dwords:   u32,
-	ps_ud_param:    i32,
-	ps_ud_dwords:   u32,
-	root_bindings:  [dynamic]Host_Root_Binding,
+	ps_ud_param:        i32,
+	ps_ud_dwords:       u32,
+	ps_tex_table_param: i32,
+	cs_tex_table_param: i32,
+	cs_uav_table_param: i32,
+	root_bindings:      [dynamic]Host_Root_Binding,
 	host_attempted: bool,
 	host_root:      rawptr,
 	host_pso:       rawptr,
 	vs_shader:      vasperty_shader.Host_Shader,
 	ps_shader:      vasperty_shader.Host_Shader,
 	cs_shader:      vasperty_shader.Host_Shader,
+	pso_id:         u32,
 	mu:             sync.Mutex,
 }
 
@@ -1192,6 +1335,8 @@ device_create_pso_stream :: proc "system" (this: This, desc: rawptr, iid: ^Iid, 
 							append(&p.input_elems, e)
 						}
 					}
+				case 13: // IBStripCutValue
+					p.ib_strip_cut = (cast(^u32)rawptr(base + 4))^
 				case 14: // PrimitiveTopologyType
 					p.topology_type = (cast(^u32)rawptr(base + 4))^
 				case 15: // RTFormats

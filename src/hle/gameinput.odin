@@ -134,6 +134,7 @@ GameInput_Reading :: struct {
 @(private) gi_xinput_loaded: bool
 @(private) gi_xinput_get_state: proc "system" (user_index: u32, state: ^XInput_State) -> u32
 @(private) gi_joy_get_pos_ex: proc "system" (joy_id: u32, pji: ^Joy_Info_Ex) -> u32
+@(private) gi_get_async_key_state: proc "system" (vk: i32) -> i16
 
 @(private) gi_device_info := GameInput_Device_Info {
 	info_size        = size_of(GameInput_Device_Info),
@@ -186,14 +187,16 @@ gi_ensure_init :: proc() {
 		if jfn, jok := host_fn("winmm.dll", "joyGetPosEx", proc "system" (u32, ^Joy_Info_Ex) -> u32); jok {
 			gi_joy_get_pos_ex = jfn
 		}
+		if kfn, kok := host_fn("user32.dll", "GetAsyncKeyState", proc "system" (i32) -> i16); kok {
+			gi_get_async_key_state = kfn
+		}
 	}
 }
 
 @(private)
 gi_key_down :: proc(vk: i32) -> bool {
-	fn, ok := host_fn("user32.dll", "GetAsyncKeyState", proc "system" (i32) -> i16)
-	if !ok { return false }
-	return (u16(fn(vk)) & 0x8000) != 0
+	if gi_get_async_key_state == nil { return false }
+	return (u16(gi_get_async_key_state(vk)) & 0x8000) != 0
 }
 
 @(private)
@@ -312,34 +315,26 @@ gi_sample_gamepad :: proc() -> GameInput_Gamepad_State {
 	// 3. Optional automated menu progression for unattended boot tests
 	if gi_auto_press_a {
 		elapsed_ms := u64(time.duration_milliseconds(time.tick_since(gi_start_tick)))
-		if elapsed_ms >= 8000 && elapsed_ms < 70000 {
-			if (elapsed_ms % 2000) < 250 {
+		if elapsed_ms >= 3000 && elapsed_ms < 40000 {
+			// Pass Text Size / Account / Legal / Intro: press A every 1.5s
+			if ((elapsed_ms - 3000) % 1500) < 200 {
 				st.buttons |= GAMEINPUT_GAMEPAD_A
 			}
-		} else if elapsed_ms >= 70000 && elapsed_ms < 90000 {
-			// Pass Legal Notices: D-Pad Down twice + A
-			phase := (elapsed_ms - 70000) % 6000
-			if phase >= 500 && phase < 750 {
-				st.buttons |= GAMEINPUT_GAMEPAD_DPAD_DOWN
-			} else if phase >= 1500 && phase < 1750 {
-				st.buttons |= GAMEINPUT_GAMEPAD_DPAD_DOWN
-			} else if phase >= 2500 && phase < 2750 {
-				st.buttons |= GAMEINPUT_GAMEPAD_A
-			}
-		} else if elapsed_ms >= 90000 && elapsed_ms < 110000 {
-			// Rockstar Terms & Policies: Up, Up, A (check Privacy), Down, A (check ToS), Down, A (Confirm & Start Game!)
-			t := elapsed_ms - 90000
-			if t >= 1000 && t < 1250 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_UP }
-			if t >= 2500 && t < 2750 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_UP }
-			if t >= 4000 && t < 4250 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_UP }
-			if t >= 6000 && t < 6250 { st.buttons |= GAMEINPUT_GAMEPAD_A }
-			if t >= 8000 && t < 8250 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_DOWN }
-			if t >= 10000 && t < 10250 { st.buttons |= GAMEINPUT_GAMEPAD_A }
-			if t >= 12000 && t < 12250 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_DOWN }
-			if t >= 14000 && t < 14250 { st.buttons |= GAMEINPUT_GAMEPAD_A }
-			if t >= 16500 && t < 16750 { st.buttons |= GAMEINPUT_GAMEPAD_A }
-		} else if elapsed_ms >= 110000 {
-			if (elapsed_ms % 3000) < 250 {
+		} else if elapsed_ms >= 45000 && elapsed_ms < 60000 {
+			// Rockstar Terms & Policies: Up, Up, Up, A (Privacy), Down, A (ToS), Down, A (Confirm), A
+			t := elapsed_ms - 45000
+			if t >= 500 && t < 700 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_UP }
+			if t >= 1700 && t < 1900 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_UP }
+			if t >= 2900 && t < 3100 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_UP }
+			if t >= 4100 && t < 4300 { st.buttons |= GAMEINPUT_GAMEPAD_A }
+			if t >= 5300 && t < 5500 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_DOWN }
+			if t >= 6500 && t < 6700 { st.buttons |= GAMEINPUT_GAMEPAD_A }
+			if t >= 7700 && t < 7900 { st.buttons |= GAMEINPUT_GAMEPAD_DPAD_DOWN }
+			if t >= 8900 && t < 9100 { st.buttons |= GAMEINPUT_GAMEPAD_A }
+			if t >= 10100 && t < 10300 { st.buttons |= GAMEINPUT_GAMEPAD_A }
+		} else if elapsed_ms >= 60000 {
+			// Main Menu -> Story Mode -> 3D World: press A every 2.0s
+			if ((elapsed_ms - 60000) % 2000) < 200 {
 				st.buttons |= GAMEINPUT_GAMEPAD_A
 			}
 		}

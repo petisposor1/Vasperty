@@ -43,6 +43,17 @@ D3D12_ROOT_DESCRIPTOR_TABLE1 :: struct {
 }
 
 @(private)
+D3D12_DESCRIPTOR_RANGE1 :: struct {
+	RangeType:                         u32,
+	NumDescriptors:                    u32,
+	BaseShaderRegister:                u32,
+	RegisterSpace:                     u32,
+	Flags:                             u32,
+	OffsetInDescriptorsFromTableStart: u32,
+}
+#assert(size_of(D3D12_DESCRIPTOR_RANGE1) == 24)
+
+@(private)
 D3D12_ROOT_CONSTANTS :: struct {
 	ShaderRegister: u32,
 	RegisterSpace:  u32,
@@ -327,10 +338,29 @@ build_host_root_signature :: proc(hdev: rawptr, p: ^Console_Pipeline) -> rawptr 
 	p.vs_ud_dwords = 0
 	p.ps_ud_param = -1
 	p.ps_ud_dwords = 0
+	p.ps_tex_table_param = -1
+	p.cs_tex_table_param = -1
+	p.cs_uav_table_param = -1
 	clear(&p.root_bindings)
 
 	params := make([dynamic]D3D12_ROOT_PARAMETER1, 0, 12, context.temp_allocator)
 	samplers := make([dynamic]D3D12_STATIC_SAMPLER_DESC, 0, 16, context.temp_allocator)
+	tex_range := D3D12_DESCRIPTOR_RANGE1{
+		RangeType                         = 0,
+		NumDescriptors                    = 16,
+		BaseShaderRegister                = 0,
+		RegisterSpace                     = vasperty_shader.TEX_SRV_SPACE,
+		Flags                             = 0x2,
+		OffsetInDescriptorsFromTableStart = 0,
+	}
+	uav_range := D3D12_DESCRIPTOR_RANGE1{
+		RangeType                         = 1,
+		NumDescriptors                    = 16,
+		BaseShaderRegister                = 0,
+		RegisterSpace                     = vasperty_shader.TEX_UAV_SPACE,
+		Flags                             = 0x2,
+		OffsetInDescriptorsFromTableStart = 0,
+	}
 
 	if p.is_compute {
 		ud := min(vasperty_shader.host_shader_user_data_dwords(&p.cs_shader), u32(64))
@@ -344,6 +374,44 @@ build_host_root_signature :: proc(hdev: rawptr, p: ^Console_Pipeline) -> rawptr 
 			})
 		}
 		append_shader_root_bindings(&p.cs_shader, D3D12_SHADER_VISIBILITY_ALL, &params, &samplers, &p.root_bindings)
+		if len(p.cs_shader.tex_srvs) > 0 {
+			p.cs_tex_table_param = i32(len(params))
+			append(&params, D3D12_ROOT_PARAMETER1{
+				ParameterType    = 0,
+				DescriptorTable  = D3D12_ROOT_DESCRIPTOR_TABLE1{
+					NumDescriptorRanges = 1,
+					pDescriptorRanges   = &tex_range,
+				},
+				ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL,
+			})
+			if len(samplers) == 0 {
+				append(&samplers, D3D12_STATIC_SAMPLER_DESC{
+					Filter           = 0x15,
+					AddressU         = 3,
+					AddressV         = 3,
+					AddressW         = 3,
+					MaxAnisotropy    = 1,
+					ComparisonFunc   = 1,
+					BorderColor      = 0,
+					MinLOD           = 0,
+					MaxLOD           = 3.4028235e+38,
+					ShaderRegister   = 0,
+					RegisterSpace    = vasperty_shader.SAMPLER_SPACE,
+					ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL,
+				})
+			}
+		}
+		if len(p.cs_shader.tex_uavs) > 0 {
+			p.cs_uav_table_param = i32(len(params))
+			append(&params, D3D12_ROOT_PARAMETER1{
+				ParameterType    = 0,
+				DescriptorTable  = D3D12_ROOT_DESCRIPTOR_TABLE1{
+					NumDescriptorRanges = 1,
+					pDescriptorRanges   = &uav_range,
+				},
+				ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL,
+			})
+		}
 	} else {
 		vs_ud := min(vasperty_shader.host_shader_user_data_dwords(&p.vs_shader), u32(64))
 		if vs_ud > 0 {
@@ -370,6 +438,33 @@ build_host_root_signature :: proc(hdev: rawptr, p: ^Console_Pipeline) -> rawptr 
 		append_shader_root_bindings(&p.vs_shader, D3D12_SHADER_VISIBILITY_VERTEX, &params, &samplers, &p.root_bindings)
 		if len(p.ps_shader.dxil) > 0 {
 			append_shader_root_bindings(&p.ps_shader, D3D12_SHADER_VISIBILITY_PIXEL, &params, &samplers, &p.root_bindings)
+			if len(p.ps_shader.tex_srvs) > 0 {
+				p.ps_tex_table_param = i32(len(params))
+				append(&params, D3D12_ROOT_PARAMETER1{
+					ParameterType    = 0,
+					DescriptorTable  = D3D12_ROOT_DESCRIPTOR_TABLE1{
+						NumDescriptorRanges = 1,
+						pDescriptorRanges   = &tex_range,
+					},
+					ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL,
+				})
+				if len(samplers) == 0 {
+					append(&samplers, D3D12_STATIC_SAMPLER_DESC{
+						Filter           = 0x15,
+						AddressU         = 3,
+						AddressV         = 3,
+						AddressW         = 3,
+						MaxAnisotropy    = 1,
+						ComparisonFunc   = 1,
+						BorderColor      = 0,
+						MinLOD           = 0,
+						MaxLOD           = 3.4028235e+38,
+						ShaderRegister   = 0,
+						RegisterSpace    = vasperty_shader.SAMPLER_SPACE,
+						ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL,
+					})
+				}
+			}
 		}
 	}
 
@@ -435,6 +530,7 @@ default_graphics_pso_desc :: proc "contextless" (p: ^Console_Pipeline, root_sig:
 			FrontFace        = {1, 1, 1, 8},
 			BackFace         = {1, 1, 1, 8},
 		},
+		IBStripCutValue       = p.ib_strip_cut if p.ib_strip_cut <= 2 else 0,
 		PrimitiveTopologyType = p.topology_type if (p.topology_type >= 1 && p.topology_type <= 4) else 3,
 		SampleDesc            = DXGI_SAMPLE_DESC{Count = 1, Quality = 0},
 	}
@@ -483,6 +579,9 @@ default_graphics_pso_desc :: proc "contextless" (p: ^Console_Pipeline, root_sig:
 		r := p.rast_desc
 		if r.FillMode != 2 && r.FillMode != 3 { r.FillMode = 3 }
 		r.CullMode = 1 // D3D12_CULL_MODE_NONE (Xbox RECTLIST / CCW screen quads must not be back-face culled)
+		r.MultisampleEnable = 0
+		r.AntialiasedLineEnable = 0
+		r.ForcedSampleCount = 0
 		if r.ConservativeRaster > 1 { r.ConservativeRaster = 0 }
 		desc.RasterizerState = r
 	}
@@ -614,6 +713,18 @@ ensure_host_pipeline :: proc(p: ^Console_Pipeline) -> (root: rawptr, pso: rawptr
 	} else {
 		pso_desc := default_graphics_pso_desc(p, root_sig)
 		hr = dvt.CreateGraphicsPipelineState(hdev, &pso_desc, &pso_iid, &pso_obj)
+		if hr < 0 || pso_obj == nil {
+			if pso_desc.DSVFormat == 0 {
+				pso_desc.DepthStencilState.DepthEnable = 0
+				pso_desc.DepthStencilState.StencilEnable = 0
+			}
+			for i in 0 ..< 8 {
+				if pso_desc.BlendState.RenderTarget[i].BlendEnable != 0 {
+					pso_desc.BlendState.RenderTarget[i].LogicOpEnable = 0
+				}
+			}
+			hr = dvt.CreateGraphicsPipelineState(hdev, &pso_desc, &pso_iid, &pso_obj)
+		}
 	}
 
 	if hr < 0 || pso_obj == nil {
@@ -622,7 +733,8 @@ ensure_host_pipeline :: proc(p: ^Console_Pipeline) -> (root: rawptr, pso: rawptr
 		return nil, nil, false
 	}
 
-	intrinsics.atomic_add(&g_stat_pso_ok, 1)
+	pso_n := intrinsics.atomic_add(&g_stat_pso_ok, 1) + 1
+	p.pso_id = u32(pso_n)
 	p.host_root = root_sig
 	p.host_pso = pso_obj
 	return p.host_root, p.host_pso, true

@@ -475,6 +475,7 @@ Console_Cmd_List :: struct #align(16) {
 	host_temps:            [dynamic]rawptr,
 	cur_pso:               rawptr,
 	bound_host_root:       rawptr,
+	bound_host_cs_root:    rawptr,
 	bound_host_pso:        rawptr,
 	viewports:             [8]D3D12_VIEWPORT,
 	scissors:              [8]D3D12_RECT,
@@ -486,6 +487,12 @@ Console_Cmd_List :: struct #align(16) {
 	vp_dirty:              bool,
 	scissor_dirty:         bool,
 	topo_dirty:            bool,
+	blend_factor:          [4]f32,
+	has_blend_factor:      bool,
+	blend_factor_dirty:    bool,
+	stencil_ref:           u32,
+	has_stencil_ref:       bool,
+	stencil_ref_dirty:     bool,
 	vb_views:              [8]D3D12_VERTEX_BUFFER_VIEW,
 	vb_mask:               u8,
 	ib_view:               D3D12_INDEX_BUFFER_VIEW,
@@ -493,6 +500,7 @@ Console_Cmd_List :: struct #align(16) {
 	cur_rts:               [8]^Console_Resource,
 	num_cur_rts:           u32,
 	gfx_roots:             [32]Console_Root_Slot,
+	cs_roots:              [32]Console_Root_Slot,
 }
 
 #assert(offset_of(Console_Cmd_List, put) == 0x18)
@@ -587,6 +595,7 @@ cmdlist_reset :: proc "system" (this: This, alloc: rawptr, pso: rawptr) -> HRESU
 	recycle_cl_host_list(cl)
 	cl.cur_pso = pso
 	cl.bound_host_root = nil
+	cl.bound_host_cs_root = nil
 	cl.bound_host_pso = nil
 	cl.num_viewports = 0
 	cl.num_scissors = 0
@@ -595,10 +604,15 @@ cmdlist_reset :: proc "system" (this: This, alloc: rawptr, pso: rawptr) -> HRESU
 	cl.vp_dirty = false
 	cl.scissor_dirty = false
 	cl.topo_dirty = false
+	cl.has_blend_factor = false
+	cl.blend_factor_dirty = false
+	cl.has_stencil_ref = false
+	cl.stencil_ref_dirty = false
 	cl.vb_mask = 0
 	cl.has_ib = false
 	cl.num_cur_rts = 0
 	cl.gfx_roots = {}
+	cl.cs_roots = {}
 	cl.is_closed = false
 	return S_OK
 }
@@ -629,7 +643,13 @@ g_disp_log_count: u64
 cmdlist_dispatch :: proc "system" (this: This, x, y, z: u32) {
 	context = gpu_context()
 	intrinsics.atomic_add(&g_stat_dispatches, 1)
-	_ = this; _ = x; _ = y; _ = z
+	if this == nil || x == 0 || y == 0 || z == 0 { return }
+	cl := cast(^Console_Cmd_List)this
+	hl := prepare_host_dispatch(cl)
+	if hl == nil { return }
+	lvt := (cast(^^Host_Cmd_List_Vtbl)hl)^
+	lvt.Dispatch(hl, x, y, z)
+	emit_uav_barrier(hl, lvt)
 }
 
 @(private)
@@ -788,6 +808,40 @@ cmdlist_rs_scissors :: proc "system" (this: This, num_rects: u32, rects: [^]D3D1
 }
 
 @(private)
+cmdlist_om_blend_factor :: proc "system" (this: This, factor: ^[4]f32) {
+	context = gpu_context()
+	if this == nil { return }
+	cl := cast(^Console_Cmd_List)this
+	if uintptr(factor) >= 0x10000 {
+		cl.blend_factor = factor^
+	} else {
+		cl.blend_factor = {0, 0, 0, 0}
+	}
+	cl.has_blend_factor = true
+	cl.blend_factor_dirty = true
+	if cl.host_list != nil && !cl.is_closed {
+		lvt := (cast(^^Host_Cmd_List_Vtbl)cl.host_list)^
+		lvt.OMSetBlendFactor(cl.host_list, &cl.blend_factor)
+		cl.blend_factor_dirty = false
+	}
+}
+
+@(private)
+cmdlist_om_stencil_ref :: proc "system" (this: This, ref: u32) {
+	context = gpu_context()
+	if this == nil { return }
+	cl := cast(^Console_Cmd_List)this
+	cl.stencil_ref = ref
+	cl.has_stencil_ref = true
+	cl.stencil_ref_dirty = true
+	if cl.host_list != nil && !cl.is_closed {
+		lvt := (cast(^^Host_Cmd_List_Vtbl)cl.host_list)^
+		lvt.OMSetStencilRef(cl.host_list, ref)
+		cl.stencil_ref_dirty = false
+	}
+}
+
+@(private)
 cmdlist_set_pipeline :: proc "system" (this: This, pso: rawptr) {
 	context = gpu_context()
 	if this == nil { return }
@@ -852,6 +906,48 @@ cmdlist_set_gfx_root_view :: proc "system" (this: This, slot: u32, gpu_va: u64) 
 	cl := cast(^Console_Cmd_List)this
 	cl.gfx_roots[slot].kind = 3
 	cl.gfx_roots[slot].va = gpu_va
+}
+
+@(private)
+cmdlist_set_cs_root_table :: proc "system" (this: This, slot: u32, handle: u64) {
+	if this == nil || slot >= 32 { return }
+	cl := cast(^Console_Cmd_List)this
+	cl.cs_roots[slot].kind = 1
+	cl.cs_roots[slot].va = handle
+}
+
+@(private)
+cmdlist_set_cs_root_const :: proc "system" (this: This, slot: u32, val: u32, dest_offset: u32) {
+	if this == nil || slot >= 32 || dest_offset >= 32 { return }
+	cl := cast(^Console_Cmd_List)this
+	cl.cs_roots[slot].kind = 2
+	cl.cs_roots[slot].consts[dest_offset] = val
+	if dest_offset + 1 > cl.cs_roots[slot].num_consts {
+		cl.cs_roots[slot].num_consts = dest_offset + 1
+	}
+}
+
+@(private)
+cmdlist_set_cs_root_consts :: proc "system" (this: This, slot: u32, count: u32, src: [^]u32, dest_offset: u32) {
+	if this == nil || slot >= 32 || count == 0 || uintptr(src) < 0x10000 { return }
+	cl := cast(^Console_Cmd_List)this
+	cl.cs_roots[slot].kind = 2
+	for i in u32(0) ..< count {
+		idx := dest_offset + i
+		if idx >= 32 { break }
+		cl.cs_roots[slot].consts[idx] = src[i]
+		if idx + 1 > cl.cs_roots[slot].num_consts {
+			cl.cs_roots[slot].num_consts = idx + 1
+		}
+	}
+}
+
+@(private)
+cmdlist_set_cs_root_view :: proc "system" (this: This, slot: u32, gpu_va: u64) {
+	if this == nil || slot >= 32 { return }
+	cl := cast(^Console_Cmd_List)this
+	cl.cs_roots[slot].kind = 3
+	cl.cs_roots[slot].va = gpu_va
 }
 
 @(private)
@@ -1233,8 +1329,8 @@ init_console_object_vtables :: proc "contextless" () {
 		{20,  rawptr(cmdlist_ia_topology)}, // IASetPrimitiveTopology
 		{21,  rawptr(cmdlist_rs_viewports)}, // RSSetViewports
 		{22,  rawptr(cmdlist_rs_scissors)}, // RSSetScissorRects
-		{23,  rawptr(cmdlist_noop)}, // OMSetBlendFactor
-		{24,  rawptr(cmdlist_noop)}, // OMSetStencilRef
+		{23,  rawptr(cmdlist_om_blend_factor)}, // OMSetBlendFactor
+		{24,  rawptr(cmdlist_om_stencil_ref)}, // OMSetStencilRef
 		{25,  rawptr(cmdlist_set_pipeline)}, // SetPipelineState
 		{26,  rawptr(cmdlist_barrier)},
 		{28,  rawptr(cmdlist_noop)}, // BeginQuery
@@ -1243,17 +1339,17 @@ init_console_object_vtables :: proc "contextless" () {
 		{32,  rawptr(cmdlist_noop)}, // SetDescriptorHeaps
 		{33,  rawptr(cmdlist_noop)}, // SetComputeRootSignature
 		{34,  rawptr(cmdlist_noop)}, // SetGraphicsRootSignature
-		{35,  rawptr(cmdlist_noop)}, // SetComputeRootDescriptorTable
+		{35,  rawptr(cmdlist_set_cs_root_table)}, // SetComputeRootDescriptorTable
 		{36,  rawptr(cmdlist_set_gfx_root_table)}, // SetGraphicsRootDescriptorTable
-		{37,  rawptr(cmdlist_noop)}, // SetComputeRoot32BitConstant
+		{37,  rawptr(cmdlist_set_cs_root_const)}, // SetComputeRoot32BitConstant
 		{38,  rawptr(cmdlist_set_gfx_root_const)}, // SetGraphicsRoot32BitConstant
-		{39,  rawptr(cmdlist_noop)}, // SetComputeRoot32BitConstants
+		{39,  rawptr(cmdlist_set_cs_root_consts)}, // SetComputeRoot32BitConstants
 		{40,  rawptr(cmdlist_set_gfx_root_consts)}, // SetGraphicsRoot32BitConstants
-		{41,  rawptr(cmdlist_noop)}, // SetComputeRootCBV
+		{41,  rawptr(cmdlist_set_cs_root_view)}, // SetComputeRootCBV
 		{42,  rawptr(cmdlist_set_gfx_root_view)}, // SetGraphicsRootCBV
-		{43,  rawptr(cmdlist_noop)}, // SetComputeRootSRV
+		{43,  rawptr(cmdlist_set_cs_root_view)}, // SetComputeRootSRV
 		{44,  rawptr(cmdlist_set_gfx_root_view)}, // SetGraphicsRootSRV
-		{45,  rawptr(cmdlist_noop)}, // SetComputeRootUAV
+		{45,  rawptr(cmdlist_set_cs_root_view)}, // SetComputeRootUAV
 		{46,  rawptr(cmdlist_set_gfx_root_view)}, // SetGraphicsRootUAV
 		{47,  rawptr(cmdlist_ia_index_buffer)}, // IASetIndexBuffer
 		{48,  rawptr(cmdlist_ia_vertex_buffers)}, // IASetVertexBuffers

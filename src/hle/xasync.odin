@@ -136,14 +136,16 @@ Task_Queue :: struct {
 }
 
 Async_Entry :: struct {
-	id:          u64,
-	identity:    rawptr,
-	status:      HRESULT,
-	completed:   bool,
-	canceled:    bool,
-	payload:     []u8,
-	owns_mem:    bool,
-	result_size: uint,
+	id:           u64,
+	identity:     rawptr,
+	provider:     Async_Provider,
+	provider_ctx: rawptr,
+	status:       HRESULT,
+	completed:    bool,
+	canceled:     bool,
+	payload:      []u8,
+	owns_mem:     bool,
+	result_size:  uint,
 }
 
 @(private)
@@ -482,7 +484,9 @@ XTaskQueueSubmitDelayedCallback :: proc "system" (q: ^Task_Queue, port_id: u32, 
 	worker := thread.create(proc(t: ^thread.Thread) {
 		a := cast(^Delayed_Args)t.data
 		time.sleep(time.Duration(a.delay_ms) * time.Millisecond)
-		_ = XTaskQueueSubmitCallback(a.q, a.port_id, a.ctx, a.cb)
+		if a.q != nil && !a.q.terminated {
+			_ = XTaskQueueSubmitCallback(a.q, a.port_id, a.ctx, a.cb)
+		}
 		free(a)
 		thread.destroy(t)
 	})
@@ -668,11 +672,30 @@ async_bytes :: proc(v: ^$T) -> []u8 {
 	return mem.byte_slice(v, size_of(T))
 }
 
+@(private)
+reset_async_entry_locked :: proc(e: ^Async_Entry, identity: rawptr, provider: Async_Provider = nil, provider_ctx: rawptr = nil) {
+	if e.owns_mem && len(e.payload) > 0 {
+		delete(e.payload)
+	}
+	e.identity = identity
+	e.provider = provider
+	e.provider_ctx = provider_ctx
+	e.status = E_PENDING
+	e.completed = false
+	e.canceled = false
+	e.payload = nil
+	e.owns_mem = false
+	e.result_size = 0
+}
+
 async_pending_with :: proc(block: ^Async_Block, identity: rawptr, fn: proc(user: rawptr) -> (HRESULT, []u8), user: rawptr = nil) -> HRESULT {
 	if block == nil || fn == nil {
 		return E_INVALIDARG
 	}
-	_ = get_or_create_async_entry(block, identity, true)
+	e := get_or_create_async_entry(block, identity, true)
+	sync.mutex_lock(&xasync_state.mu)
+	reset_async_entry_locked(e, identity)
+	sync.mutex_unlock(&xasync_state.mu)
 	Pending_Args :: struct {
 		block:    ^Async_Block,
 		identity: rawptr,
@@ -775,6 +798,28 @@ XAsyncGetResult :: proc "system" (
 		}
 		if len(e.payload) >= int(e.result_size) {
 			mem.copy(buffer, raw_data(e.payload), int(e.result_size))
+		} else if e.provider != nil {
+			prov := e.provider
+			pctx := e.provider_ctx
+			pid := e.identity
+			rsz := e.result_size
+			sync.mutex_unlock(&xasync_state.mu)
+			get_data := Provider_Data{
+				block       = block,
+				context_    = pctx,
+				identity    = pid,
+				buffer_size = buffer_size,
+				buffer      = buffer,
+			}
+			phr := prov(XASYNC_OP_GET_RESULT, &get_data)
+			sync.mutex_lock(&xasync_state.mu)
+			if i32(phr) < 0 {
+				return phr
+			}
+			if buffer_used != nil {
+				buffer_used^ = rsz
+			}
+			return S_OK
 		}
 	}
 	if buffer_used != nil {
@@ -824,7 +869,10 @@ XAsyncRun :: proc "system" (block: ^Async_Block, work: Async_Work) -> HRESULT {
 	if block == nil || work == nil {
 		return E_INVALIDARG
 	}
-	_ = get_or_create_async_entry(block, nil, true)
+	e := get_or_create_async_entry(block, nil, true)
+	sync.mutex_lock(&xasync_state.mu)
+	reset_async_entry_locked(e, nil)
+	sync.mutex_unlock(&xasync_state.mu)
 	hr := work(block)
 	XAsyncComplete(block, hr, 0)
 	return S_OK
@@ -844,7 +892,7 @@ XAsyncBegin :: proc "system" (
 	}
 	e := get_or_create_async_entry(block, identity, true)
 	sync.mutex_lock(&xasync_state.mu)
-	e.identity = identity
+	reset_async_entry_locked(e, identity, provider, ctx)
 	sync.mutex_unlock(&xasync_state.mu)
 	data := Provider_Data{block = block, context_ = ctx, identity = identity}
 	hr := provider(XASYNC_OP_BEGIN, &data)
@@ -868,13 +916,56 @@ XAsyncBegin :: proc "system" (
 	return hr
 }
 
+@(private)
+xasync_do_work_cb :: proc "system" (ctx: rawptr, canceled: bool) {
+	context = hle_context()
+	block := cast(^Async_Block)ctx
+	if block == nil {
+		return
+	}
+	sync.mutex_lock(&xasync_state.mu)
+	e, ok := xasync_state.blocks[uintptr(block)]
+	if !ok || e.provider == nil || e.completed {
+		sync.mutex_unlock(&xasync_state.mu)
+		return
+	}
+	prov := e.provider
+	pctx := e.provider_ctx
+	pid := e.identity
+	sync.mutex_unlock(&xasync_state.mu)
+	if canceled {
+		XAsyncCancel(block)
+		return
+	}
+	data := Provider_Data{block = block, context_ = pctx, identity = pid}
+	hr := prov(XASYNC_OP_DO_WORK, &data)
+	if hr != E_PENDING {
+		sync.mutex_lock(&xasync_state.mu)
+		already_done := e.completed
+		sync.mutex_unlock(&xasync_state.mu)
+		if !already_done {
+			XAsyncComplete(block, hr, 0)
+		}
+	}
+}
+
 XAsyncSchedule :: proc "system" (block: ^Async_Block, delay_ms: u32) -> HRESULT {
 	context = hle_context()
-	_ = delay_ms
 	if block == nil {
 		return E_INVALIDARG
 	}
-	return S_OK
+	init_xasync_if_needed()
+	sync.mutex_lock(&xasync_state.mu)
+	e, ok := xasync_state.blocks[uintptr(block)]
+	has_prov := ok && e.provider != nil
+	sync.mutex_unlock(&xasync_state.mu)
+	if !has_prov {
+		return S_OK
+	}
+	if delay_ms > 0 {
+		return XTaskQueueSubmitDelayedCallback(block.queue, XASYNC_WORK_PORT, delay_ms, rawptr(block), xasync_do_work_cb)
+	}
+	return XTaskQueueSubmitCallback(block.queue, XASYNC_WORK_PORT, rawptr(block), xasync_do_work_cb)
 }
 
 // --- xasync COM vtable (31 slots) ---

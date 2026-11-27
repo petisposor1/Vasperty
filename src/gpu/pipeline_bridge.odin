@@ -282,6 +282,8 @@ host_shader_from_container :: proc(container: []u8, view_marks := true) -> (res:
 			root_cbvs       = make([dynamic]u8, len(ent.host.root_cbvs)),
 			root_srvs       = make([dynamic]u8, len(ent.host.root_srvs)),
 			root_uavs       = make([dynamic]u8, len(ent.host.root_uavs)),
+			tex_srvs        = make([dynamic]vasperty_shader.Tex_Srv_Ref, len(ent.host.tex_srvs)),
+			tex_uavs        = make([dynamic]vasperty_shader.Tex_Uav_Ref, len(ent.host.tex_uavs)),
 			memory          = ent.host.memory,
 			memory_writes   = ent.host.memory_writes,
 			view_addresses  = ent.host.view_addresses,
@@ -297,6 +299,8 @@ host_shader_from_container :: proc(container: []u8, view_marks := true) -> (res:
 		copy(cp.root_cbvs[:], ent.host.root_cbvs[:])
 		copy(cp.root_srvs[:], ent.host.root_srvs[:])
 		copy(cp.root_uavs[:], ent.host.root_uavs[:])
+		copy(cp.tex_srvs[:], ent.host.tex_srvs[:])
+		copy(cp.tex_uavs[:], ent.host.tex_uavs[:])
 		return cp, true, .None
 	}
 	g_sc_misses += 1
@@ -320,6 +324,8 @@ host_shader_from_container :: proc(container: []u8, view_marks := true) -> (res:
 				root_cbvs       = make([dynamic]u8, len(hs.root_cbvs)),
 				root_srvs       = make([dynamic]u8, len(hs.root_srvs)),
 				root_uavs       = make([dynamic]u8, len(hs.root_uavs)),
+				tex_srvs        = make([dynamic]vasperty_shader.Tex_Srv_Ref, len(hs.tex_srvs)),
+				tex_uavs        = make([dynamic]vasperty_shader.Tex_Uav_Ref, len(hs.tex_uavs)),
 				memory          = hs.memory,
 				memory_writes   = hs.memory_writes,
 				view_addresses  = hs.view_addresses,
@@ -335,6 +341,8 @@ host_shader_from_container :: proc(container: []u8, view_marks := true) -> (res:
 			copy(store.root_cbvs[:], hs.root_cbvs[:])
 			copy(store.root_srvs[:], hs.root_srvs[:])
 			copy(store.root_uavs[:], hs.root_uavs[:])
+			copy(store.tex_srvs[:], hs.tex_srvs[:])
+			copy(store.tex_uavs[:], hs.tex_uavs[:])
 			g_sc_mem[key.digest] = Cached_Shader_Entry{ok = true, host = store}
 		} else {
 			g_sc_mem[key.digest] = Cached_Shader_Entry{ok = false}
